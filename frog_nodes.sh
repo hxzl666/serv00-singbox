@@ -994,6 +994,11 @@ main() {
                     start_singbox
                     generate_node_links
                     enable_cron
+                    
+                    # 下载一份最新的自身脚本到工作目录，以便 crontab 保活使用
+                    download_file "https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh" "$WORKDIR/frog_nodes.sh" >/dev/null 2>&1
+                    chmod +x "$WORKDIR/frog_nodes.sh" 2>/dev/null
+                    
                     create_quick_command
                     echo
                     green "安装部署已全部完成！"
@@ -1048,8 +1053,5 @@ main() {
     done
 }
 
-# 复制一份自身到工作目录，以便 crontab 稳定执行
-cp -f "$0" "$WORKDIR/frog_nodes.sh" 2>/dev/null
-chmod +x "$WORKDIR/frog_nodes.sh" 2>/dev/null
-
+# 执行主函数
 main
