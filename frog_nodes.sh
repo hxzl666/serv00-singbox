@@ -175,6 +175,26 @@ install_dependencies() {
     else
         green "✓ 所有基础依赖检查通过"
     fi
+
+    # 针对 Alpine Linux 额外安装兼容 glibc 二进制的 gcompat 和 libc6-compat
+    if [ -f "/etc/alpine-release" ]; then
+        if ! apk info -e gcompat >/dev/null 2>&1 || ! apk info -e libc6-compat >/dev/null 2>&1; then
+            yellow "正在检查/安装 Alpine glibc 兼容层 (gcompat / libc6-compat)..."
+            if [ "$(id -u)" -eq 0 ]; then
+                apk update >/dev/null 2>&1
+                apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
+                green "✓ 兼容层安装完成"
+            else
+                if command -v sudo >/dev/null 2>&1; then
+                    sudo apk update >/dev/null 2>&1
+                    sudo apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
+                    green "✓ 兼容层安装完成 (sudo)"
+                else
+                    yellow "警告: 缺少 root 权限，无法安装 gcompat 兼容层，sing-box 可能会因为动态库缺失无法启动！"
+                fi
+            fi
+        fi
+    fi
 }
 
 # ==================== 安装核心组件 ====================
@@ -744,6 +764,66 @@ if [ "$1" = "cron" ]; then
     exit 0
 fi
 
+# ==================== 日志查看 ====================
+view_logs_menu() {
+    while true; do
+        clear
+        echo -e "${green}    ______   ____     ____    ______     _    __   ____    ____ ${re}"
+        echo -e "${green}   / ____/  / __ \\   / __ \\  / ____/    | |  / /  / __ \\  / ___/ ${re}"
+        echo -e "${green}  / /__    / /_/ /  / / / / / / __      | | / /  / /_/ /  \\__ \\  ${re}"
+        echo -e "${green} / /___   / _, _/  / /_/ / / /_/ /      | |/ /  / ____/  ___/ /  ${re}"
+        echo -e "${green}/_____/  /_/ |_|   \\____/  \\____/       |___/  /_/      /____/   ${re}"
+        echo
+        green "============================================================"
+        green "  服务运行日志查看"
+        green "============================================================"
+        echo
+        yellow "  1. 查看 sing-box 节点主进程日志"
+        yellow "  2. 查看 cloudflared Argo 节点穿透日志"
+        yellow "  3. 查看订阅文件发布穿透日志"
+        yellow "  4. 查看 Cron 定时保活巡检日志"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回主菜单"
+        echo "============================================================"
+        echo
+        reading "请选择操作 [0-4]: " log_choice
+        case "$log_choice" in
+            1)
+                echo
+                green "========== sing-box 日志 (最近 30 行) =========="
+                tail -n 30 "$LOGDIR/singbox.log" 2>/dev/null || yellow "暂无日志"
+                echo "================================================="
+                ;;
+            2)
+                echo
+                green "========== Argo 穿透日志 (最近 30 行) =========="
+                tail -n 30 "$LOGDIR/argo.log" 2>/dev/null || yellow "暂无日志"
+                echo "================================================="
+                ;;
+            3)
+                echo
+                green "========== 订阅发布日志 (最近 30 行) =========="
+                tail -n 30 "$LOGDIR/sub_argo.log" 2>/dev/null || yellow "暂无日志"
+                echo "================================================="
+                ;;
+            4)
+                echo
+                green "========== Cron 保活日志 (最近 30 行) =========="
+                tail -n 30 "$LOGDIR/cron.log" 2>/dev/null || yellow "暂无日志"
+                echo "================================================="
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                red "无效输入！"
+                ;;
+        esac
+        echo
+        reading "按回车键继续..." _
+    done
+}
+
 # ==================== 菜单界面 ====================
 
 show_menu() {
@@ -783,6 +863,7 @@ show_menu() {
     echo "  6. 开启 Cron 定时保活"
     echo "  7. 关闭 Cron 定时保活"
     echo "  8. 卸载并清除所有数据"
+    echo "  9. 查看运行日志"
     echo "------------------------------------------------------------"
     echo "  0. 退出脚本"
     echo "============================================================"
@@ -810,7 +891,7 @@ main() {
     
     while true; do
         show_menu
-        reading "请选择操作 [0-8]: " choice
+        reading "请选择操作 [0-9]: " choice
         case "$choice" in
             1)
                 collect_params
@@ -858,6 +939,9 @@ main() {
                 ;;
             8)
                 uninstall
+                ;;
+            9)
+                view_logs_menu
                 ;;
             0)
                 exit 0
