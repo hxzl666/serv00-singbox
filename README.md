@@ -159,6 +159,44 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 
 ---
 
+## ⏰ GitHub Actions 自动保活 (支持 Telegram 通知)
+
+为了防止 Serv00 / Hostuno / Frog VPS 因长时间未活动而被官方清理或冻结账号，您可以利用 GitHub Actions 设置定期自动 SSH 登录进行账号“保活”，并支持在每次执行后推送 Telegram 结果通知。
+
+### 1. 配置工作流文件
+在您自己的 GitHub 仓库根目录下创建 `.github/workflows/` 目录结构，并在其中新建 `ssh_keep_alive.yml` 文件，将项目根目录中的 [ssh_keep_alive.yml](file:///d:/workspace/sb/ssh_keep_alive.yml) 内容复制并粘贴至该文件中。
+
+### 2. 配置 GitHub Secrets
+进入您 GitHub 仓库的 **Settings -> Secrets and variables -> Actions** 中，添加以下三个 Repository Secrets：
+
+| Secret 名称 | 是否必填 | 说明 |
+| :--- | :---: | :--- |
+| **`ACCOUNTS`** | 是 | 需要定期登录保活的服务器账户 JSON 串（格式参考下方） |
+| **`TELEGRAM_BOT_TOKEN`** | 否 | 您的 Telegram Bot API Token，若不需要 TG 通知可不填 |
+| **`TELEGRAM_CHAT_ID`** | 否 | 接收通知的 Telegram 用户的 Chat ID，若不需要 TG 通知可不填 |
+
+#### `ACCOUNTS` 配置值格式示例
+请严格按照以下 JSON 格式输入到 `ACCOUNTS` 中（支持多台 VPS 主机批量保活，用英文逗号分隔）：
+
+```json
+[
+  {
+    "SSH_USER": "frog",
+    "SSH_PASS": "你的FROG登录密码",
+    "HOST": "f1194.mikr.us",
+    "PORT": "22"
+  },
+  {
+    "SSH_USER": "你的serv00用户名",
+    "SSH_PASS": "你的serv00密码",
+    "HOST": "s12.serv00.com",
+    "PORT": "22"
+  }
+]
+```
+
+---
+
 ## 📱 客户端配置
 
 ### 注意事项
