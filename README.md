@@ -35,7 +35,7 @@
 
 ---
 
-## 🚀 一键安装
+## 🚀 一键安装 (Serv00 / Hostuno / CT8)
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
@@ -51,11 +51,32 @@ bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/
 
 ---
 
+## 🐸 一键安装 (Frog VPS - Alpine Linux)
+
+由于 Frog VPS 默认以普通用户 `frog` 登录且资源受限，安装前请先在命令行运行 `sudo su` 切换为管理员身份以自动下载系统依赖：
+
+```bash
+# 切换为 root 身份
+sudo su
+
+# 运行一键安装脚本
+bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
+```
+
+或者使用 wget:
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
+```
+
+---
+
 ## 📦 支持平台
 
 - **Serv00** - 波兰免费服务器 (serv00.net)
 - **Hostuno** - Serv00 付费版 (useruno.com)
 - **CT8** - 另一个免费服务器 (ct8.pl)
+- **Frog VPS** - 基于 Alpine Linux 的 NAT 共享端口服务器 (mikr.us/frog)
 
 ---
 
