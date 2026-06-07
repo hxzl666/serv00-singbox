@@ -119,29 +119,20 @@ get_latest_release() {
     echo "${tag#v}" # 移除可能的前缀 'v'
 }
 
-# 下载带重试和加速源
+# 下载带重试的直连下载函数
 download_file() {
     local url=$1
     local dest=$2
-    local proxies=(
-        "https://ghp.ci/"
-        "https://gh-proxy.com/"
-        "https://mirror.ghproxy.com/"
-        ""
-    )
-    local success=false
-    for proxy in "${proxies[@]}"; do
-        yellow "尝试下载: ${proxy}${url}"
-        if curl -fsSL --connect-timeout 8 "${proxy}${url}" -o "$dest"; then
-            success=true
-            break
-        fi
-    done
-    if [ "$success" = "true" ]; then
+    yellow "正在直连下载: ${url}"
+    if curl -fsSL --connect-timeout 15 "${url}" -o "$dest"; then
         return 0
     else
-        return 1
+        yellow "curl 直连下载失败，尝试使用 wget 降级直连下载..."
+        if wget --no-check-certificate -qO "$dest" --timeout=15 "${url}"; then
+            return 0
+        fi
     fi
+    return 1
 }
 
 # 安装依赖
