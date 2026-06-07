@@ -199,11 +199,7 @@ install_dependencies() {
 
 # ==================== 安装核心组件 ====================
 
-install_binaries() {
-    init_dirs
-    install_dependencies
-    
-    # 安装 sing-box
+install_sb_from_github() {
     local sb_ver
     sb_ver=$(get_latest_release "SagerNet/sing-box")
     yellow "开始下载 sing-box v${sb_ver}..."
@@ -216,7 +212,8 @@ install_binaries() {
             cp -f "$extracted_dir/sing-box" "$BINDIR/sing-box"
             chmod +x "$BINDIR/sing-box"
             rm -rf "$extracted_dir" "$WORKDIR/sing-box.tar.gz"
-            green "✓ sing-box 安装完成"
+            green "✓ sing-box 从 GitHub 下载并安装完成"
+            return 0
         else
             red "错误: sing-box 解压目录未找到"
             return 1
@@ -224,6 +221,44 @@ install_binaries() {
     else
         red "错误: 下载 sing-box 失败，请重试"
         return 1
+    fi
+}
+
+install_binaries() {
+    init_dirs
+    install_dependencies
+    
+    local sb_installed=false
+    
+    # 如果是 Alpine 系统，优先尝试系统原生包管理器安装，确保 musl 兼容性
+    if [ -f "/etc/alpine-release" ]; then
+        yellow "检测到 Alpine Linux 系统，优先尝试通过系统 apk 包管理器安装原生 sing-box..."
+        if [ "$(id -u)" -eq 0 ]; then
+            apk update >/dev/null 2>&1
+            apk add --no-cache sing-box >/dev/null 2>&1
+        else
+            if command -v sudo >/dev/null 2>&1; then
+                sudo apk update >/dev/null 2>&1
+                sudo apk add --no-cache sing-box >/dev/null 2>&1
+            fi
+        fi
+        
+        # 验证是否成功安装原生 sing-box 并在 bin 目录建立链接或拷贝
+        if command -v sing-box >/dev/null 2>&1; then
+            local native_sb
+            native_sb=$(command -v sing-box)
+            cp -f "$native_sb" "$BINDIR/sing-box" 2>/dev/null || ln -sf "$native_sb" "$BINDIR/sing-box"
+            chmod +x "$BINDIR/sing-box"
+            green "✓ 已成功部署 Alpine 原生编译版 sing-box"
+            sb_installed=true
+        else
+            yellow "apk 原生包安装未成功，准备降级到 GitHub 编译包下载..."
+        fi
+    fi
+    
+    # 若不是 Alpine 或系统原生包安装失败，则降级从 GitHub 下载
+    if [ "$sb_installed" = "false" ]; then
+        install_sb_from_github || return 1
     fi
 
     # 安装 cloudflared
