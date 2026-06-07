@@ -4389,8 +4389,8 @@ EOF
             args="tunnel --edge-ip-version auto --config tunnel.yml run"
         fi
     else
-        # 临时隧道 - 日志写入boot.log
-        args="tunnel --url http://localhost:$VMESS_PORT --no-autoupdate --logfile boot.log --loglevel info"
+        # 临时隧道 - 日志写入boot.log (显式指定 protocol 为 http2 解决 UDP/quic 阻断或限速导致节点不通的问题)
+        args="tunnel --url http://localhost:$VMESS_PORT --protocol http2 --no-autoupdate --logfile boot.log --loglevel info"
     fi
     
     # 启动cloudflared，保存日志
