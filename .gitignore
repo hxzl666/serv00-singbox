@@ -2,3 +2,5 @@
 *.bak
 temp_*.sh
 temp_yg.sh
+node_modules/
+package-lock.json

@@ -159,38 +159,66 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 
 ---
 
-## ⏰ Cloudflare Workers 自动保活 (支持 Telegram 通知)
+## 🌐 Cloudflare Workers 自动保活 (SSH 登录与命令执行保活 + Telegram 通知)
 
-为了防止 Argo 临时隧道长时间无流量被 Cloudflare 断连，或者监控 Serv00 / Hostuno / Frog VPS 节点的在线状态，您可以部署 Cloudflare Workers 探针脚本，定期自动发起 HTTP 请求以维持其活跃，并在每次检测后向您的 Telegram 推送状态汇报。
+为了防止 Serv00 / Hostuno / Frog VPS (mikr.us) 等服务器账号因长时间未活动而被官方清理，或者在服务进程意外挂掉时自动将其拉起，您可以部署 Cloudflare Workers 脚本。该脚本利用其自带的 TCP Socket 发起真实的 SSH 登录来进行账号“保号”以及“进程守护”。
 
-### 1. 部署步骤
-1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com/)，在左侧导航栏依次进入 **Workers & Pages -> Create Application -> Create Worker**。
+### 1. 开启 Workers 兼容性标志（关键步骤）
+由于 SSH 连接需要使用 Node.js 的部分内置模块（例如 `crypto` 和 `net`），您必须在 Workers 中启用 `nodejs_compat` 模式：
+1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com/)，进入您的 Worker 管理页面。
+2. 切换到 **Settings -> Compatibility Flags**。
+3. 在 **Production**（以及 Preview）的 **Compatibility flags** 区域，确保已添加 **`nodejs_compat`**。
+4. 确保 **Compatibility date**（兼容性日期）设置为 **`2024-09-23`** 或更晚。
+
+### 2. 部署步骤
+1. 在左侧导航栏依次进入 **Workers & Pages -> Create Application -> Create Worker**。
 2. 为 Worker 取一个名称（例如 `serv00-keepalive`），点击 **Deploy**。
-3. 点击 **Edit Code** 按钮，清除编辑器中的默认代码，将本项目根目录下的 [workers_keep_alive.js](file:///d:/workspace/sb/workers_keep_alive.js) 内容完整复制并粘贴进去。
+3. 点击 **Edit Code** 按钮，清除编辑器中的默认代码，将本项目根目录下已打包好的 [workers_keep_alive_dist.js](file:///d:/workspace/sb/workers_keep_alive_dist.js) 内容完整复制并粘贴进去（**重要：不要复制 `workers_keep_alive.js` 源码，网页端直接运行必须使用已打包好依赖的 dist 文件**）。
 4. 点击右上角 **Save and deploy** 部署。
 
-### 2. 配置环境变量 (推荐)
-为了避免在代码中硬编码敏感信息并导致凭据泄漏，请在 Worker 部署页面进入 **Settings -> Variables**，在 **Environment Variables** 区域点击 **Add variable**，配置以下三个环境变量：
+### 3. 配置环境变量
+为了避免在代码中硬编码您的服务器密码，请在 Worker 管理页面进入 **Settings -> Variables**，在 **Environment Variables** 区域点击 **Add variable**，配置以下三个环境变量：
 
 | 变量名称 | 是否必填 | 示例值 / 说明 |
 | :--- | :---: | :--- |
-| **`URLS`** | 是 | 需要保活的域名或链接。支持多个，以半角逗号 `,` 分隔。例如：`https://xxx.trycloudflare.com,https://yourdomain.com` |
+| **`ACCOUNTS`** | 是 | 需要定期 SSH 登录保活的账户 JSON 串（格式参考下方） |
 | **`TELEGRAM_BOT_TOKEN`** | 否 | 您的 Telegram Bot API Token，例如 `123456:ABC-DEF...` |
 | **`TELEGRAM_CHAT_ID`** | 否 | 接收通知的 Telegram 用户的 Chat ID，例如 `987654321` |
 
-### 3. 配置定时触发器 (Cron Triggers)
+#### `ACCOUNTS` 配置值格式示例
+请严格按照以下 JSON 格式输入到 `ACCOUNTS` 中（支持多台 VPS 主机批量保活，用英文逗号分隔）：
+
+```json
+[
+  {
+    "SSH_USER": "frog",
+    "SSH_PASS": "你的FROG登录密码",
+    "HOST": "f1194.mikr.us",
+    "PORT": "22"
+  },
+  {
+    "SSH_USER": "你的serv00用户名",
+    "SSH_PASS": "你的serv00密码",
+    "HOST": "s12.serv00.com",
+    "PORT": "22"
+  }
+]
+```
+
+### 4. 配置定时触发器 (Cron Triggers)
 1. 在 Worker 的管理页面上，点击 **Triggers** 选项卡。
 2. 滚动到 **Cron Triggers** 部分，点击 **Add Trigger**。
 3. 配置一个定时表达式：
-   - **高频防断连（推荐）**：配置为 `*/30 * * * *` (每 30 分钟触发一次)
-   - **日常监控**：可配置为 `0 */2 * * *` (每 2 小时触发一次)
+   - 建议配置为 `0 0 */3 * *` (每 3 天的零点执行一次 SSH 登录保活)
+   - 如果想高频测试，可配置为 `0 */12 * * *` (每 12 小时触发一次)
 4. 点击 **Add** 保存。
 
-### 💡 提示与说明
-- 您也可以直接访问 Worker 的 `.workers.dev` 访问地址，手动触发一次保活和 Telegram 推送。
-- 建议配合您在 VPS 上一键脚本的**菜单选项 6 (开启 Cron 定时保活)**，在服务器本地维持进程稳定，同时利用此 Workers 脚本发送探测流量并实时监控状态。
+### 5. 本地开发与二次开发
+如果您需要修改保活脚本的源代码：
+1. 请编辑本地的 [workers_keep_alive.js](file:///d:/workspace/sb/workers_keep_alive.js)。
+2. 在项目根目录运行 `npm run build` 命令。
+3. 编译打包工具会自动处理 `ssh2` 依赖，并重新生成适合在 Workers 网页端直接粘贴部署的 [workers_keep_alive_dist.js](file:///d:/workspace/sb/workers_keep_alive_dist.js)。
 
----
 
 ## 📱 客户端配置
 
@@ -273,7 +301,7 @@ ss://method:password@ip:port#name
 
 1. 确保安装了保活服务
 2. 检查保活页面是否正常运行
-3. 设置 Workers 保活
+3. 设置 Cloudflare Workers 进行 SSH 登录与命令执行保活
 
 ### Q: 什么是 WARP 出站？
 

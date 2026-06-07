@@ -784,6 +784,31 @@ disable_cron() {
     green "✓ 保活 crontab 定时任务已禁用"
 }
 
+# ==================== 快捷命令 ====================
+
+# 创建快捷命令
+create_quick_command() {
+    COMMAND="sb"
+    SCRIPT_PATH="$HOME/bin/$COMMAND"
+    mkdir -p "$HOME/bin"
+    
+    cat > "$SCRIPT_PATH" <<'EOF'
+#!/bin/bash
+bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
+EOF
+    
+    chmod +x "$SCRIPT_PATH"
+    
+    if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc" 2>/dev/null
+        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.profile" 2>/dev/null
+        source "$HOME/.bashrc" 2>/dev/null
+        source "$HOME/.profile" 2>/dev/null
+    fi
+    
+    green "✓ 快捷命令 'sb' 已创建"
+}
+
 # ==================== 卸载 ====================
 
 uninstall() {
@@ -791,6 +816,7 @@ uninstall() {
     disable_cron
     stop_all
     rm -rf "$WORKDIR"
+    rm -f "${HOME}/bin/sb" 2>/dev/null
     green "✓ 卸载清理完毕！"
 }
 
@@ -939,8 +965,10 @@ main() {
                     start_singbox
                     generate_node_links
                     enable_cron
+                    create_quick_command
                     echo
                     green "安装部署已全部完成！"
+                    green "  快捷命令: sb"
                     show_links
                 fi
                 ;;

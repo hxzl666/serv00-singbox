@@ -1,0 +1,13 @@
+{
+  "name": "sb",
+  "version": "1.0.0",
+  "description": "Serv00/CT8/Frog VPS Keep-alive Worker",
+  "main": "workers_keep_alive.js",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.0",
+    "ssh2": "^1.17.0"
+  }
+}
