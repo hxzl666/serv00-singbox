@@ -38,13 +38,13 @@
 ## 🚀 一键安装 (Serv00 / Hostuno / CT8)
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
+bash <(curl -Lks https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
 ```
 
 或者使用 wget:
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
+bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
 ```
 
 **安装完成后，使用快捷命令 `sb` 即可快速进入菜单**
@@ -59,14 +59,14 @@ bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/
 # 切换为 root 身份
 sudo su
 
-# 运行一键安装脚本
-bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
+# 运行一键安装脚本 (使用 -k 避开证书不受信任问题)
+bash <(curl -Lks https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
 ```
 
 或者使用 wget:
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
+bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
 ```
 
 ---
