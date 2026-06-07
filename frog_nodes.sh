@@ -821,6 +821,9 @@ EOF
     fi
     
     green "✓ 快捷命令 'sb' 已创建"
+    yellow "  ⚠️ 提示：由于当前会话环境变量限制，首次使用前您需要断开 SSH 重新连接，"
+    yellow "  或者在当前终端手动执行以下命令，即可立即生效："
+    green "  source ~/.bashrc"
 }
 
 # ==================== 卸载 ====================
@@ -982,7 +985,7 @@ main() {
                     create_quick_command
                     echo
                     green "安装部署已全部完成！"
-                    green "  快捷命令: sb"
+                    green "  快捷命令: sb (首次在当前终端使用请先执行: source ~/.bashrc)"
                     show_links
                 fi
                 ;;
