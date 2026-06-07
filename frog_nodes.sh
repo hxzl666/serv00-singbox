@@ -313,6 +313,13 @@ save_params() {
     echo "PORT_VMESS_V6=$PORT_VMESS_V6" >> "$WORKDIR/ports.txt"
     echo "PORT_ARGO_LOCAL=$PORT_ARGO_LOCAL" >> "$WORKDIR/ports.txt"
     echo "PORT_SS_V6=$PORT_SS_V6" >> "$WORKDIR/ports.txt"
+
+    echo "ENABLE_VLESS_REALITY=$ENABLE_VLESS_REALITY" > "$WORKDIR/switches.txt"
+    echo "ENABLE_HYSTERIA2=$ENABLE_HYSTERIA2" >> "$WORKDIR/switches.txt"
+    echo "ENABLE_TUIC=$ENABLE_TUIC" >> "$WORKDIR/switches.txt"
+    echo "ENABLE_ARGO=$ENABLE_ARGO" >> "$WORKDIR/switches.txt"
+    echo "ENABLE_VMESS_V6=$ENABLE_VMESS_V6" >> "$WORKDIR/switches.txt"
+    echo "ENABLE_SS_V6=$ENABLE_SS_V6" >> "$WORKDIR/switches.txt"
 }
 
 # 加载保存的参数
@@ -321,6 +328,16 @@ load_params() {
     [ -f "$WORKDIR/HOST_DOMAIN.txt" ] && HOST_DOMAIN=$(cat "$WORKDIR/HOST_DOMAIN.txt")
     if [ -f "$WORKDIR/ports.txt" ]; then
         source "$WORKDIR/ports.txt"
+    fi
+    if [ -f "$WORKDIR/switches.txt" ]; then
+        source "$WORKDIR/switches.txt"
+    else
+        ENABLE_VLESS_REALITY=true
+        ENABLE_HYSTERIA2=true
+        ENABLE_TUIC=true
+        ENABLE_ARGO=true
+        ENABLE_VMESS_V6=true
+        ENABLE_SS_V6=true
     fi
 }
 
@@ -334,26 +351,93 @@ collect_params() {
     fi
     local default_uuid
     default_uuid=$(generate_uuid)
+
+    load_params
+
+    HOST_DOMAIN=${HOST_DOMAIN:-$default_host}
+    UUID=${UUID:-$default_uuid}
     
     echo
     green "==== 请输入 Frog VPS 的网络配置参数 ===="
-    reading "1. 请输入您的公网映射域名 (回车默认: $default_host): " custom_host
-    HOST_DOMAIN=${custom_host:-$default_host}
+    reading "1. 请输入您的公网映射域名 (回车默认: $HOST_DOMAIN): " custom_host
+    HOST_DOMAIN=${custom_host:-$HOST_DOMAIN}
     
-    reading "2. 请输入第一个可用 IPv4 映射端口 (回车默认: 20194): " p1
-    PORT1=${p1:-20194}
-    reading "3. 请输入第二个可用 IPv4 映射端口 (回车默认: 30194): " p2
-    PORT2=${p2:-30194}
-    reading "4. 请输入第三个可用 IPv4 映射端口 (回车默认: 40194): " p3
-    PORT3=${p3:-40194}
+    reading "2. 请输入您的用户 UUID (回车默认: $UUID): " custom_uuid
+    UUID=${custom_uuid:-$UUID}
+
+    echo
+    green "==== 自定义搭建节点组合 ===="
+    purple "提示: 直连节点需要绑定公网映射端口（您最多有 3 个公网映射端口）"
+
+    # 选择协议开关
+    reading "• 是否启用 VLESS-Reality 直连节点? [Y/n]: " choice_vless
+    if [[ "$choice_vless" =~ ^[Nn]$ ]]; then
+        ENABLE_VLESS_REALITY=false
+    else
+        ENABLE_VLESS_REALITY=true
+    fi
+
+    reading "• 是否启用 Hysteria2 直连节点? [Y/n]: " choice_hy2
+    if [[ "$choice_hy2" =~ ^[Nn]$ ]]; then
+        ENABLE_HYSTERIA2=false
+    else
+        ENABLE_HYSTERIA2=true
+    fi
+
+    reading "• 是否启用 TUIC v5 直连节点? [Y/n]: " choice_tuic
+    if [[ "$choice_tuic" =~ ^[Nn]$ ]]; then
+        ENABLE_TUIC=false
+    else
+        ENABLE_TUIC=true
+    fi
+
+    reading "• 是否启用 CF Argo VMess 穿透隧道? [Y/n]: " choice_argo
+    if [[ "$choice_argo" =~ ^[Nn]$ ]]; then
+        ENABLE_ARGO=false
+    else
+        ENABLE_ARGO=true
+    fi
+
+    reading "• 是否启用 VMess-WS IPv6 直连节点? [Y/n]: " choice_v6_vmess
+    if [[ "$choice_v6_vmess" =~ ^[Nn]$ ]]; then
+        ENABLE_VMESS_V6=false
+    else
+        ENABLE_VMESS_V6=true
+    fi
+
+    reading "• 是否启用 Shadowsocks-2022 IPv6 直连节点? [Y/n]: " choice_v6_ss
+    if [[ "$choice_v6_ss" =~ ^[Nn]$ ]]; then
+        ENABLE_SS_V6=false
+    else
+        ENABLE_SS_V6=true
+    fi
+
+    # 动态分配端口
+    echo
+    green "==== 配置直连协议的映射端口 ===="
     
-    reading "5. 请输入您的用户 UUID (回车默认随机生成): " custom_uuid
-    UUID=${custom_uuid:-$default_uuid}
+    PORT1=${PORT1:-20194}
+    PORT2=${PORT2:-30194}
+    PORT3=${PORT3:-40194}
+
+    if [[ "$ENABLE_VLESS_REALITY" == "true" ]]; then
+        reading "-> VLESS-Reality 的公网映射端口 (回车默认: $PORT1): " p1
+        PORT1=${p1:-$PORT1}
+    fi
+
+    if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
+        reading "-> Hysteria2 的公网映射端口 (回车默认: $PORT2): " p2
+        PORT2=${p2:-$PORT2}
+    fi
+
+    if [[ "$ENABLE_TUIC" == "true" ]]; then
+        reading "-> TUIC v5 的公网映射端口 (回车默认: $PORT3): " p3
+        PORT3=${p3:-$PORT3}
+    fi
     
-    # 自动生成 IPv6 专属端口
-    PORT_VMESS_V6=$(generate_random_port)
-    PORT_ARGO_LOCAL=$(generate_random_port)
-    PORT_SS_V6=$(generate_random_port)
+    PORT_VMESS_V6=${PORT_VMESS_V6:-$(generate_random_port)}
+    PORT_ARGO_LOCAL=${PORT_ARGO_LOCAL:-$(generate_random_port)}
+    PORT_SS_V6=${PORT_SS_V6:-$(generate_random_port)}
     
     save_params
 }
@@ -367,9 +451,134 @@ generate_singbox_config() {
     local reality_priv
     reality_priv=$(cat "$WORKDIR/private_key.txt")
     local ss_password
-    ss_password=$(openssl rand -base64 16)
-    echo "$ss_password" > "$WORKDIR/ss_password.txt"
+    ss_password=$(cat "$WORKDIR/ss_password.txt" 2>/dev/null)
+    if [ -z "$ss_password" ]; then
+        ss_password=$(openssl rand -base64 16)
+        echo "$ss_password" > "$WORKDIR/ss_password.txt"
+    fi
     
+    local inbounds=()
+    
+    if [[ "$ENABLE_VLESS_REALITY" == "true" ]]; then
+        inbounds+=( "    {
+      \"tag\": \"vless-reality-in\",
+      \"type\": \"vless\",
+      \"listen\": \"::\",
+      \"listen_port\": $PORT1,
+      \"users\": [
+        {
+          \"uuid\": \"$UUID\",
+          \"flow\": \"xtls-rprx-vision\"
+        }
+      ],
+      \"tls\": {
+        \"enabled\": true,
+        \"server_name\": \"blog.cloudflare.com\",
+        \"reality\": {
+          \"enabled\": true,
+          \"handshake\": {
+            \"server\": \"blog.cloudflare.com\",
+            \"server_port\": 443
+          },
+          \"private_key\": \"$reality_priv\",
+          \"short_id\": [\"\"]
+        }
+      }
+    }" )
+    fi
+
+    if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
+        inbounds+=( "    {
+      \"tag\": \"hysteria2-in\",
+      \"type\": \"hysteria2\",
+      \"listen\": \"::\",
+      \"listen_port\": $PORT2,
+      \"users\": [
+        {
+          \"password\": \"$UUID\"
+        }
+      ],
+      \"masquerade\": \"https://www.bing.com\",
+      \"tls\": {
+        \"enabled\": true,
+        \"alpn\": [\"h3\"],
+        \"certificate_path\": \"$WORKDIR/cert.pem\",
+        \"key_path\": \"$WORKDIR/private.key\"
+      }
+    }" )
+    fi
+
+    if [[ "$ENABLE_TUIC" == "true" ]]; then
+        inbounds+=( "    {
+      \"tag\": \"tuic-in\",
+      \"type\": \"tuic\",
+      \"listen\": \"::\",
+      \"listen_port\": $PORT3,
+      \"users\": [
+        {
+          \"uuid\": \"$UUID\",
+          \"password\": \"$UUID\"
+        }
+      ],
+      \"congestion_control\": \"bbr\",
+      \"tls\": {
+        \"enabled\": true,
+        \"alpn\": [\"h3\"],
+        \"certificate_path\": \"$WORKDIR/cert.pem\",
+        \"key_path\": \"$WORKDIR/private.key\"
+      }
+    }" )
+    fi
+
+    if [[ "$ENABLE_VMESS_V6" == "true" ]]; then
+        inbounds+=( "    {
+      \"tag\": \"vmess-ws-in\",
+      \"type\": \"vmess\",
+      \"listen\": \"::\",
+      \"listen_port\": $PORT_VMESS_V6,
+      \"users\": [
+        {
+          \"uuid\": \"$UUID\"
+        }
+      ],
+      \"transport\": {
+        \"type\": \"ws\",
+        \"path\": \"/$UUID-vm\",
+        \"early_data_header_name\": \"Sec-WebSocket-Protocol\"
+      }
+    }" )
+    fi
+
+    if [[ "$ENABLE_ARGO" == "true" ]]; then
+        inbounds+=( "    {
+      \"tag\": \"vmess-argo-in\",
+      \"type\": \"vmess\",
+      \"listen\": \"127.0.0.1\",
+      \"listen_port\": $PORT_ARGO_LOCAL,
+      \"users\": [
+        {
+          \"uuid\": \"$UUID\"
+        }
+      ],
+      \"transport\": {
+        \"type\": \"ws\",
+        \"path\": \"/$UUID-argo\",
+        \"early_data_header_name\": \"Sec-WebSocket-Protocol\"
+      }
+    }" )
+    fi
+
+    if [[ "$ENABLE_SS_V6" == "true" ]]; then
+        inbounds+=( "    {
+      \"tag\": \"ss-in\",
+      \"type\": \"shadowsocks\",
+      \"listen\": \"::\",
+      \"listen_port\": $PORT_SS_V6,
+      \"method\": \"2022-blake3-aes-128-gcm\",
+      \"password\": \"$ss_password\"
+    }" )
+    fi
+
     cat > "$WORKDIR/config.json" <<EOF
 {
   "log": {
@@ -390,108 +599,19 @@ generate_singbox_config() {
     ]
   },
   "inbounds": [
-    {
-      "tag": "vless-reality-in",
-      "type": "vless",
-      "listen": "::",
-      "listen_port": $PORT1,
-      "users": [
-        {
-          "uuid": "$UUID",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "blog.cloudflare.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "blog.cloudflare.com",
-            "server_port": 443
-          },
-          "private_key": "$reality_priv",
-          "short_id": [""]
-        }
-      }
-    },
-    {
-      "tag": "hysteria2-in",
-      "type": "hysteria2",
-      "listen": "::",
-      "listen_port": $PORT2,
-      "users": [
-        {
-          "password": "$UUID"
-        }
-      ],
-      "masquerade": "https://www.bing.com",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "$WORKDIR/cert.pem",
-        "key_path": "$WORKDIR/private.key"
-      }
-    },
-    {
-      "tag": "tuic-in",
-      "type": "tuic",
-      "listen": "::",
-      "listen_port": $PORT3,
-      "users": [
-        {
-          "uuid": "$UUID",
-          "password": "$UUID"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "$WORKDIR/cert.pem",
-        "key_path": "$WORKDIR/private.key"
-      }
-    },
-    {
-      "tag": "vmess-ws-in",
-      "type": "vmess",
-      "listen": "::",
-      "listen_port": $PORT_VMESS_V6,
-      "users": [
-        {
-          "uuid": "$UUID"
-        }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "/$UUID-vm",
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      }
-    },
-    {
-      "tag": "vmess-argo-in",
-      "type": "vmess",
-      "listen": "127.0.0.1",
-      "listen_port": $PORT_ARGO_LOCAL,
-      "users": [
-        {
-          "uuid": "$UUID"
-        }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "/$UUID-argo",
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      }
-    },
-    {
-      "tag": "ss-in",
-      "type": "shadowsocks",
-      "listen": "::",
-      "listen_port": $PORT_SS_V6,
-      "method": "2022-blake3-aes-128-gcm",
-      "password": "$ss_password"
-    }
+EOF
+
+    local first=true
+    for item in "${inbounds[@]}"; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            echo "," >> "$WORKDIR/config.json"
+        fi
+        echo -n "$item" >> "$WORKDIR/config.json"
+    done
+
+    cat >> "$WORKDIR/config.json" <<EOF
   ],
   "outbounds": [
     {
@@ -512,6 +632,11 @@ EOF
 
 # 启动 sing-box
 start_singbox() {
+    # 注入 Go 内存和 CPU 资源优化环境变量
+    export GOMAXPROCS=1
+    export GOGC=20
+    export GODEBUG=madvdontneed=1
+
     if [ ! -f "$WORKDIR/config.json" ]; then
         red "错误: 配置文件不存在，请先选择安装组件"
         return 1
@@ -541,6 +666,15 @@ start_singbox() {
 
 # 启动 argo 代理隧道
 start_argo_tunnel() {
+    if [[ "$ENABLE_ARGO" != "true" ]]; then
+        return 0
+    fi
+    
+    # 注入 Go 内存和 CPU 资源优化环境变量
+    export GOMAXPROCS=1
+    export GOGC=20
+    export GODEBUG=madvdontneed=1
+
     # 停止已有进程
     pkill -f "tunnel --url http://localhost:$PORT_ARGO_LOCAL" >/dev/null 2>&1 || true
     sleep 1
@@ -554,6 +688,10 @@ start_argo_tunnel() {
 # 提取并解析生成的临时隧道域名
 get_argo_domain() {
     local domain=""
+    if [[ "$ENABLE_ARGO" != "true" ]]; then
+        echo ""
+        return 0
+    fi
     domain=$(grep -o 'https://[-0-9a-zA-Z]*\.trycloudflare\.com' "$LOGDIR/argo.log" | tail -n 1 | sed 's/https:\/\///')
     echo "$domain"
 }
@@ -573,6 +711,12 @@ start_sub_server() {
     nohup python3 -m http.server 18000 --bind 127.0.0.1 >/dev/null 2>&1 &
     # 穿透发布静态服务
     > "$LOGDIR/sub_argo.log"
+
+    # 注入 Go 内存和 CPU 资源优化环境变量
+    export GOMAXPROCS=1
+    export GOGC=20
+    export GODEBUG=madvdontneed=1
+
     run_detached "$LOGDIR/sub_argo.log" "$BINDIR/cloudflared" tunnel --url "http://127.0.0.1:18000" --no-autoupdate
     yellow "正在生成并配置订阅发布链接..."
     sleep 8
@@ -644,74 +788,84 @@ generate_node_links() {
     echo >> "$list_file"
 
     # 1. VLESS Reality
-    local vless_v4="vless://$UUID@$HOST_DOMAIN:$PORT1?encryption=none&flow=xtls-rprx-vision&security=reality&sni=blog.cloudflare.com&fp=chrome&pbk=$pub_key&type=tcp&headerType=none#$isName-VLESS-Reality-IPv4"
-    echo "$vless_v4" >> "$output_file"
-    echo "【VLESS-Reality - IPv4 NAT 映射】" >> "$list_file"
-    echo "$vless_v4" >> "$list_file"
-    echo >> "$list_file"
-    
-    if [ -n "$ipv6_addr" ]; then
-        local vless_v6="vless://$UUID@[$ipv6_addr]:$PORT1?encryption=none&flow=xtls-rprx-vision&security=reality&sni=blog.cloudflare.com&fp=chrome&pbk=$pub_key&type=tcp&headerType=none#$isName-VLESS-Reality-IPv6"
-        echo "$vless_v6" >> "$output_file"
-        echo "【VLESS-Reality - IPv6 直连】" >> "$list_file"
-        echo "$vless_v6" >> "$list_file"
+    if [[ "$ENABLE_VLESS_REALITY" == "true" ]]; then
+        local vless_v4="vless://$UUID@$HOST_DOMAIN:$PORT1?encryption=none&flow=xtls-rprx-vision&security=reality&sni=blog.cloudflare.com&fp=chrome&pbk=$pub_key&type=tcp&headerType=none#$isName-VLESS-Reality-IPv4"
+        echo "$vless_v4" >> "$output_file"
+        echo "【VLESS-Reality - IPv4 NAT 映射】" >> "$list_file"
+        echo "$vless_v4" >> "$list_file"
         echo >> "$list_file"
+        
+        if [ -n "$ipv6_addr" ]; then
+            local vless_v6="vless://$UUID@[$ipv6_addr]:$PORT1?encryption=none&flow=xtls-rprx-vision&security=reality&sni=blog.cloudflare.com&fp=chrome&pbk=$pub_key&type=tcp&headerType=none#$isName-VLESS-Reality-IPv6"
+            echo "$vless_v6" >> "$output_file"
+            echo "【VLESS-Reality - IPv6 直连】" >> "$list_file"
+            echo "$vless_v6" >> "$list_file"
+            echo >> "$list_file"
+        fi
     fi
 
     # 2. Hysteria2
-    local hy2_v4="hysteria2://$UUID@$HOST_DOMAIN:$PORT2?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$isName-Hysteria2-IPv4"
-    echo "$hy2_v4" >> "$output_file"
-    echo "【Hysteria2 - IPv4 NAT 映射】" >> "$list_file"
-    echo "$hy2_v4" >> "$list_file"
-    echo >> "$list_file"
-    
-    if [ -n "$ipv6_addr" ]; then
-        local hy2_v6="hysteria2://$UUID@[$ipv6_addr]:$PORT2?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$isName-Hysteria2-IPv6"
-        echo "$hy2_v6" >> "$output_file"
-        echo "【Hysteria2 - IPv6 直连】" >> "$list_file"
-        echo "$hy2_v6" >> "$list_file"
+    if [[ "$ENABLE_HYSTERIA2" == "true" ]]; then
+        local hy2_v4="hysteria2://$UUID@$HOST_DOMAIN:$PORT2?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$isName-Hysteria2-IPv4"
+        echo "$hy2_v4" >> "$output_file"
+        echo "【Hysteria2 - IPv4 NAT 映射】" >> "$list_file"
+        echo "$hy2_v4" >> "$list_file"
         echo >> "$list_file"
+        
+        if [ -n "$ipv6_addr" ]; then
+            local hy2_v6="hysteria2://$UUID@[$ipv6_addr]:$PORT2?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$isName-Hysteria2-IPv6"
+            echo "$hy2_v6" >> "$output_file"
+            echo "【Hysteria2 - IPv6 直连】" >> "$list_file"
+            echo "$hy2_v6" >> "$list_file"
+            echo >> "$list_file"
+        fi
     fi
 
     # 3. TUIC v5
-    local tuic_v4="tuic://$UUID:$UUID@$HOST_DOMAIN:$PORT3?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$isName-TUIC5-IPv4"
-    echo "$tuic_v4" >> "$output_file"
-    echo "【TUIC v5 - IPv4 NAT 映射】" >> "$list_file"
-    echo "$tuic_v4" >> "$list_file"
-    echo >> "$list_file"
-    
-    if [ -n "$ipv6_addr" ]; then
-        local tuic_v6="tuic://$UUID:$UUID@[$ipv6_addr]:$PORT3?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$isName-TUIC5-IPv6"
-        echo "$tuic_v6" >> "$output_file"
-        echo "【TUIC v5 - IPv6 直连】" >> "$list_file"
-        echo "$tuic_v6" >> "$list_file"
+    if [[ "$ENABLE_TUIC" == "true" ]]; then
+        local tuic_v4="tuic://$UUID:$UUID@$HOST_DOMAIN:$PORT3?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$isName-TUIC5-IPv4"
+        echo "$tuic_v4" >> "$output_file"
+        echo "【TUIC v5 - IPv4 NAT 映射】" >> "$list_file"
+        echo "$tuic_v4" >> "$list_file"
         echo >> "$list_file"
+        
+        if [ -n "$ipv6_addr" ]; then
+            local tuic_v6="tuic://$UUID:$UUID@[$ipv6_addr]:$PORT3?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$isName-TUIC5-IPv6"
+            echo "$tuic_v6" >> "$output_file"
+            echo "【TUIC v5 - IPv6 直连】" >> "$list_file"
+            echo "$tuic_v6" >> "$list_file"
+            echo >> "$list_file"
+        fi
     fi
 
     # 4. VMess-WS IPv6 直连
-    if [ -n "$ipv6_addr" ]; then
-        local vmess_v6_json
-        vmess_v6_json=$(echo "{\"v\":\"2\",\"ps\":\"$isName-VMess-WS-IPv6\",\"add\":\"$ipv6_addr\",\"port\":\"$PORT_VMESS_V6\",\"id\":\"$UUID\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"/$UUID-vm?ed=2048\",\"tls\":\"\",\"sni\":\"\"}" | base64 -w0)
-        local vmess_v6="vmess://$vmess_v6_json"
-        echo "$vmess_v6" >> "$output_file"
-        echo "【VMess-WS - IPv6 直连】" >> "$list_file"
-        echo "$vmess_v6" >> "$list_file"
-        echo >> "$list_file"
+    if [[ "$ENABLE_VMESS_V6" == "true" ]]; then
+        if [ -n "$ipv6_addr" ]; then
+            local vmess_v6_json
+            vmess_v6_json=$(echo "{\"v\":\"2\",\"ps\":\"$isName-VMess-WS-IPv6\",\"add\":\"$ipv6_addr\",\"port\":\"$PORT_VMESS_V6\",\"id\":\"$UUID\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"/$UUID-vm?ed=2048\",\"tls\":\"\",\"sni\":\"\"}" | base64 -w0)
+            local vmess_v6="vmess://$vmess_v6_json"
+            echo "$vmess_v6" >> "$output_file"
+            echo "【VMess-WS - IPv6 直连】" >> "$list_file"
+            echo "$vmess_v6" >> "$list_file"
+            echo >> "$list_file"
+        fi
     fi
 
     # 5. Shadowsocks IPv6 直连
-    if [ -n "$ipv6_addr" ]; then
-        local ss_enc
-        ss_enc=$(echo -n "2022-blake3-aes-128-gcm:$ss_pass" | base64 -w0)
-        local ss_v6="ss://${ss_enc}@[$ipv6_addr]:$PORT_SS_V6#$isName-Shadowsocks-IPv6"
-        echo "$ss_v6" >> "$output_file"
-        echo "【Shadowsocks-2022 - IPv6 直连】" >> "$list_file"
-        echo "$ss_v6" >> "$list_file"
-        echo >> "$list_file"
+    if [[ "$ENABLE_SS_V6" == "true" ]]; then
+        if [ -n "$ipv6_addr" ]; then
+            local ss_enc
+            ss_enc=$(echo -n "2022-blake3-aes-128-gcm:$ss_pass" | base64 -w0)
+            local ss_v6="ss://${ss_enc}@[$ipv6_addr]:$PORT_SS_V6#$isName-Shadowsocks-IPv6"
+            echo "$ss_v6" >> "$output_file"
+            echo "【Shadowsocks-2022 - IPv6 直连】" >> "$list_file"
+            echo "$ss_v6" >> "$list_file"
+            echo >> "$list_file"
+        fi
     fi
 
     # 6. Argo VMess 穿透
-    if [ -n "$argo_domain" ]; then
+    if [[ "$ENABLE_ARGO" == "true" ]] && [ -n "$argo_domain" ]; then
         # TLS
         local vmess_argo_tls_json
         vmess_argo_tls_json=$(echo "{\"v\":\"2\",\"ps\":\"$isName-Argo-TLS\",\"add\":\"cdn.2020111.xyz\",\"port\":\"8443\",\"id\":\"$UUID\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"$argo_domain\",\"path\":\"/$UUID-argo?ed=2048\",\"tls\":\"tls\",\"sni\":\"$argo_domain\"}" | base64 -w0)
@@ -769,8 +923,8 @@ keep_alive() {
         start_singbox >> "$LOGDIR/keep_alive.log" 2>&1
     fi
     
-    # 2. 检测并重启 Argo Tunnel (如果 argo.log 存在)
-    if [ -f "$LOGDIR/argo.log" ]; then
+    # 2. 检测并重启 Argo Tunnel
+    if [[ "$ENABLE_ARGO" == "true" ]] && [ -f "$LOGDIR/argo.log" ]; then
         if ! pgrep -f "tunnel --url http://localhost:$PORT_ARGO_LOCAL" >/dev/null 2>&1; then
             echo "[$(date)] cloudflared argo 退出，正在重启..." >> "$LOGDIR/keep_alive.log"
             start_argo_tunnel >> "$LOGDIR/keep_alive.log" 2>&1
@@ -798,7 +952,6 @@ enable_cron() {
 disable_cron() {
     crontab -l 2>/dev/null | grep -Fv "frog_nodes.sh" | crontab -
     green "✓ 保活 crontab 定时任务已禁用"
-}
 
 # ==================== 快捷命令 ====================
 
