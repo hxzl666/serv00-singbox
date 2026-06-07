@@ -158,92 +158,16 @@ get_all_ips() {
     # 保存到文件
     printf '%s\n' "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
 }
-# 检测IP大陆可达性
-check_ip_availability() {
-    local ip=$1
-    local req_id=""
-    local response=""
-    response=$(curl -s -H "Accept: application/json" --max-time 4 "https://check-host.net/check-ping?host=${ip}&node=cn" 2>/dev/null)
-    if [ -z "$response" ]; then
-        echo "Unknown" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-        echo "Unknown"
-        return
-    fi
-    req_id=$(echo "$response" | grep -o '"request_id":"[^"]*"' | head -n1 | cut -d'"' -f4)
-    if [ -z "$req_id" ]; then
-        echo "Unknown" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-        echo "Unknown"
-        return
-    fi
-    sleep 3
-    local result=""
-    result=$(curl -s --max-time 4 "https://check-host.net/check-result/${req_id}" 2>/dev/null)
-    if [ -n "$result" ]; then
-        if echo "$result" | grep -q '"OK"'; then
-            echo "Available" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-            echo "Available"
-        else
-            echo "Blocked" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-            echo "Blocked"
-        fi
-    else
-        echo "Unknown" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-        echo "Unknown"
-    fi
-}
 
-# 显示IP列表并批量检测大陆可达性
+# 显示IP列表
 display_ip_list() {
-    yellow "正在检测本机IP的大陆可达性 (API: check-host.net)..."
-    
-    local req_ids=()
-    for ip in "${ALL_IPS[@]}"; do
-        local response=""
-        response=$(curl -s -H "Accept: application/json" --max-time 4 "https://check-host.net/check-ping?host=${ip}&node=cn" 2>/dev/null)
-        local req_id=""
-        if [ -n "$response" ]; then
-            req_id=$(echo "$response" | grep -o '"request_id":"[^"]*"' | head -n1 | cut -d'"' -f4)
-        fi
-        req_ids+=("$req_id")
-    done
-    
-    # 统一等待 3 秒以让节点返回检测结果
-    sleep 3
-    
     green "可用IP列表 (共 ${IP_COUNT} 个):"
     local idx=1
-    for i in "${!ALL_IPS[@]}"; do
-        local ip="${ALL_IPS[$i]}"
-        local req_id="${req_ids[$i]}"
-        local status="Unknown"
-        
-        if [ -n "$req_id" ]; then
-            local result=""
-            result=$(curl -s --max-time 4 "https://check-host.net/check-result/${req_id}" 2>/dev/null)
-            if [ -n "$result" ]; then
-                if echo "$result" | grep -q '"OK"'; then
-                    status="Available"
-                else
-                    status="Blocked"
-                fi
-            fi
-        fi
-        
-        # 写入缓存文件，供 generate_links 读取
-        echo "$status" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-        
-        if [[ "$status" == "Available" ]]; then
-            green "  [$idx] $ip  ->  [可用] (大陆未阻断)"
-        elif [[ "$status" == "Blocked" ]]; then
-            red "  [$idx] $ip  ->  [被墙] (Argo与CDN回源节点、proxyip依旧有效)"
-        else
-            yellow "  [$idx] $ip  ->  [未知] (检测超时)"
-        fi
+    for ip in "${ALL_IPS[@]}"; do
+        purple "  [$idx] $ip"
         ((idx++))
     done
 }
-
-
 
 # 检测端口是否被占用
 check_port_in_use() {
@@ -3533,54 +3457,15 @@ read_user_config() {
     if [[ "$ip_mode" == "2" ]]; then
         # 单IP模式 - 让用户选择或自动选择最佳IP
         USE_ALL_IPS=false
-        reading "请输入要使用的IP (回车自动选择最佳可用IP): " selected_ip
+        reading "请输入要使用的IP (回车自动选择第一个): " selected_ip
         if [ -z "$selected_ip" ]; then
-            # 自动选择最佳可用IP（优先选择 Available 的）
-            yellow "正在自动筛选最佳可用IP..."
-            local req_ids=()
-            for ip in "${ALL_IPS[@]}"; do
-                local response=""
-                response=$(curl -s -H "Accept: application/json" --max-time 4 "https://check-host.net/check-ping?host=${ip}&node=cn" 2>/dev/null)
-                local req_id=""
-                if [ -n "$response" ]; then
-                    req_id=$(echo "$response" | grep -o '"request_id":"[^"]*"' | head -n1 | cut -d'"' -f4)
-                fi
-                req_ids+=("$req_id")
-            done
-            
-            sleep 3
-            
-            for i in "${!ALL_IPS[@]}"; do
-                local ip="${ALL_IPS[$i]}"
-                local req_id="${req_ids[$i]}"
-                local status="Unknown"
-                if [ -n "$req_id" ]; then
-                    local result=""
-                    result=$(curl -s --max-time 4 "https://check-host.net/check-result/${req_id}" 2>/dev/null)
-                    if [ -n "$result" ] && echo "$result" | grep -q '"OK"'; then
-                        status="Available"
-                    fi
-                fi
-                if [[ "$status" == "Available" ]]; then
-                    selected_ip="$ip"
-                    break
-                fi
-            done
-            
-            # 如果没有找到 Available 的，退回第一个
-            if [ -z "$selected_ip" ]; then
-                selected_ip=${ALL_IPS[0]}
-                yellow "未检测到大陆可达的IP，默认选择第一个 IP: $selected_ip"
-            else
-                green "自动选择最佳可用 IP: $selected_ip (大陆未阻断)"
-            fi
+            selected_ip=${ALL_IPS[0]}
         fi
         # 只保留选中的IP
         ALL_IPS=("$selected_ip")
         IP_COUNT=1
         printf '%s\n' "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
         green "选择的IP: $selected_ip (单IP模式)"
-
     else
         # 所有IP模式
         USE_ALL_IPS=true
@@ -4352,7 +4237,6 @@ show_singbox_log() {
 # 启动Argo隧道
 start_argo() {
     cd "$WORKDIR"
-    load_saved_config
     CF_BINARY=$(cat cf.txt 2>/dev/null)
     
     if [ -z "$CF_BINARY" ] || [ ! -f "$CF_BINARY" ]; then
@@ -4360,10 +4244,8 @@ start_argo() {
         return 1
     fi
     
-    # 杀掉现有进程 (与甬哥一致，分别处理临时和固定隧道的进程)
-    ps aux | grep '[t]unnel --u' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
-    ps aux | grep '[t]unnel --n' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
-    pkill -x "$CF_BINARY" >/dev/null 2>&1
+    # 杀掉现有进程
+    pkill -f "tunnel" >/dev/null 2>&1
     
     # 清空旧日志
     > "$WORKDIR/argo.log"
@@ -4371,7 +4253,7 @@ start_argo() {
     local args=""
     if [[ -n "$ARGO_AUTH" ]]; then
         if [[ $ARGO_AUTH =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-            # Token格式 (与甬哥一致，不添加额外参数)
+            # Token格式
             args="tunnel --no-autoupdate run --token ${ARGO_AUTH}"
         elif [[ $ARGO_AUTH =~ TunnelSecret ]]; then
             # JSON格式
@@ -4391,49 +4273,21 @@ EOF
             args="tunnel --edge-ip-version auto --config tunnel.yml run"
         fi
     else
-        # 临时隧道 - 与甬哥一致: 不指定 --protocol http2，让 cloudflared 自行选择最佳协议
-        rm -rf boot.log
+        # 临时隧道 - 日志写入boot.log
         args="tunnel --url http://localhost:$VMESS_PORT --no-autoupdate --logfile boot.log --loglevel info"
     fi
     
     # 启动cloudflared，保存日志
     nohup ./"$CF_BINARY" $args >> "$WORKDIR/argo.log" 2>&1 &
-    sleep 10
+    sleep 5
     
     if pgrep -x "$CF_BINARY" > /dev/null; then
         green "Argo隧道已启动"
-        # 验证隧道是否真正可用 (与甬哥一致: curl 检查返回 404 表示隧道有效)
-        if [ -f "$WORKDIR/boot.log" ]; then
-            local argosl=$(cat "$WORKDIR/boot.log" 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
-            local checkhttp=$(curl -o /dev/null -s -w "%{http_code}\n" "https://$argosl" 2>/dev/null)
-            if [[ "$checkhttp" == "404" ]]; then
-                green "Argo临时隧道验证通过 (域名有效)"
-            else
-                yellow "Argo临时隧道域名暂未验证通过，可能需要等待，保活会自动恢复"
-            fi
-        else
-            local argogd=$(cat "$WORKDIR/ARGO_DOMAIN.log" 2>/dev/null)
-            local checkhttp=$(curl --max-time 2 -o /dev/null -s -w "%{http_code}\n" "https://$argogd" 2>/dev/null)
-            if [[ "$checkhttp" == "404" ]]; then
-                green "Argo固定隧道验证通过 (域名有效)"
-            else
-                yellow "Argo固定隧道域名验证未通过，请检查域名/端口/密钥配置"
-            fi
-        fi
         return 0
     else
-        red "Argo隧道启动失败，重启中..."
-        pkill -x "$CF_BINARY" 2>/dev/null
-        nohup ./"$CF_BINARY" $args >> "$WORKDIR/argo.log" 2>&1 &
-        sleep 5
-        if pgrep -x "$CF_BINARY" > /dev/null; then
-            purple "Argo隧道重启成功"
-            return 0
-        else
-            red "Argo隧道重启仍然失败"
-            show_argo_log
-            return 1
-        fi
+        red "Argo隧道启动失败"
+        show_argo_log
+        return 1
     fi
 }
 
@@ -4580,13 +4434,12 @@ get_argo_domain() {
         echo "$ARGO_DOMAIN"
     else
         local retry=0
-        local max_retries=6
+        local max_retries=10
         local argodomain=""
         
         while [[ $retry -lt $max_retries ]]; do
             ((retry++))
-            # 与甬哥一致: 使用 awk NR==2 提取第2行匹配的域名 (第2行通常是最终确定的隧道域名)
-            argodomain=$(cat "$WORKDIR/boot.log" 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+            argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "$WORKDIR/boot.log" 2>/dev/null | head -1 | sed 's@https://@@')
             if [[ -n $argodomain ]]; then
                 break
             fi
@@ -4594,7 +4447,7 @@ get_argo_domain() {
         done
         
         if [ -z "$argodomain" ]; then
-            argodomain="Argo临时域名暂时获取失败，Argo节点暂不可用(保活过程中会自动恢复)，其他节点依旧可用"
+            argodomain="Argo临时域名获取中,请稍后查看..."
         fi
         echo "$argodomain"
     fi
@@ -4632,14 +4485,7 @@ generate_links() {
     echo "可用IP列表 (共 ${IP_COUNT} 个):" >> list.txt
     local idx=1
     for ip in "${ALL_IPS[@]}"; do
-        local status=$(cat "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null)
-        if [[ "$status" == "Available" ]]; then
-            echo "  [$idx] $ip : 可用" >> list.txt
-        elif [[ "$status" == "Blocked" ]]; then
-            echo "  [$idx] $ip : 被墙 (Argo与CDN回源节点、proxyip依旧有效)" >> list.txt
-        else
-            echo "  [$idx] $ip : 未知 (检测超时)" >> list.txt
-        fi
+        echo "  [$idx] $ip" >> list.txt
         ((idx++))
     done
     echo "" >> list.txt
@@ -4686,76 +4532,36 @@ generate_links() {
         purple "VMess-WS 直连节点已生成 (${IP_COUNT} 个)"
     fi
     
-    # VMess WS Argo - 与甬哥一致: add地址统一使用CDN优选地址, 通过host/sni携带Argo域名路由
+    # VMess WS Argo (TLS) - Argo只需要一个
     if [[ "$ENABLE_ARGO" == "true" ]] && [[ -n "$ARGO_DOMAIN_FINAL" ]]; then
         echo "=== VMess-WS-Argo ===" >> list.txt
-        
-        # 与甬哥一致: add地址统一使用 $CFIP (默认 www.visa.com.hk)
-        # 无论临时还是固定隧道, 都通过CF CDN网络, 客户端需连接CF入口节点
-        local argo_add="$CFIP"
-        
-        # 主 Argo TLS 节点 (与甬哥一致: 端口8443, add使用CDN优选地址)
-        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$argo_add\", \"port\": \"8443\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
+        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$CFIP\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
         echo "vmess://$vmess_argo_tls" >> links.txt
         
-        # 主 Argo 非TLS 节点 (与甬哥一致: 端口8880)
-        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$argo_add\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$CFIP\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
         echo "vmess://$vmess_argo" >> links.txt
         
-        echo "Argo TLS (CDN优选IP节点, 地址可自行修改优选IP/域名, 被墙依旧能用):" >> list.txt
+        echo "Argo TLS:" >> list.txt
         echo "vmess://$vmess_argo_tls" >> list.txt
         echo "" >> list.txt
-        echo "Argo NoTLS (CDN优选IP节点, 地址可自行修改优选IP/域名, 被墙依旧能用):" >> list.txt
+        echo "Argo NoTLS:" >> list.txt
         echo "vmess://$vmess_argo" >> list.txt
         echo "" >> list.txt
         ((node_count+=2))
         
-        # 与甬哥一致: 通过curl检测Argo域名是否返回404来判断隧道是否有效
-        # 有效则生成CDN多端口优选节点 (使用不同的CF IP段, 与甬哥完全一致)
-        local argo_valid=false
-        if [ -f "$WORKDIR/boot.log" ]; then
-            local argosl=$(cat "$WORKDIR/boot.log" 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
-            local checkhttp=$(curl -o /dev/null -s -w "%{http_code}\n" "https://$argosl" 2>/dev/null)
-            [[ "$checkhttp" == "404" ]] && argo_valid=true
-        else
-            local argogd=$(cat "$WORKDIR/ARGO_DOMAIN.log" 2>/dev/null)
-            local checkhttp=$(curl --max-time 2 -o /dev/null -s -w "%{http_code}\n" "https://$argogd" 2>/dev/null)
-            [[ "$checkhttp" == "404" ]] && argo_valid=true
-        fi
+        # 多个CDN端点
+        for port in 443 2053 2083 2087 2096 8443; do
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.16.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+            echo "vmess://$vmess_cdn" >> links.txt
+            ((node_count++))
+        done
         
-        if [[ "$argo_valid" == "true" ]]; then
-            # 与甬哥一致: 生成CDN优选IP多端口节点 (使用不同的CF IP段 104.16~104.27)
-            # 6个 TLS 443系端口节点
-            vmess_cdn1=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-443\", \"add\": \"104.16.0.0\", \"port\": \"443\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn1" >> links.txt
-            vmess_cdn2=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2053\", \"add\": \"104.17.0.0\", \"port\": \"2053\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn2" >> links.txt
-            vmess_cdn3=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2083\", \"add\": \"104.18.0.0\", \"port\": \"2083\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn3" >> links.txt
-            vmess_cdn4=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2087\", \"add\": \"104.19.0.0\", \"port\": \"2087\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn4" >> links.txt
-            vmess_cdn5=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2096\", \"add\": \"104.20.0.0\", \"port\": \"2096\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn5" >> links.txt
-            
-            # 7个非TLS 80系端口节点
-            vmess_cdn6=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-80\", \"add\": \"104.21.0.0\", \"port\": \"80\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn6" >> links.txt
-            vmess_cdn7=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-8080\", \"add\": \"104.22.0.0\", \"port\": \"8080\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn7" >> links.txt
-            vmess_cdn8=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2052\", \"add\": \"104.24.0.0\", \"port\": \"2052\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn8" >> links.txt
-            vmess_cdn9=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2082\", \"add\": \"104.25.0.0\", \"port\": \"2082\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn9" >> links.txt
-            vmess_cdn10=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2086\", \"add\": \"104.26.0.0\", \"port\": \"2086\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn10" >> links.txt
-            vmess_cdn11=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-2095\", \"add\": \"104.27.0.0\", \"port\": \"2095\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn11" >> links.txt
-            
-            ((node_count+=11))
-            purple "VMess-WS-Argo 节点已生成 (含13个CDN优选IP节点, 已添加CF不死IP)"
-        else
-            purple "VMess-WS-Argo 主节点已生成 (CDN优选节点待隧道验证通过后生成)"
-        fi
+        for port in 80 8080 8880 2052 2082 2086 2095; do
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.17.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+            echo "vmess://$vmess_cdn" >> links.txt
+            ((node_count++))
+        done
+        purple "VMess-WS-Argo 节点已生成 (含CDN节点)"
     fi
     
     # 为每个IP生成 Trojan WS
@@ -5176,52 +4982,28 @@ generate_custom_subscription() {
     
     if [[ "$sel_argo" == "true" ]] && [[ -n "$ARGO_DOMAIN_FINAL" ]]; then
         CFIP=${CFIP:-'www.visa.com.hk'}
+        CFPORT=${CFPORT:-'443'}
         
-        # 与甬哥一致: add地址统一使用 $CFIP (CDN优选地址)
-        local argo_add="$CFIP"
-        
-        # 主 Argo TLS 节点 (端口8443)
-        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$argo_add\", \"port\": \"8443\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
+        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$CFIP\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
         echo "vmess://$vmess_argo_tls" >> "$custom_links"
         
-        # 主 Argo 非TLS 节点 (端口8880)
-        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$argo_add\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$CFIP\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
         echo "vmess://$vmess_argo" >> "$custom_links"
         ((node_count+=2))
         
-        # CDN优选IP多端口节点 (使用不同CF IP段, 与甬哥一致)
-        local argo_valid=false
-        if [ -f "$WORKDIR/boot.log" ]; then
-            local argosl=$(cat "$WORKDIR/boot.log" 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
-            local checkhttp=$(curl -o /dev/null -s -w "%{http_code}\n" "https://$argosl" 2>/dev/null)
-            [[ "$checkhttp" == "404" ]] && argo_valid=true
-        else
-            local argogd=$(cat "$WORKDIR/ARGO_DOMAIN.log" 2>/dev/null)
-            local checkhttp=$(curl --max-time 2 -o /dev/null -s -w "%{http_code}\n" "https://$argogd" 2>/dev/null)
-            [[ "$checkhttp" == "404" ]] && argo_valid=true
-        fi
+        # CDN节点
+        for port in 443 2053 2083 2087 2096 8443; do
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.16.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+            echo "vmess://$vmess_cdn" >> "$custom_links"
+            ((node_count++))
+        done
         
-        if [[ "$argo_valid" == "true" ]]; then
-            # TLS 443系端口
-            for entry in "443:104.16.0.0" "2053:104.17.0.0" "2083:104.18.0.0" "2087:104.19.0.0" "2096:104.20.0.0"; do
-                local port="${entry%%:*}"
-                local ip="${entry#*:}"
-                vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-$port\", \"add\": \"$ip\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
-                echo "vmess://$vmess_cdn" >> "$custom_links"
-                ((node_count++))
-            done
-            # 非TLS 80系端口
-            for entry in "80:104.21.0.0" "8080:104.22.0.0" "2052:104.24.0.0" "2082:104.25.0.0" "2086:104.26.0.0" "2095:104.27.0.0"; do
-                local port="${entry%%:*}"
-                local ip="${entry#*:}"
-                vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-$port\", \"add\": \"$ip\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-                echo "vmess://$vmess_cdn" >> "$custom_links"
-                ((node_count++))
-            done
-            purple "✓ 已添加 VMess-WS-Argo 节点 (含CDN优选IP节点)"
-        else
-            purple "✓ 已添加 VMess-WS-Argo 主节点 (CDN节点待隧道验证后生成)"
-        fi
+        for port in 80 8080 8880 2052 2082 2086 2095; do
+            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"104.17.0.0\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+            echo "vmess://$vmess_cdn" >> "$custom_links"
+            ((node_count++))
+        done
+        purple "✓ 已添加 VMess-WS-Argo 节点 (含CDN节点)"
     fi
     
     if [[ "$sel_trojan" == "true" ]]; then
@@ -5509,7 +5291,7 @@ reset_argo() {
     # 显示当前状态
     if [ -f "boot.log" ]; then
         green "当前使用: Argo临时隧道"
-        current_domain=$(cat boot.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+        current_domain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' boot.log 2>/dev/null | head -1 | sed 's@https://@@')
         [ -n "$current_domain" ] && purple "临时域名: $current_domain"
     else
         green "当前使用: Argo固定隧道"
@@ -6232,45 +6014,6 @@ menu() {
     green "  Serv00/Hostuno 多协议节点安装脚本 v${SCRIPT_VERSION}"
     green "============================================================"
     purple "  支持协议: Argo, VLESS-Reality, VMess, Trojan, Hy2, TUIC, SS"
-    echo "============================================================"
-    
-    # 确保 ALL_IPS 已加载
-    if [ ${#ALL_IPS[@]} -eq 0 ]; then
-        if [ -f "$WORKDIR/all_ips.txt" ]; then
-            mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
-        else
-            get_all_ips >/dev/null 2>&1
-        fi
-    fi
-    
-    # 检测并显示IP状态（优先读取缓存）
-    purple "  本机IP及大陆可达性检测 (API: check-host.net):"
-    local all_cached=true
-    for ip in "${ALL_IPS[@]}"; do
-        if [ ! -f "$WORKDIR/ip_status_${ip}.txt" ]; then
-            all_cached=false
-            break
-        fi
-    done
-    
-    # 如果没有全部缓存，则进行一次实时检测
-    if [ "$all_cached" = "false" ]; then
-        display_ip_list >/dev/null 2>&1
-    fi
-    
-    # 从缓存显示状态
-    local idx=1
-    for ip in "${ALL_IPS[@]}"; do
-        local status=$(cat "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null)
-        if [[ "$status" == "Available" ]]; then
-            green "    [$idx] $ip  ->  [可用] (大陆未阻断)"
-        elif [[ "$status" == "Blocked" ]]; then
-            red "    [$idx] $ip  ->  [被墙] (Argo与CDN回源节点、proxyip依旧有效)"
-        else
-            yellow "    [$idx] $ip  ->  [未知] (检测超时)"
-        fi
-        ((idx++))
-    done
     echo "============================================================"
     echo
     
