@@ -521,13 +521,13 @@ start_singbox() {
         return 1
     fi
     # 停止已有进程
-    pkill -f "$BINDIR/sing-box" >/dev/null 2>&1 || true
+    pkill -f "sing-box" >/dev/null 2>&1 || killall sing-box >/dev/null 2>&1 || true
     sleep 1
     # 启动
     > "$LOGDIR/singbox.log"
     run_detached "$LOGDIR/singbox.log" "$BINDIR/sing-box" run -c "$WORKDIR/config.json"
     sleep 2
-    if pgrep -f "$BINDIR/sing-box" >/dev/null 2>&1; then
+    if pgrep -f "sing-box" >/dev/null 2>&1 || pidof sing-box >/dev/null 2>&1; then
         green "✓ sing-box 已成功启动"
         return 0
     else
@@ -586,9 +586,23 @@ get_sub_domain() {
 # 停止所有服务
 stop_all() {
     yellow "正在停止所有服务..."
-    pkill -f "$BINDIR/sing-box" >/dev/null 2>&1 || true
-    pkill -f "$BINDIR/cloudflared" >/dev/null 2>&1 || true
+    load_params
+    
+    # 彻底停止相关进程
+    pkill -f "sing-box" >/dev/null 2>&1 || killall sing-box >/dev/null 2>&1 || true
+    pkill -f "cloudflared" >/dev/null 2>&1 || killall cloudflared >/dev/null 2>&1 || true
+    pkill -f "tunnel" >/dev/null 2>&1 || true
     pkill -f "http.server 18000" >/dev/null 2>&1 || true
+    
+    # 强制释放可能占用我们配置端口的进程 (如果有权限)
+    if [ -n "$PORT1" ] || [ -n "$PORT2" ] || [ -n "$PORT3" ]; then
+        local pids
+        pids=$(netstat -tulpn 2>/dev/null | grep -E ":(${PORT1:-0}|${PORT2:-0}|${PORT3:-0}) " | awk '{print $7}' | cut -d'/' -f1 | grep -E '^[0-9]+$')
+        if [ -n "$pids" ]; then
+            kill -9 $pids >/dev/null 2>&1 || true
+        fi
+    fi
+    
     green "✓ 所有服务已完全停止"
 }
 
@@ -748,7 +762,7 @@ keep_alive() {
     fi
     
     # 1. 检测并重启 sing-box
-    if ! pgrep -f "$BINDIR/sing-box" >/dev/null 2>&1; then
+    if ! (pgrep -f "sing-box" >/dev/null 2>&1 || pidof sing-box >/dev/null 2>&1); then
         echo "[$(date)] sing-box 崩溃退出，正在重新拉起..." >> "$LOGDIR/keep_alive.log"
         start_singbox >> "$LOGDIR/keep_alive.log" 2>&1
     fi
@@ -904,7 +918,7 @@ show_menu() {
     
     # 显示服务当前状态
     echo -n "  服务状态: "
-    if pgrep -f "$BINDIR/sing-box" >/dev/null 2>&1; then
+    if pgrep -f "sing-box" >/dev/null 2>&1 || pidof sing-box >/dev/null 2>&1; then
         green "● 运行中"
     else
         red "○ 未运行"
