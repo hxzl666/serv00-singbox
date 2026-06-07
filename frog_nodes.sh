@@ -952,6 +952,7 @@ enable_cron() {
 disable_cron() {
     crontab -l 2>/dev/null | grep -Fv "frog_nodes.sh" | crontab -
     green "✓ 保活 crontab 定时任务已禁用"
+}
 
 # ==================== 快捷命令 ====================
 
