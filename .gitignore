@@ -1,0 +1,4 @@
+*.log
+*.bak
+temp_*.sh
+temp_yg.sh
