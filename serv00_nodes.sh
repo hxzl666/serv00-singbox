@@ -64,7 +64,7 @@ export ARGO_AUTH=${ARGO_AUTH:-''}
 export NEZHA_SERVER=${NEZHA_SERVER:-''}
 export NEZHA_PORT=${NEZHA_PORT:-''}
 export NEZHA_KEY=${NEZHA_KEY:-''}
-export CFIP=${CFIP:-'www.visa.com.hk'}
+export CFIP=${CFIP:-'cdn.2020111.xyz'}
 export CFPORT=${CFPORT:-'443'}
 export SUB_TOKEN=${SUB_TOKEN:-${UUID:0:8}}
 
@@ -4690,7 +4690,7 @@ generate_links() {
     if [[ "$ENABLE_ARGO" == "true" ]] && [[ -n "$ARGO_DOMAIN_FINAL" ]]; then
         echo "=== VMess-WS-Argo ===" >> list.txt
         
-        # 与甬哥一致: add地址统一使用 $CFIP (默认 www.visa.com.hk)
+        # 与甬哥一致: add地址统一使用 $CFIP (默认 cdn.2020111.xyz)
         # 无论临时还是固定隧道, 都通过CF CDN网络, 客户端需连接CF入口节点
         local argo_add="$CFIP"
         
@@ -5175,7 +5175,7 @@ generate_custom_subscription() {
     fi
     
     if [[ "$sel_argo" == "true" ]] && [[ -n "$ARGO_DOMAIN_FINAL" ]]; then
-        CFIP=${CFIP:-'www.visa.com.hk'}
+        CFIP=${CFIP:-'cdn.2020111.xyz'}
         
         # 与甬哥一致: add地址统一使用 $CFIP (CDN优选地址)
         local argo_add="$CFIP"
