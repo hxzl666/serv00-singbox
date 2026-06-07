@@ -197,6 +197,40 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 
 ---
 
+## 🌐 Cloudflare Workers 自动保活 (探针检测 + Telegram 通知)
+
+为了防止 Argo 临时隧道长时间无流量被 Cloudflare 断连，或者监控节点的在线状态，您可以部署 Cloudflare Workers 探针脚本定期请求您的节点或订阅发布页。
+
+### 1. 部署步骤
+1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com/)，在左侧导航栏依次进入 **Workers & Pages -> Create Application -> Create Worker**。
+2. 为 Worker 取一个名称（例如 `serv00-keepalive`），点击 **Deploy**。
+3. 点击 **Edit Code** 按钮，清除编辑器中的默认代码，将本项目根目录下的 [workers_keep_alive.js](file:///d:/workspace/sb/workers_keep_alive.js) 内容完整复制并粘贴进去。
+4. 点击右上角 **Save and deploy** 部署。
+
+### 2. 配置环境变量 (推荐)
+为了避免在代码中硬编码敏感信息并导致信息泄露，请在 Worker 部署页面进入 **Settings -> Variables**，在 **Environment Variables** 区域点击 **Add variable**，配置以下三个环境变量：
+
+| 变量名称 | 是否必填 | 示例值 / 说明 |
+| :--- | :---: | :--- |
+| **`URLS`** | 是 | 需要保活的域名或链接。支持多个，以半角逗号 `,` 分隔。例如：`https://xxx.trycloudflare.com,https://yourdomain.com` |
+| **`TELEGRAM_BOT_TOKEN`** | 否 | 您的 Telegram Bot API Token，例如 `123456:ABC-DEF...` |
+| **`TELEGRAM_CHAT_ID`** | 否 | 接收通知的 Telegram 用户的 Chat ID，例如 `987654321` |
+
+### 3. 配置定时触发器 (Cron Triggers)
+1. 在 Worker 的管理页面上，点击 **Triggers** 选项卡。
+2. 滚动到 **Cron Triggers** 部分，点击 **Add Trigger**。
+3. 配置一个定时表达式：
+   - 如果想高频防断连，建议配置为 `*/30 * * * *` (每 30 分钟触发一次)
+   - 如果想日常监控，可配置为 `0 */2 * * *` (每 2 小时触发一次)
+4. 点击 **Add** 保存。
+
+### ⚠️ 重要提醒与原理区别
+* **探针保活 (Workers 脚本)**：主要通过发送 `HTTP GET` 请求来激活 Argo 隧道或检测节点响应。**它运行在轻量级的沙盒环境中，不支持 SSH 协议，因此当服务器上的代理进程被系统杀死时，它无法登录服务器拉起进程。**
+* **登录保活 (GitHub Actions)**：利用虚拟机的完整操作系统，通过 `sshpass` 真实登录到您的 Serv00/Frog 容器中执行退出或拉起，**属于真正的后台重启动作**。
+* **最佳实践**：建议两者结合使用，或者使用一键脚本的**菜单选项 6 (开启 Cron 定时保活)**，在 VPS 本地维持进程，同时用 Workers 发送高频流量并监控状态。
+
+---
+
 ## 📱 客户端配置
 
 ### 注意事项
