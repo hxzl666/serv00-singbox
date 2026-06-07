@@ -159,47 +159,9 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 
 ---
 
-## ⏰ GitHub Actions 自动保活 (支持 Telegram 通知)
+## ⏰ Cloudflare Workers 自动保活 (支持 Telegram 通知)
 
-为了防止 Serv00 / Hostuno / Frog VPS 因长时间未活动而被官方清理或冻结账号，您可以利用 GitHub Actions 设置定期自动 SSH 登录进行账号“保活”，并支持在每次执行后推送 Telegram 结果通知。
-
-### 1. 配置工作流文件
-在您自己的 GitHub 仓库根目录下创建 `.github/workflows/` 目录结构，并在其中新建 `ssh_keep_alive.yml` 文件，将项目根目录中的 [ssh_keep_alive.yml](file:///d:/workspace/sb/ssh_keep_alive.yml) 内容复制并粘贴至该文件中。
-
-### 2. 配置 GitHub Secrets
-进入您 GitHub 仓库的 **Settings -> Secrets and variables -> Actions** 中，添加以下三个 Repository Secrets：
-
-| Secret 名称 | 是否必填 | 说明 |
-| :--- | :---: | :--- |
-| **`ACCOUNTS`** | 是 | 需要定期登录保活的服务器账户 JSON 串（格式参考下方） |
-| **`TELEGRAM_BOT_TOKEN`** | 否 | 您的 Telegram Bot API Token，若不需要 TG 通知可不填 |
-| **`TELEGRAM_CHAT_ID`** | 否 | 接收通知的 Telegram 用户的 Chat ID，若不需要 TG 通知可不填 |
-
-#### `ACCOUNTS` 配置值格式示例
-请严格按照以下 JSON 格式输入到 `ACCOUNTS` 中（支持多台 VPS 主机批量保活，用英文逗号分隔）：
-
-```json
-[
-  {
-    "SSH_USER": "frog",
-    "SSH_PASS": "你的FROG登录密码",
-    "HOST": "f1194.mikr.us",
-    "PORT": "22"
-  },
-  {
-    "SSH_USER": "你的serv00用户名",
-    "SSH_PASS": "你的serv00密码",
-    "HOST": "s12.serv00.com",
-    "PORT": "22"
-  }
-]
-```
-
----
-
-## 🌐 Cloudflare Workers 自动保活 (探针检测 + Telegram 通知)
-
-为了防止 Argo 临时隧道长时间无流量被 Cloudflare 断连，或者监控节点的在线状态，您可以部署 Cloudflare Workers 探针脚本定期请求您的节点或订阅发布页。
+为了防止 Argo 临时隧道长时间无流量被 Cloudflare 断连，或者监控 Serv00 / Hostuno / Frog VPS 节点的在线状态，您可以部署 Cloudflare Workers 探针脚本，定期自动发起 HTTP 请求以维持其活跃，并在每次检测后向您的 Telegram 推送状态汇报。
 
 ### 1. 部署步骤
 1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com/)，在左侧导航栏依次进入 **Workers & Pages -> Create Application -> Create Worker**。
@@ -208,7 +170,7 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 4. 点击右上角 **Save and deploy** 部署。
 
 ### 2. 配置环境变量 (推荐)
-为了避免在代码中硬编码敏感信息并导致信息泄露，请在 Worker 部署页面进入 **Settings -> Variables**，在 **Environment Variables** 区域点击 **Add variable**，配置以下三个环境变量：
+为了避免在代码中硬编码敏感信息并导致凭据泄漏，请在 Worker 部署页面进入 **Settings -> Variables**，在 **Environment Variables** 区域点击 **Add variable**，配置以下三个环境变量：
 
 | 变量名称 | 是否必填 | 示例值 / 说明 |
 | :--- | :---: | :--- |
@@ -220,14 +182,13 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 1. 在 Worker 的管理页面上，点击 **Triggers** 选项卡。
 2. 滚动到 **Cron Triggers** 部分，点击 **Add Trigger**。
 3. 配置一个定时表达式：
-   - 如果想高频防断连，建议配置为 `*/30 * * * *` (每 30 分钟触发一次)
-   - 如果想日常监控，可配置为 `0 */2 * * *` (每 2 小时触发一次)
+   - **高频防断连（推荐）**：配置为 `*/30 * * * *` (每 30 分钟触发一次)
+   - **日常监控**：可配置为 `0 */2 * * *` (每 2 小时触发一次)
 4. 点击 **Add** 保存。
 
-### ⚠️ 重要提醒与原理区别
-* **探针保活 (Workers 脚本)**：主要通过发送 `HTTP GET` 请求来激活 Argo 隧道或检测节点响应。**它运行在轻量级的沙盒环境中，不支持 SSH 协议，因此当服务器上的代理进程被系统杀死时，它无法登录服务器拉起进程。**
-* **登录保活 (GitHub Actions)**：利用虚拟机的完整操作系统，通过 `sshpass` 真实登录到您的 Serv00/Frog 容器中执行退出或拉起，**属于真正的后台重启动作**。
-* **最佳实践**：建议两者结合使用，或者使用一键脚本的**菜单选项 6 (开启 Cron 定时保活)**，在 VPS 本地维持进程，同时用 Workers 发送高频流量并监控状态。
+### 💡 提示与说明
+- 您也可以直接访问 Worker 的 `.workers.dev` 访问地址，手动触发一次保活和 Telegram 推送。
+- 建议配合您在 VPS 上一键脚本的**菜单选项 6 (开启 Cron 定时保活)**，在服务器本地维持进程稳定，同时利用此 Workers 脚本发送探测流量并实时监控状态。
 
 ---
 
