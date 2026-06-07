@@ -4352,6 +4352,7 @@ show_singbox_log() {
 # 启动Argo隧道
 start_argo() {
     cd "$WORKDIR"
+    load_saved_config
     CF_BINARY=$(cat cf.txt 2>/dev/null)
     
     if [ -z "$CF_BINARY" ] || [ ! -f "$CF_BINARY" ]; then
