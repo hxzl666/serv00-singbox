@@ -51,7 +51,7 @@ bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzlpl
 
 ---
 
-## 🐸 一键安装 (Frog VPS - Alpine Linux)
+## 🐸 一键安装与保活 (Frog VPS - Alpine Linux)
 
 由于 Frog VPS 默认以普通用户 `frog` 登录且资源受限，安装前请先在命令行运行 `sudo su` 切换为管理员身份以自动下载系统依赖：
 
@@ -63,11 +63,17 @@ sudo su
 bash <(curl -Lks https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
 ```
 
-或者使用 wget:
+或者使用 wget (推荐使用非静默命令，一旦网络连接或解析出错可直观排查)：
 
 ```bash
-bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
+bash <(wget --no-check-certificate -O- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
 ```
+
+### 快捷命令与保活说明
+1. **快捷菜单**：安装完成后，首次在当前终端使用请先执行 `source ~/.bashrc` 刷新环境变量，随后在终端任意路径直接输入 **`sb`** 即可调出脚本菜单。
+2. **本地 Crontab 保活**：在一键安装完成后，脚本会自动设置并启动每 5 分钟检测一次的保活定时任务。您也可以通过快捷菜单 `sb` 选择 **`6`**（开启 Cron 保活）或 **`7`**（关闭 Cron 保活）来手动管理。
+3. **防止 SSH 退出进程丢失**：脚本已优化 `disown` 逻辑，最大程度防止 SSH 会话关闭时进程被系统强杀。若您重连后发现服务未运行，可直接运行 `sb` 别名（或本地路径 `bash ~/singbox/frog_nodes.sh`）并选择 **`2`** 重新一键启动。
+4. **远程 SSH 登录保活**：由于部分轻量主机长时间未活跃会被系统清理，建议配合下方 [Cloudflare Workers 自动保活](#-cloudflare-workers-自动保活-ssh-登录与命令执行保活--telegram-通知) 设置定时 SSH 登录与服务状态监控，以防封号。
 
 ---
 
