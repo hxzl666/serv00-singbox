@@ -273,7 +273,7 @@ ss://method:password@ip:port#name
 
 1. 确保安装了保活服务
 2. 检查保活页面是否正常运行
-3. 设置 GitHub Actions 或 Workers 保活
+3. 设置 Workers 保活
 
 ### Q: 什么是 WARP 出站？
 
