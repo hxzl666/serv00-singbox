@@ -804,27 +804,20 @@ disable_cron() {
 
 # 创建快捷命令
 create_quick_command() {
-    COMMAND="sb"
-    SCRIPT_PATH="$HOME/bin/$COMMAND"
-    mkdir -p "$HOME/bin"
+    # 清理旧的 bin/sb 文件，避免与别名冲突
+    rm -f "$HOME/bin/sb" 2>/dev/null
     
-    cat > "$SCRIPT_PATH" <<'EOF'
-#!/bin/bash
-bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
-EOF
+    # 清理已有的旧别名配置，防止重复追加
+    sed -i '/alias sb=/d' "$HOME/.bashrc" 2>/dev/null
+    sed -i '/alias sb=/d' "$HOME/.profile" 2>/dev/null
     
-    chmod +x "$SCRIPT_PATH"
+    # 将快捷命令写入别名 alias
+    echo "alias sb=\"bash $WORKDIR/frog_nodes.sh\"" >> "$HOME/.bashrc" 2>/dev/null
+    echo "alias sb=\"bash $WORKDIR/frog_nodes.sh\"" >> "$HOME/.profile" 2>/dev/null
     
-    if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
-        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc" 2>/dev/null
-        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.profile" 2>/dev/null
-        source "$HOME/.bashrc" 2>/dev/null
-        source "$HOME/.profile" 2>/dev/null
-    fi
-    
-    green "✓ 快捷命令 'sb' 已创建"
-    yellow "  ⚠️ 提示：由于当前会话环境变量限制，首次使用前您需要断开 SSH 重新连接，"
-    yellow "  或者在当前终端手动执行以下命令，即可立即生效："
+    green "✓ 快捷命令 'sb' 已创建 (已通过 Shell 别名写入配置)"
+    yellow "  ⚠️ 提示：由于当前终端会话环境变量未刷新，"
+    yellow "  您需要断开 SSH 重新连接，或手动执行以下命令使之立即生效："
     green "  source ~/.bashrc"
 }
 
@@ -834,8 +827,13 @@ uninstall() {
     yellow "正在卸载并清除所有节点服务与配置..."
     disable_cron
     stop_all
-    rm -rf "$WORKDIR"
+    
+    # 清理快捷命令别名
+    sed -i '/alias sb=/d' "$HOME/.bashrc" 2>/dev/null
+    sed -i '/alias sb=/d' "$HOME/.profile" 2>/dev/null
     rm -f "${HOME}/bin/sb" 2>/dev/null
+    
+    rm -rf "$WORKDIR"
     green "✓ 卸载清理完毕！"
 }
 
