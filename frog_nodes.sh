@@ -102,6 +102,8 @@ run_detached() {
     else
         nohup "$@" </dev/null >>"$logfile" 2>&1 &
     fi
+    # 尝试 disown 释放与当前 Shell 会话的关联，防止 SSH 登出时进程被杀死
+    disown -h %$! 2>/dev/null || disown 2>/dev/null || true
 }
 
 # 获取最新 release
