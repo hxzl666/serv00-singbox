@@ -266,7 +266,10 @@ install_binaries() {
 
 # 生成自签名证书
 generate_certificate() {
-    if [ ! -f "$WORKDIR/cert.pem" ] || [ ! -f "$WORKDIR/private.key" ]; then
+    # 检查自签名证书 (要求存在且不为空文件)
+    if [ ! -f "$WORKDIR/cert.pem" ] || [ ! -s "$WORKDIR/cert.pem" ] || \
+       [ ! -f "$WORKDIR/private.key" ] || [ ! -s "$WORKDIR/private.key" ]; then
+        rm -f "$WORKDIR/cert.pem" "$WORKDIR/private.key"
         openssl ecparam -genkey -name prime256v1 -out "$WORKDIR/private.key" 2>/dev/null
         openssl req -new -x509 -days 3650 -key "$WORKDIR/private.key" -out "$WORKDIR/cert.pem" \
             -subj "/CN=frog.mikr.us" 2>/dev/null
@@ -276,16 +279,23 @@ generate_certificate() {
 
 # 生成 Reality 密钥对
 generate_reality_keys() {
-    if [ ! -f "$WORKDIR/public_key.txt" ] || [ ! -f "$WORKDIR/private_key.txt" ]; then
+    # 检查密钥对 (要求存在且不为空文件)
+    if [ ! -f "$WORKDIR/public_key.txt" ] || [ ! -s "$WORKDIR/public_key.txt" ] || \
+       [ ! -f "$WORKDIR/private_key.txt" ] || [ ! -s "$WORKDIR/private_key.txt" ]; then
+        rm -f "$WORKDIR/public_key.txt" "$WORKDIR/private_key.txt"
         local output
         output=$("$BINDIR/sing-box" generate reality-keypair 2>/dev/null)
         local priv
         priv=$(echo "${output}" | grep -i "PrivateKey" | awk '{print $2}')
         local pub
         pub=$(echo "${output}" | grep -i "PublicKey" | awk '{print $2}')
-        echo "$priv" > "$WORKDIR/private_key.txt"
-        echo "$pub" > "$WORKDIR/public_key.txt"
-        green "✓ Reality 密钥对生成完毕"
+        if [ -n "$priv" ] && [ -n "$pub" ]; then
+            echo "$priv" > "$WORKDIR/private_key.txt"
+            echo "$pub" > "$WORKDIR/public_key.txt"
+            green "✓ Reality 密钥对生成完毕"
+        else
+            red "警告: Reality 密钥对生成失败，请确认 sing-box 运行正常！"
+        fi
     fi
 }
 
