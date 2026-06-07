@@ -368,11 +368,11 @@ generate_singbox_config() {
   "dns": {
     "servers": [
       {
-        "address": "8.8.8.8",
-        "address_resolver": "local"
+        "tag": "dns-remote",
+        "address": "8.8.8.8"
       },
       {
-        "tag": "local",
+        "tag": "dns-local",
         "address": "local"
       }
     ]
