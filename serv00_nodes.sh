@@ -4658,10 +4658,21 @@ generate_links() {
     # VMess WS Argo (TLS) - Argo只需要一个
     if [[ "$ENABLE_ARGO" == "true" ]] && [[ -n "$ARGO_DOMAIN_FINAL" ]]; then
         echo "=== VMess-WS-Argo ===" >> list.txt
-        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"cdn.2020111.xyz\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+        
+        # 判断是否为临时隧道
+        local argo_add=""
+        local is_temp_argo=false
+        if [[ "$ARGO_DOMAIN_FINAL" == *"trycloudflare.com"* ]]; then
+            argo_add="$ARGO_DOMAIN_FINAL"
+            is_temp_argo=true
+        else
+            argo_add="cdn.2020111.xyz"
+        fi
+        
+        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$argo_add\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
         echo "vmess://$vmess_argo_tls" >> links.txt
         
-        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"cdn.2020111.xyz\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$argo_add\", \"port\": \"80\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
         echo "vmess://$vmess_argo" >> links.txt
         
         echo "Argo TLS:" >> list.txt
@@ -4672,19 +4683,24 @@ generate_links() {
         echo "" >> list.txt
         ((node_count+=2))
         
-        # 多个CDN端点
-        for port in 443 2053 2083 2087 2096 8443; do
-            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"cdn.2020111.xyz\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn" >> links.txt
-            ((node_count++))
-        done
-        
-        for port in 80 8080 8880 2052 2082 2086 2095; do
-            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"cdn.2020111.xyz\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn" >> links.txt
-            ((node_count++))
-        done
-        purple "VMess-WS-Argo 节点已生成 (含CDN节点)"
+        # 只有在固定自定义域名隧道时才支持 CDN 优选及多端口节点
+        if [[ "$is_temp_argo" == "false" ]]; then
+            # 多个CDN端点
+            for port in 443 2053 2083 2087 2096 8443; do
+                vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"$argo_add\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+                echo "vmess://$vmess_cdn" >> links.txt
+                ((node_count++))
+            done
+            
+            for port in 80 8080 8880 2052 2082 2086 2095; do
+                vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"$argo_add\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+                echo "vmess://$vmess_cdn" >> links.txt
+                ((node_count++))
+            done
+            purple "VMess-WS-Argo 节点已生成 (含CDN节点)"
+        else
+            purple "VMess-WS-Argo 临时节点已生成 (临时域名不支持非标端口，已精简)"
+        fi
     fi
     
     # 为每个IP生成 Trojan WS
@@ -5107,26 +5123,41 @@ generate_custom_subscription() {
         CFIP=${CFIP:-'www.visa.com.hk'}
         CFPORT=${CFPORT:-'443'}
         
-        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"cdn.2020111.xyz\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+        # 判断是否为临时隧道
+        local argo_add=""
+        local is_temp_argo=false
+        if [[ "$ARGO_DOMAIN_FINAL" == *"trycloudflare.com"* ]]; then
+            argo_add="$ARGO_DOMAIN_FINAL"
+            is_temp_argo=true
+        else
+            argo_add="cdn.2020111.xyz"
+        fi
+        
+        vmess_argo_tls=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo-tls\", \"add\": \"$argo_add\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
         echo "vmess://$vmess_argo_tls" >> "$custom_links"
         
-        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"cdn.2020111.xyz\", \"port\": \"8880\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+        vmess_argo=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-argo\", \"add\": \"$argo_add\", \"port\": \"80\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
         echo "vmess://$vmess_argo" >> "$custom_links"
         ((node_count+=2))
         
-        # CDN节点
-        for port in 443 2053 2083 2087 2096 8443; do
-            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"cdn.2020111.xyz\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn" >> "$custom_links"
-            ((node_count++))
-        done
-        
-        for port in 80 8080 8880 2052 2082 2086 2095; do
-            vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"cdn.2020111.xyz\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
-            echo "vmess://$vmess_cdn" >> "$custom_links"
-            ((node_count++))
-        done
-        purple "✓ 已添加 VMess-WS-Argo 节点 (含CDN节点)"
+        # 只有在固定自定义域名隧道时才支持 CDN 优选及多端口节点
+        if [[ "$is_temp_argo" == "false" ]]; then
+            # CDN节点
+            for port in 443 2053 2083 2087 2096 8443; do
+                vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"$argo_add\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN_FINAL\"}" | base64 -w0)
+                echo "vmess://$vmess_cdn" >> "$custom_links"
+                ((node_count++))
+            done
+            
+            for port in 80 8080 8880 2052 2082 2086 2095; do
+                vmess_cdn=$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-cdn-$port\", \"add\": \"$argo_add\", \"port\": \"$port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN_FINAL\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\"}" | base64 -w0)
+                echo "vmess://$vmess_cdn" >> "$custom_links"
+                ((node_count++))
+            done
+            purple "✓ 已添加 VMess-WS-Argo 节点 (含CDN节点)"
+        else
+            purple "✓ 已添加 VMess-WS-Argo 临时节点 (临时域名不支持非标端口，已精简)"
+        fi
     fi
     
     if [[ "$sel_trojan" == "true" ]]; then
