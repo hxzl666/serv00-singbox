@@ -596,10 +596,10 @@ stop_all() {
     pkill -f "tunnel" >/dev/null 2>&1 || true
     pkill -f "http.server 18000" >/dev/null 2>&1 || true
     
-    # 强制释放可能占用我们配置端口的进程 (如果有权限)
-    if [ -n "$PORT1" ] || [ -n "$PORT2" ] || [ -n "$PORT3" ]; then
+    # 强制释放所有可能被占用的配置端口 (如果有权限)
+    if [ -n "$PORT1" ] || [ -n "$PORT2" ] || [ -n "$PORT3" ] || [ -n "$PORT_VMESS_V6" ] || [ -n "$PORT_SS_V6" ]; then
         local pids
-        pids=$(netstat -tulpn 2>/dev/null | grep -E ":(${PORT1:-0}|${PORT2:-0}|${PORT3:-0}) " | awk '{print $7}' | cut -d'/' -f1 | grep -E '^[0-9]+$')
+        pids=$(netstat -tulpn 2>/dev/null | grep -E ":(${PORT1:-0}|${PORT2:-0}|${PORT3:-0}|${PORT_VMESS_V6:-0}|${PORT_SS_V6:-0}) " | awk '{print $7}' | cut -d'/' -f1 | grep -E '^[0-9]+$')
         if [ -n "$pids" ]; then
             kill -9 $pids >/dev/null 2>&1 || true
         fi
@@ -973,6 +973,18 @@ main() {
         reading "请选择操作 [0-9]: " choice
         case "$choice" in
             1)
+                # 检测重复安装，并提前释放旧端口
+                if [ -f "$WORKDIR/config.json" ]; then
+                    yellow "检测到已存在旧的配置文件，准备进行覆盖安装..."
+                    reading "确认要继续覆盖安装吗? (y/N): " overwrite_confirm
+                    if [[ ! "$overwrite_confirm" =~ ^[Yy]$ ]]; then
+                        echo
+                        reading "已取消安装。按回车键继续..." _
+                        continue
+                    fi
+                    stop_all
+                fi
+                
                 collect_params
                 install_binaries
                 if [ $? -eq 0 ]; then
