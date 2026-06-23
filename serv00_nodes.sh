@@ -1930,9 +1930,6 @@ elif mode == "google_warp":
             "mtu": 1280
         })
     route["final"] = warp_tag
-    else:
-        outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
-        route["final"] = direct_tag
 else:
     print(f"[!] 未知模式: {mode}")
     sys.exit(1)
