@@ -1794,6 +1794,9 @@ apply_egress_mode_psiphon() {
     # 备份配置
     cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
 
+    local loopback_port
+    loopback_port=$(get_free_loopback_port)
+
     yellow "[*] 更新 sing-box 配置 (添加 Psiphon SOCKS 出站)..."
 
     python3 - <<PY
@@ -1808,6 +1811,7 @@ warp_port = int(r"$warp_port")
 warp_ipv6 = r"$warp_ipv6"
 warp_private_key = r"$warp_private_key"
 warp_reserved_str = r"$warp_reserved"
+loopback_port = int(r"$loopback_port")
 
 try:
     with open(cfg_path, "r", encoding="utf-8") as f:
@@ -1943,7 +1947,6 @@ for o in outbounds:
         break
 
 inbound_tag = "socks-loopback"
-loopback_port = 25300
 
 # 移除旧的 loopback 路由规则
 rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
@@ -2212,9 +2215,30 @@ show_supported_psiphon_codes() {
     yellow "  非洲: KE=肯尼亚 ZA=南非 AUTO=自动"
 }
 
+# 获取空闲本地回环端口以防冲突
+get_free_loopback_port() {
+    local port
+    port=$(python3 -c '
+import socket
+try:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    print(p)
+except:
+    print(25300)
+' 2>/dev/null)
+    port=${port:-25300}
+    echo "$port" > "$WORKDIR/warp_loopback_port.txt"
+    echo "$port"
+}
+
 # WARP 出口 IP 检测 - 优化版，减少 fork 压力
 warp_egress_test() {
-    local socks="25300"
+    local socks
+    socks=$(cat "$WORKDIR/warp_loopback_port.txt" 2>/dev/null)
+    socks=${socks:-25300}
     
     # 检查 sing-box 是否在运行
     local sb_binary
@@ -4335,11 +4359,13 @@ EOF
     
     # 如果启用 WARP，添加回环 Socks 入站用于出口 IP 检测
     if [[ "$WARP_ENABLED" == "true" ]]; then
+        local loopback_port
+        loopback_port=$(get_free_loopback_port)
         inbounds+=("    {
       \"tag\": \"socks-loopback\",
       \"type\": \"socks\",
       \"listen\": \"127.0.0.1\",
-      \"listen_port\": 25300
+      \"listen_port\": $loopback_port
     }")
     fi
     
@@ -6445,6 +6471,9 @@ configure_warp_outbound() {
     local warp_private_key="${WARP_PRIVATE_KEY:-52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=}"
     local warp_reserved="${WARP_RESERVED:-[215, 69, 233]}"
     
+    local loopback_port
+    loopback_port=$(get_free_loopback_port)
+    
     python3 - <<PY
 import json
 import sys
@@ -6457,6 +6486,7 @@ warp_port = int("$warp_port")
 warp_ipv6 = "$warp_ipv6"
 warp_private_key = "$warp_private_key"
 warp_reserved_str = "$warp_reserved"
+loopback_port = int("$loopback_port")
 
 try:
     with open(cfg_path, "r", encoding="utf-8") as f:
@@ -6472,7 +6502,6 @@ inbounds = data.setdefault("inbounds", [])
 
 warp_tag = "warp-out"
 inbound_tag = "socks-loopback"
-loopback_port = 25300
 
 # 1. 移除旧的 loopback 规则和 warp 规则（保持幂等）
 rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
