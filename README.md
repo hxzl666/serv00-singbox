@@ -51,38 +51,13 @@ bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzlpl
 
 ---
 
-## 🐸 一键安装与保活 (Frog VPS - Alpine Linux)
 
-由于 Frog VPS 默认以普通用户 `frog` 登录且资源受限，安装前请先在命令行运行 `sudo su` 切换为管理员身份以自动下载系统依赖：
-
-```bash
-# 切换为 root 身份
-sudo su
-
-# 运行一键安装脚本 (使用 -k 避开证书不受信任问题)
-bash <(curl -Lks https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
-```
-
-或者使用 wget (推荐使用非静默命令，一旦网络连接或解析出错可直观排查)：
-
-```bash
-bash <(wget --no-check-certificate -O- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/frog_nodes.sh)
-```
-
-### 快捷命令与保活说明
-1. **快捷菜单**：安装完成后，首次在当前终端使用请先执行 `source ~/.bashrc` 刷新环境变量，随后在终端任意路径直接输入 **`sb`** 即可调出脚本菜单。
-2. **本地 Crontab 保活**：在一键安装完成后，脚本会自动设置并启动每 5 分钟检测一次的保活定时任务。您也可以通过快捷菜单 `sb` 选择 **`6`**（开启 Cron 保活）或 **`7`**（关闭 Cron 保活）来手动管理。
-3. **防止 SSH 退出进程丢失**：脚本已优化 `disown` 逻辑，最大程度防止 SSH 会话关闭时进程被系统强杀。若您重连后发现服务未运行，可直接运行 `sb` 别名（或本地路径 `bash ~/singbox/frog_nodes.sh`）并选择 **`2`** 重新一键启动。
-4. **远程 SSH 登录保活**：由于部分轻量主机长时间未活跃会被系统清理，建议配合下方 [Cloudflare Workers 自动保活](#-cloudflare-workers-自动保活-ssh-登录与命令执行保活--telegram-通知) 设置定时 SSH 登录与服务状态监控，以防封号。
-
----
 
 ## 📦 支持平台
 
 - **Serv00** - 波兰免费服务器 (serv00.net)
 - **Hostuno** - Serv00 付费版 (useruno.com)
 - **CT8** - 另一个免费服务器 (ct8.pl)
-- **Frog VPS** - 基于 Alpine Linux 的 NAT 共享端口服务器 (mikr.us/frog)
 
 ---
 
@@ -167,7 +142,7 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 
 ## 🌐 Cloudflare Workers 自动保活 (SSH 登录与命令执行保活 + Telegram 通知)
 
-为了防止 Serv00 / Hostuno / Frog VPS (mikr.us) 等服务器账号因长时间未活动而被官方清理，或者在服务进程意外挂掉时自动将其拉起，您可以部署 Cloudflare Workers 脚本。该脚本利用其自带的 TCP Socket 发起真实的 SSH 登录来进行账号“保号”以及“进程守护”。
+为了防止 Serv00 / Hostuno 等服务器账号因长时间未活动而被官方清理，或者在服务进程意外挂掉时自动将其拉起，您可以部署 Cloudflare Workers 脚本。该脚本利用其自带的 TCP Socket 发起真实的 SSH 登录来进行账号“保号”以及“进程守护”。
 
 ### 1. 开启 Workers 兼容性标志（关键步骤）
 由于 SSH 连接需要使用 Node.js 的部分内置模块（例如 `crypto` 和 `net`），您必须在 Workers 中启用 `nodejs_compat` 模式：
@@ -196,12 +171,6 @@ UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -L
 
 ```json
 [
-  {
-    "SSH_USER": "frog",
-    "SSH_PASS": "你的FROG登录密码",
-    "HOST": "f1194.mikr.us",
-    "PORT": "22"
-  },
   {
     "SSH_USER": "你的serv00用户名",
     "SSH_PASS": "你的serv00密码",

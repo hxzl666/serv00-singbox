@@ -661,16 +661,16 @@ init_warp_config() {
     
     # 尝试从勇哥的 API 获取预注册配置
     local warpurl=""
-    warpurl=$(curl -sm5 -k https://ygkkk-warp.renky.eu.org 2>/dev/null) || \
-    warpurl=$(wget -qO- --timeout=5 https://ygkkk-warp.renky.eu.org 2>/dev/null)
+    warpurl=$(curl -sm5 -k https://warp.xijp.eu.org 2>/dev/null) || \
+    warpurl=$(wget -qO- --timeout=5 https://warp.xijp.eu.org 2>/dev/null)
     
-    if echo "$warpurl" | grep -q ygkkk; then
+    if [ -n "$warpurl" ] && ! echo "$warpurl" | grep -q html; then
         WARP_PRIVATE_KEY=$(echo "$warpurl" | awk -F'：' '/Private_key/{print $2}' | xargs)
         WARP_IPV6=$(echo "$warpurl" | awk -F'：' '/IPV6/{print $2}' | xargs)
         WARP_RESERVED=$(echo "$warpurl" | awk -F'：' '/reserved/{print $2}' | xargs)
-        green "WARP 配置获取成功 (远程API)"
+        green "WARP 配置获取成功 (远程API: warp.xijp.eu.org)"
     else
-        # 备用硬编码配置 (和 argosbx 一样)
+        # 备用硬编码配置
         WARP_IPV6='2606:4700:110:8d8d:1845:c39f:2dd5:a03a'
         WARP_PRIVATE_KEY='52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A='
         WARP_RESERVED='[215, 69, 233]'
@@ -1766,7 +1766,7 @@ stop_psiphon_userland() {
 
 # 应用 Psiphon 出站模式 (使用 Python 稳定修改 JSON)
 apply_egress_mode_psiphon() {
-    local mode="$1"   # all / google
+    local mode="$1"   # all / google / google_warp
     local cfg="$WORKDIR/config.json"
 
     # 先启动 psiphon，再获取实际端口
@@ -1778,6 +1778,18 @@ apply_egress_mode_psiphon() {
         red "[!] 无法获取 Psiphon 实际端口"
         return 1
     fi
+
+    # 获取 WARP 变量以供 google_warp 模式使用
+    local warp_endpoint
+    warp_endpoint=$(get_warp_endpoint)
+    local warp_port
+    warp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null || echo "2408")
+    local warp_ipv6
+    warp_ipv6=$(cat "$WORKDIR/warp_ipv6.txt" 2>/dev/null || echo "2606:4700:110:8d8d:1845:c39f:2dd5:a03a")
+    local warp_private_key
+    warp_private_key=$(cat "$WORKDIR/warp_private_key.txt" 2>/dev/null || echo "52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=")
+    local warp_reserved
+    warp_reserved=$(cat "$WORKDIR/warp_reserved.txt" 2>/dev/null || echo "[215, 69, 233]")
 
     # 备份配置
     cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
@@ -1791,6 +1803,11 @@ import sys
 cfg_path = r"$cfg"
 mode = r"$mode"
 socks_port = int(r"$socks_port")
+warp_endpoint = r"$warp_endpoint"
+warp_port = int(r"$warp_port")
+warp_ipv6 = r"$warp_ipv6"
+warp_private_key = r"$warp_private_key"
+warp_reserved_str = r"$warp_reserved"
 
 try:
     with open(cfg_path, "r", encoding="utf-8") as f:
@@ -1811,6 +1828,7 @@ def first_tag_by_type(t, fallback):
 
 direct_tag = first_tag_by_type("direct", "direct")
 psiphon_tag = "psiphon-out"
+warp_tag = "warp-out"
 
 # upsert psiphon outbound (SOCKS5)
 found = False
@@ -1846,7 +1864,8 @@ rules[:] = [r for r in rules if not is_our_rule(r)]
 
 if mode == "all":
     route["final"] = psiphon_tag
-elif mode == "google":
+    outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+elif mode in ("google", "google_warp"):
     # 分流模式: Google/YouTube/OpenAI 走 Psiphon
     rules.insert(0, {
         "domain_suffix": [
@@ -1858,7 +1877,51 @@ elif mode == "google":
         ],
         "outbound": psiphon_tag
     })
-    route["final"] = direct_tag
+    
+    if mode == "google_warp":
+        try:
+            warp_reserved = json.loads(warp_reserved_str)
+        except Exception:
+            warp_reserved = [215, 69, 233]
+            
+        warp_found = False
+        for o in outbounds:
+            if o.get("tag") == warp_tag:
+                o.clear()
+                o.update({
+                    "type": "wireguard",
+                    "tag": warp_tag,
+                    "server": warp_endpoint,
+                    "server_port": warp_port,
+                    "local_address": [
+                        "172.16.0.2/32",
+                        warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
+                    ],
+                    "private_key": warp_private_key,
+                    "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                    "reserved": warp_reserved
+                })
+                warp_found = True
+                break
+                
+        if not warp_found:
+            outbounds.append({
+                "type": "wireguard",
+                "tag": warp_tag,
+                "server": warp_endpoint,
+                "server_port": warp_port,
+                "local_address": [
+                    "172.16.0.2/32",
+                    warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
+                ],
+                "private_key": warp_private_key,
+                "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                "reserved": warp_reserved
+            })
+        route["final"] = warp_tag
+    else:
+        outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+        route["final"] = direct_tag
 else:
     print(f"[!] 未知模式: {mode}")
     sys.exit(1)
@@ -5724,6 +5787,8 @@ configure_warp_outbound() {
     if [[ "$psi_status" == "true" ]]; then
         if [[ "$psi_mode" == "all" ]]; then
             purple "  Psiphon: 已启用 (全部流量)"
+        elif [[ "$psi_mode" == "google_warp" ]]; then
+            purple "  Psiphon: 已启用 (赛风分流 + 普通流量走 WARP)"
         else
             purple "  Psiphon: 已启用 (分流模式)"
         fi
@@ -5743,13 +5808,14 @@ configure_warp_outbound() {
     echo "------------------------------------------------------------"
     purple "  6. Psiphon 全局出站"
     purple "  7. Psiphon 分流出站 (Google/OpenAI/Netflix)"
-    purple "  8. 关闭 Psiphon"
+    purple "  8. 赛风出站 + 普通流量走 WARP (混合分流)"
+    purple "  9. 关闭 Psiphon"
     echo "------------------------------------------------------------"
-    yellow "  9. 返回主菜单"
+    yellow " 10. 返回主菜单"
     echo "============================================================"
-    reading "请选择 [0-9]: " new_choice
+    reading "请选择 [0-10]: " new_choice
     
-    if [[ "$new_choice" == "9" ]]; then
+    if [[ "$new_choice" == "10" ]]; then
         return 0
     fi
     
@@ -5965,6 +6031,42 @@ configure_warp_outbound() {
             return 0
             ;;
         8)
+            # Psiphon + WARP 混合分流出站
+            yellow "正在配置 Psiphon 分流 + 普通流量走 WARP 模式..."
+            # 开启并初始化 WARP 变量以供后续脚本使用
+            if init_warp_config; then
+                WARP_ENABLED=true
+                WARP_MODE="all"
+                echo "true" > "$WORKDIR/warp_enabled.txt"
+                echo "all" > "$WORKDIR/warp_mode.txt"
+            else
+                red "WARP 配置失败，但将继续配置赛风..."
+            fi
+            
+            if apply_egress_mode_psiphon "google_warp"; then
+                echo "true" > "$WORKDIR/psiphon_enabled.txt"
+                echo "google_warp" > "$WORKDIR/psiphon_mode.txt"
+                
+                # 重启 sing-box
+                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+                if [ -n "$sb_binary" ]; then
+                    yellow "正在重启 sing-box..."
+                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    sleep 1
+                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
+                    sleep 2
+                    if pgrep -x "$sb_binary" > /dev/null; then
+                        green "✓ 混合分流模式已启用 (赛风出站 + 普通流量走 WARP)"
+                    else
+                        red "sing-box 重启失败"
+                    fi
+                fi
+            else
+                red "配置 Psiphon 混合出站失败"
+            fi
+            return 0
+            ;;
+        9)
             # 关闭 Psiphon
             yellow "正在关闭 Psiphon..."
             if disable_psiphon_egress; then
@@ -6308,6 +6410,8 @@ menu() {
         if [[ "$psi_status" == "true" ]]; then
             if [[ "$psi_mode" == "all" ]]; then
                 purple "Psiphon: ✓ 已启用 (全部流量)"
+            elif [[ "$psi_mode" == "google_warp" ]]; then
+                purple "Psiphon: ✓ 已启用 (赛风分流 + 普通流量走 WARP)"
             else
                 purple "Psiphon: ✓ 已启用 (分流模式)"
             fi
