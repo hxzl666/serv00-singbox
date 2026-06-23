@@ -5680,14 +5680,15 @@ view_logs_menu() {
     green "  1. 查看 sing-box 日志"
     green "  2. 查看 Argo 日志"
     green "  3. 查看 boot.log (Argo临时隧道)"
+    green "  4. 查看 WARP 运行日志 (过滤自 sing-box)"
     echo "------------------------------------------------------------"
-    blue "  4. 查看所有日志"
-    blue "  5. 清空所有日志"
+    blue "  5. 查看所有日志"
+    blue "  6. 清空所有日志"
     echo "------------------------------------------------------------"
     yellow "  0. 返回主菜单"
     echo "============================================================"
     
-    reading "请选择 [0-5]: " log_choice
+    reading "请选择 [0-6]: " log_choice
     echo
     
     case "$log_choice" in
@@ -5729,6 +5730,24 @@ view_logs_menu() {
             ;;
         4)
             echo
+            green "========== WARP 运行日志 (过滤自 sing-box 最近50行) =========="
+            if [ -f "$WORKDIR/singbox.log" ] && [ -s "$WORKDIR/singbox.log" ]; then
+                local warp_logs=$(grep -iE "wireguard|warp-out|warp" "$WORKDIR/singbox.log" | tail -50)
+                if [ -n "$warp_logs" ]; then
+                    echo "$warp_logs"
+                else
+                    yellow "未过滤到 WARP 相关日志 (可能是没有产生相关连接信息)，以下为最新 20 行 sing-box 日志："
+                    tail -20 "$WORKDIR/singbox.log"
+                fi
+            else
+                yellow "sing-box日志为空或不存在，无法读取 WARP 日志"
+            fi
+            green "============================================================"
+            echo
+            yellow "提示: WARP 作为 sing-box 出站运行，完整日志保存在: $WORKDIR/singbox.log"
+            ;;
+        5)
+            echo
             green "========== 所有日志概览 =========="
             echo
             
@@ -5752,7 +5771,7 @@ view_logs_menu() {
             
             green "================================="
             ;;
-        5)
+        6)
             reading "确定清空所有日志? (y/N): " confirm_clear
             if [[ "$confirm_clear" =~ ^[Yy]$ ]]; then
                 > "$WORKDIR/singbox.log" 2>/dev/null
