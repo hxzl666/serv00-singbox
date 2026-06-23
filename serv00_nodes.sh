@@ -1869,8 +1869,8 @@ rules[:] = [r for r in rules if not is_our_rule(r)]
 if mode == "all":
     route["final"] = psiphon_tag
     outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
-elif mode in ("google", "google_warp"):
-    # 分流模式: Google/YouTube/OpenAI 走 Psiphon
+elif mode == "google":
+    # 仅 Google/YouTube/OpenAI/Netflix 走 Psiphon 分流，普通流量走直连
     rules.insert(0, {
         "domain_suffix": [
             "google.com", "google.co.jp", "google.com.hk",
@@ -1881,8 +1881,10 @@ elif mode in ("google", "google_warp"):
         ],
         "outbound": psiphon_tag
     })
-    
-    # 确保清除可能存在的 endpoints 字段以兼容旧版 sing-box
+    route["final"] = direct_tag
+    outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+elif mode == "google_warp":
+    # 混合模式：赛风出口节点走赛风出站（由 sync_egress_group inbound 路由控制），普通主节点全部走 WARP，各自独立出站，无域名共同分流
     if "endpoints" in data:
         del data["endpoints"]
 
