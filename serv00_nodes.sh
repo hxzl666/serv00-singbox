@@ -1884,43 +1884,68 @@ elif mode in ("google", "google_warp"):
         except Exception:
             warp_reserved = [215, 69, 233]
             
+        # 确保从 outbounds 中清除旧的 warp-out 出站
+        outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+        
+        # 将 WireGuard 配置注入 endpoints
+        endpoints = data.setdefault("endpoints", [])
         warp_found = False
-        for o in outbounds:
-            if o.get("tag") == warp_tag:
-                o.clear()
-                o.update({
+        for ep in endpoints:
+            if ep.get("tag") == warp_tag:
+                ep.clear()
+                ep.update({
                     "type": "wireguard",
                     "tag": warp_tag,
-                    "server": warp_endpoint,
-                    "server_port": warp_port,
-                    "local_address": [
+                    "address": [
                         "172.16.0.2/32",
                         warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
                     ],
                     "private_key": warp_private_key,
-                    "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                    "reserved": warp_reserved
+                    "peers": [
+                        {
+                            "address": warp_endpoint,
+                            "port": warp_port,
+                            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                            "allowed_ips": [
+                                "0.0.0.0/0",
+                                "::/0"
+                            ],
+                            "reserved": warp_reserved
+                        }
+                    ]
                 })
                 warp_found = True
                 break
                 
         if not warp_found:
-            outbounds.append({
+            endpoints.append({
                 "type": "wireguard",
                 "tag": warp_tag,
-                "server": warp_endpoint,
-                "server_port": warp_port,
-                "local_address": [
+                "address": [
                     "172.16.0.2/32",
                     warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
                 ],
                 "private_key": warp_private_key,
-                "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                "reserved": warp_reserved
+                "peers": [
+                    {
+                        "address": warp_endpoint,
+                        "port": warp_port,
+                        "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                        "allowed_ips": [
+                            "0.0.0.0/0",
+                            "::/0"
+                        ],
+                        "reserved": warp_reserved
+                    }
+                ]
             })
         route["final"] = warp_tag
     else:
         outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+        if "endpoints" in data:
+            data["endpoints"] = [ep for ep in data["endpoints"] if ep.get("tag") != warp_tag]
+            if not data["endpoints"]:
+                del data["endpoints"]
         route["final"] = direct_tag
 else:
     print(f"[!] 未知模式: {mode}")
@@ -1977,12 +2002,20 @@ route = data.get("route", {})
 rules = route.get("rules", [])
 
 psiphon_tag = "psiphon-out"
+warp_tag = "warp-out"
 
 # 移除 psiphon outbound
 outbounds[:] = [o for o in outbounds if o.get("tag") != psiphon_tag]
 
 # 移除 psiphon 相关规则
 rules[:] = [r for r in rules if r.get("outbound") != psiphon_tag]
+
+# 确保从 outbounds/endpoints 移除 warp-out 痕迹
+outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+if "endpoints" in data:
+    data["endpoints"] = [ep for ep in data["endpoints"] if ep.get("tag") != warp_tag]
+    if not data["endpoints"]:
+        del data["endpoints"]
 
 # 恢复 final 为 direct
 def first_tag_by_type(t, fallback):
@@ -6156,19 +6189,29 @@ configure_warp_outbound() {
     {
       "type": "block",
       "tag": "block"
-    },
+    }
+  ],
+  "endpoints": [
     {
       "type": "wireguard",
       "tag": "warp-out",
-      "server": "$warp_endpoint",
-      "server_port": $warp_port,
-      "local_address": [
+      "address": [
         "172.16.0.2/32",
         "${warp_ipv6}/128"
       ],
       "private_key": "${warp_private_key}",
-      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "reserved": ${warp_reserved}
+      "peers": [
+        {
+          "address": "$warp_endpoint",
+          "port": $warp_port,
+          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "allowed_ips": [
+            "0.0.0.0/0",
+            "::/0"
+          ],
+          "reserved": ${warp_reserved}
+        }
+      ]
     }
   ],
   "route": {
@@ -6187,19 +6230,29 @@ WARP_ALL
     {
       "type": "block",
       "tag": "block"
-    },
+    }
+  ],
+  "endpoints": [
     {
       "type": "wireguard",
       "tag": "warp-out",
-      "server": "$warp_endpoint",
-      "server_port": $warp_port,
-      "local_address": [
+      "address": [
         "172.16.0.2/32",
         "${warp_ipv6}/128"
       ],
       "private_key": "${warp_private_key}",
-      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "reserved": ${warp_reserved}
+      "peers": [
+        {
+          "address": "$warp_endpoint",
+          "port": $warp_port,
+          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "allowed_ips": [
+            "0.0.0.0/0",
+            "::/0"
+          ],
+          "reserved": ${warp_reserved}
+        }
+      ]
     }
   ],
   "route": {
