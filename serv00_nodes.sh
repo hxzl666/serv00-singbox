@@ -1934,6 +1934,52 @@ else:
     print(f"[!] 未知模式: {mode}")
     sys.exit(1)
 
+# 动态处理 socks-loopback
+warp_tags = ["warp-out", "wireguard-out"]
+active_warp_tag = None
+for o in outbounds:
+    if o.get("tag") in warp_tags:
+        active_warp_tag = o["tag"]
+        break
+
+inbound_tag = "socks-loopback"
+loopback_port = 25300
+
+# 移除旧的 loopback 路由规则
+rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
+
+if active_warp_tag:
+    # 确保 inbounds 列表存在
+    inbounds = data.setdefault("inbounds", [])
+    inbound_found = False
+    for ib in inbounds:
+        if ib.get("tag") == inbound_tag:
+            ib.clear()
+            ib.update({
+                "tag": inbound_tag,
+                "type": "socks",
+                "listen": "127.0.0.1",
+                "listen_port": loopback_port
+            })
+            inbound_found = True
+            break
+    if not inbound_found:
+        inbounds.append({
+            "tag": inbound_tag,
+            "type": "socks",
+            "listen": "127.0.0.1",
+            "listen_port": loopback_port
+        })
+    # 在 rules 开头插入强制分流规则
+    rules.insert(0, {
+        "inbound": [inbound_tag],
+        "outbound": active_warp_tag
+    })
+else:
+    # 移除 inbound
+    if "inbounds" in data:
+        data["inbounds"] = [ib for ib in data["inbounds"] if ib.get("tag") != inbound_tag]
+
 try:
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2007,6 +2053,52 @@ def first_tag_by_type(t, fallback):
 
 direct_tag = first_tag_by_type("direct", "direct")
 route["final"] = direct_tag
+
+# 动态处理 socks-loopback
+warp_tags = ["warp-out", "wireguard-out"]
+active_warp_tag = None
+for o in outbounds:
+    if o.get("tag") in warp_tags:
+        active_warp_tag = o["tag"]
+        break
+
+inbound_tag = "socks-loopback"
+loopback_port = 25300
+
+# 移除旧的 loopback 路由规则
+rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
+
+if active_warp_tag:
+    # 确保 inbounds 列表存在
+    inbounds = data.setdefault("inbounds", [])
+    inbound_found = False
+    for ib in inbounds:
+        if ib.get("tag") == inbound_tag:
+            ib.clear()
+            ib.update({
+                "tag": inbound_tag,
+                "type": "socks",
+                "listen": "127.0.0.1",
+                "listen_port": loopback_port
+            })
+            inbound_found = True
+            break
+    if not inbound_found:
+        inbounds.append({
+            "tag": inbound_tag,
+            "type": "socks",
+            "listen": "127.0.0.1",
+            "listen_port": loopback_port
+        })
+    # 在 rules 开头插入强制分流规则
+    rules.insert(0, {
+        "inbound": [inbound_tag],
+        "outbound": active_warp_tag
+    })
+else:
+    # 移除 inbound
+    if "inbounds" in data:
+        data["inbounds"] = [ib for ib in data["inbounds"] if ib.get("tag") != inbound_tag]
 
 try:
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -2118,6 +2210,80 @@ show_supported_psiphon_codes() {
     yellow "  美洲: AR=阿根廷 BR=巴西 CA=加拿大 CL=智利 CO=哥伦比亚 MX=墨西哥 US=美国"
     yellow "  大洋洲: AU=澳大利亚 NZ=新西兰"
     yellow "  非洲: KE=肯尼亚 ZA=南非 AUTO=自动"
+}
+
+# WARP 出口 IP 检测 - 优化版，减少 fork 压力
+warp_egress_test() {
+    local socks="25300"
+    
+    # 检查 sing-box 是否在运行
+    local sb_binary
+    sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+    if [[ -z "$sb_binary" ]] || ! pgrep -x "$sb_binary" >/dev/null 2>&1; then
+        red "[!] sing-box 进程未运行，无法检测 WARP"
+        return 1
+    fi
+
+    # 检查当前是否配置了 WARP
+    local warp_enabled
+    warp_enabled=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
+    if [[ "$warp_enabled" != "true" ]]; then
+        red "[!] WARP 未启用"
+        return 1
+    fi
+
+    yellow "[*] 正在检测 WARP 出口 IP..."
+
+    local json=""
+    # 尝试 ipinfo.io (可能限流/403)
+    json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null)" || true
+    
+    # fallback 到 ip-api.com (免费无 key，但只有 HTTP)
+    if [[ -z "$json" ]]; then
+        yellow "[*] ipinfo.io 无响应，尝试 ip-api.com..."
+        json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null)" || true
+    fi
+    
+    # fallback 到 ifconfig.me (只返回 IP)
+    if [[ -z "$json" ]]; then
+        yellow "[*] ip-api.com 无响应，尝试 ifconfig.me..."
+        local raw_ip
+        raw_ip="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ifconfig.me 2>/dev/null)" || true
+        if [[ -n "$raw_ip" ]]; then
+            green "  IP: $raw_ip"
+            yellow "  (其他信息无法获取，但 WARP 环回通道正常)"
+            return 0
+        fi
+    fi
+
+    if [[ -z "$json" ]]; then
+        yellow "[!] WARP 出口 IP 检测未成功"
+        yellow "    这不一定表示 WARP 未工作，可能是检测接口被墙/限流"
+        yellow "    建议稍后重试，或手动测试: curl --socks5-hostname 127.0.0.1:${socks} https://ipinfo.io/ip"
+        return 1
+    fi
+
+    # 解析 JSON - 使用 python3 -c 代替 heredoc
+    python3 -c '
+import json, sys
+try:
+    j = json.load(sys.stdin)
+    ip = j.get("ip") or j.get("query") or ""
+    country = j.get("country") or j.get("countryCode") or ""
+    city = j.get("city") or ""
+    region = j.get("region") or j.get("regionName") or ""
+    org = j.get("org") or j.get("isp") or ""
+    print(f"  IP:      {ip}")
+    print(f"  国家:    {country}")
+    print(f"  城市:    {city}")
+    print(f"  地区:    {region}")
+    print(f"  运营商:  {org}")
+except Exception as e:
+    print(f"[!] 解析失败: {e}")
+    sys.exit(1)
+' <<<"$json"
+    
+    return 0
 }
 
 # 出口 IP 检测 (等价 psictl egress-test) - 优化版，减少 fork 压力
@@ -4167,6 +4333,16 @@ EOF
     }")
     fi
     
+    # 如果启用 WARP，添加回环 Socks 入站用于出口 IP 检测
+    if [[ "$WARP_ENABLED" == "true" ]]; then
+        inbounds+=("    {
+      \"tag\": \"socks-loopback\",
+      \"type\": \"socks\",
+      \"listen\": \"127.0.0.1\",
+      \"listen_port\": 25300
+    }")
+    fi
+    
     # 用逗号连接inbounds
     IFS=','
     echo "${inbounds[*]}" >> config.json
@@ -4215,6 +4391,12 @@ EOF
     }
   ],
   "route": {
+    "rules": [
+      {
+        "inbound": ["socks-loopback"],
+        "outbound": "warp-out"
+      }
+    ],
     "final": "warp-out"
   }
 }
@@ -4279,6 +4461,10 @@ EOF
     ],
     "rules": [
       {
+        "inbound": ["socks-loopback"],
+        "outbound": "warp-out"
+      },
+      {
         "rule_set": ["google", "youtube", "openai", "netflix"],
         "outbound": "warp-out"
       }
@@ -4332,6 +4518,10 @@ EOF
       }
     ],
     "rules": [
+      {
+        "inbound": ["socks-loopback"],
+        "outbound": "wireguard-out"
+      },
       {
         "rule_set": ["google", "youtube"],
         "outbound": "wireguard-out"
@@ -5948,11 +6138,19 @@ configure_warp_outbound() {
     purple "  8. 赛风出站 + 普通流量走 WARP (混合分流)"
     purple "  9. 关闭 Psiphon"
     echo "------------------------------------------------------------"
-    yellow " 10. 返回主菜单"
+    green " 10. 检测 WARP 出口 IP"
+    yellow " 11. 返回主菜单"
     echo "============================================================"
-    reading "请选择 [0-10]: " new_choice
+    reading "请选择 [0-11]: " new_choice
+    
+    if [[ "$new_choice" == "11" ]]; then
+        return 0
+    fi
     
     if [[ "$new_choice" == "10" ]]; then
+        warp_egress_test
+        echo
+        reading "按回车键继续..." temp
         return 0
     fi
     
@@ -6247,169 +6445,154 @@ configure_warp_outbound() {
     local warp_private_key="${WARP_PRIVATE_KEY:-52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=}"
     local warp_reserved="${WARP_RESERVED:-[215, 69, 233]}"
     
-    # 提取 inbounds 部分 (保留不变)
-    # 使用 awk 提取从 "inbounds" 到 "]," 的内容
-    local inbounds_content=$(awk '
-        /"inbounds"/ { found=1 }
-        found { 
-            print
-            if (/^  \],?$/ && found) { found=0; exit }
-        }
-    ' config.json)
-    
-    # 提取 log 和 dns 部分
-    local log_content=$(awk '
-        /"log"/ { found=1 }
-        found { 
-            print
-            brace_count += gsub(/{/, "{")
-            brace_count -= gsub(/}/, "}")
-            if (brace_count == 0 && found) { found=0 }
-        }
-    ' config.json)
-    
-    local dns_content=$(awk '
-        /"dns"/ { found=1 }
-        found { 
-            print
-            brace_count += gsub(/{/, "{")
-            brace_count -= gsub(/}/, "}")
-            if (brace_count == 0 && found) { found=0 }
-        }
-    ' config.json)
+    python3 - <<PY
+import json
+import sys
 
-    # 生成新的 outbounds 和 route
-    local new_outbounds=""
-    local new_route=""
+cfg_path = "config.json"
+warp_enabled = "$WARP_ENABLED"
+warp_mode = "$WARP_MODE"
+warp_endpoint = "$warp_endpoint"
+warp_port = int("$warp_port")
+warp_ipv6 = "$warp_ipv6"
+warp_private_key = "$warp_private_key"
+warp_reserved_str = "$warp_reserved"
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取配置失败: {e}")
+    sys.exit(1)
+
+outbounds = data.setdefault("outbounds", [])
+route = data.setdefault("route", {})
+rules = route.setdefault("rules", [])
+inbounds = data.setdefault("inbounds", [])
+
+warp_tag = "warp-out"
+inbound_tag = "socks-loopback"
+loopback_port = 25300
+
+# 1. 移除旧的 loopback 规则和 warp 规则（保持幂等）
+rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
+rules[:] = [r for r in rules if r.get("outbound") == warp_tag]
+
+# 2. 如果启用 WARP，则追加并更新 warp outbound 以及 socks-loopback inbound，并插入路由规则
+if warp_enabled == "true":
+    try:
+        warp_reserved = json.loads(warp_reserved_str)
+    except Exception:
+        warp_reserved = [215, 69, 233]
+        
+    warp_found = False
+    for o in outbounds:
+        if o.get("tag") == warp_tag:
+            o.clear()
+            o.update({
+                "type": "wireguard",
+                "tag": warp_tag,
+                "server": warp_endpoint,
+                "server_port": warp_port,
+                "local_address": [
+                    "172.16.0.2/32",
+                    warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
+                ],
+                "private_key": warp_private_key,
+                "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                "reserved": warp_reserved,
+                "system": False,
+                "mtu": 1280
+            })
+            warp_found = True
+            break
+            
+    if not warp_found:
+        outbounds.append({
+            "type": "wireguard",
+            "tag": warp_tag,
+            "server": warp_endpoint,
+            "server_port": warp_port,
+            "local_address": [
+                "172.16.0.2/32",
+                warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
+            ],
+            "private_key": warp_private_key,
+            "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "reserved": warp_reserved,
+            "system": False,
+            "mtu": 1280
+        })
+
+    # 确保 socks-loopback 入站存在
+    inbound_found = False
+    for ib in inbounds:
+        if ib.get("tag") == inbound_tag:
+            ib.clear()
+            ib.update({
+                "tag": inbound_tag,
+                "type": "socks",
+                "listen": "127.0.0.1",
+                "listen_port": loopback_port
+            })
+            inbound_found = True
+            break
+    if not inbound_found:
+        inbounds.append({
+            "tag": inbound_tag,
+            "type": "socks",
+            "listen": "127.0.0.1",
+            "listen_port": loopback_port
+        })
+
+    # 在 rules 开时插入强制分流规则
+    rules.insert(0, {
+        "inbound": [inbound_tag],
+        "outbound": warp_tag
+    })
+
+    if warp_mode == "all":
+        route["final"] = warp_tag
+    elif warp_mode == "google":
+        route["final"] = "direct"
+        
+        # 使用 domain_suffix (与 psiphon 分流一致)
+        rules.append({
+            "domain_suffix": [
+                "google.com", "google.co.jp", "google.com.hk",
+                "googleapis.com", "gstatic.com", "ggpht.com",
+                "youtube.com", "ytimg.com", "youtu.be",
+                "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+                "netflix.com", "nflxvideo.net", "nflxso.net"
+            ],
+            "outbound": warp_tag
+        })
+else:
+    # 移除 warp-out outbound 和 socks-loopback inbound
+    outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+    inbounds[:] = [ib for ib in inbounds if ib.get("tag") != inbound_tag]
     
-    if [[ "$WARP_ENABLED" == "true" ]] && [[ "$WARP_MODE" == "all" ]]; then
-        # 全部流量走 WARP
-        new_outbounds=$(cat <<WARP_ALL
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    },
-    {
-      "type": "wireguard",
-      "tag": "warp-out",
-      "server": "$warp_endpoint",
-      "server_port": $warp_port,
-      "local_address": [
-        "172.16.0.2/32",
-        "${warp_ipv6}/128"
-      ],
-      "private_key": "${warp_private_key}",
-      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "system": false,
-      "mtu": 1280,
-      "reserved": ${warp_reserved}
-    }
-  ],
-  "route": {
-    "final": "warp-out"
-  }
-WARP_ALL
-)
-    elif [[ "$WARP_ENABLED" == "true" ]] && [[ "$WARP_MODE" == "google" ]]; then
-        # 分流模式
-        new_outbounds=$(cat <<WARP_SPLIT
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    },
-    {
-      "type": "wireguard",
-      "tag": "warp-out",
-      "server": "$warp_endpoint",
-      "server_port": $warp_port,
-      "local_address": [
-        "172.16.0.2/32",
-        "${warp_ipv6}/128"
-      ],
-      "private_key": "${warp_private_key}",
-      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "system": false,
-      "mtu": 1280,
-      "reserved": ${warp_reserved}
-    }
-  ],
-  "route": {
-    "rule_set": [
-      {
-        "tag": "youtube",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs",
-        "download_detour": "direct"
-      },
-      {
-        "tag": "google",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs",
-        "download_detour": "direct"
-      },
-      {
-        "tag": "openai",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs",
-        "download_detour": "direct"
-      },
-      {
-        "tag": "netflix",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs",
-        "download_detour": "direct"
-      }
-    ],
-    "rules": [
-      {
-        "rule_set": ["google", "youtube", "openai", "netflix"],
-        "outbound": "warp-out"
-      }
-    ],
-    "final": "direct"
-  }
-WARP_SPLIT
-)
-    else
-        # 直连
-        new_outbounds=$(cat <<DIRECT
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
-  ]
-DIRECT
-)
+    # 恢复 final
+    def first_tag_by_type(t, fallback):
+        for o in outbounds:
+            if o.get("type") == t and o.get("tag"):
+                return o["tag"]
+        return fallback
+    route["final"] = first_tag_by_type("direct", "direct")
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("[+] sing-box 配置文件修改成功")
+except Exception as e:
+    print(f"[!] 写入配置失败: {e}")
+    sys.exit(1)
+PY
+
+    if [ $? -ne 0 ]; then
+        red "[!] 配置文件修改失败"
+        return 1
     fi
-
-    # 重新组装配置文件
-    cat > config.json <<CONFIG_EOF
-{
-$log_content
-$dns_content
-$inbounds_content
-$new_outbounds
-}
-CONFIG_EOF
 
     # 验证配置
     SB_BINARY=$(cat sb.txt 2>/dev/null)
@@ -6450,6 +6633,9 @@ CONFIG_EOF
                 else
                     blue "✓ WARP 出站已启用 (Google/YouTube/Netflix/OpenAI)"
                 fi
+                # 等待 sing-box 建立连接，然后检测出口 IP
+                sleep 2
+                warp_egress_test || true
             else
                 green "✓ 已切换为直连出站"
             fi
