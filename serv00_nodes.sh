@@ -5584,7 +5584,7 @@ restart_processes() {
     ARGO_AUTH=$(cat ARGO_AUTH.log 2>/dev/null)
     ARGO_DOMAIN=$(cat ARGO_DOMAIN.log 2>/dev/null)
     
-    if [[ "$ENABLE_ARGO" == "true" ]] || [[ -n "$ARGO_AUTH" ]] || [[ ! -f "$WORKDIR/ARGO_AUTH.log" ]]; then
+    if [[ "$ENABLE_ARGO" == "true" ]]; then
         start_argo
     fi
     
@@ -5623,6 +5623,110 @@ reset_argo() {
     
     sleep 5
     generate_links
+}
+
+# Argo隧道管理 (开关/重置)
+argo_management_menu() {
+    clear
+    echo
+    green "============================================================"
+    green "  Argo 隧道管理"
+    green "============================================================"
+    
+    # 加载配置
+    load_saved_config
+    
+    # 获取当前运行状态
+    CF_BINARY=$(cat cf.txt 2>/dev/null)
+    local cf_running=false
+    if [ -n "$CF_BINARY" ] && pgrep -x "$CF_BINARY" >/dev/null 2>&1; then
+        cf_running=true
+    fi
+    
+    purple "当前状态:"
+    if [[ "$ENABLE_ARGO" == "true" ]]; then
+        green "  开关状态: 已启用 (ENABLE_ARGO=true)"
+        if [ "$cf_running" = true ]; then
+            green "  运行状态: 运行中 (cloudflared 在线)"
+        else
+            yellow "  运行状态: 未运行 (正在等待拉起或配置有误)"
+        fi
+    else
+        red "  开关状态: 已禁用 (ENABLE_ARGO=false)"
+        if [ "$cf_running" = true ]; then
+            yellow "  运行状态: 运行中 (开关已关，但残留了 cloudflared 进程，建议重启或清理)"
+        else
+            green "  运行状态: 已关闭"
+        fi
+    fi
+    
+    # 获取隧道域名信息
+    if [[ "$ENABLE_ARGO" == "true" ]]; then
+        if [ -f "boot.log" ] && [ ! -f "ARGO_DOMAIN.log" ]; then
+            local current_domain=$(cat boot.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+            [ -n "$current_domain" ] && purple "  隧道模式: 临时隧道 ($current_domain)"
+        elif [ -f "ARGO_DOMAIN.log" ]; then
+            purple "  隧道模式: 固定隧道 ($(cat ARGO_DOMAIN.log 2>/dev/null))"
+        else
+            purple "  隧道模式: 未配置或正在获取..."
+        fi
+    fi
+    
+    echo "------------------------------------------------------------"
+    green "  1. 开启 Argo 隧道"
+    red   "  2. 关闭 Argo 隧道"
+    green "  3. 重置/重新配置 Argo 隧道"
+    echo "------------------------------------------------------------"
+    yellow "  0. 返回主菜单"
+    echo "============================================================"
+    
+    reading "请选择 [0-3]: " argo_choice
+    echo
+    
+    case "$argo_choice" in
+        1)
+            ENABLE_ARGO="true"
+            echo "true" > "$WORKDIR/enable_argo.txt"
+            green "Argo 开关已设定为: 开启"
+            
+            # 确认是否有 cf.txt (cloudflared 是否已下载)
+            if [ ! -f "$WORKDIR/cf.txt" ] || [ ! -s "$WORKDIR/cf.txt" ]; then
+                yellow "未找到 Argo 二进制配置，正在启动配置向导..."
+                configure_argo
+            fi
+            
+            yellow "正在启动 Argo 隧道..."
+            start_argo
+            generate_links
+            ;;
+        2)
+            ENABLE_ARGO="false"
+            echo "false" > "$WORKDIR/enable_argo.txt"
+            green "Argo 开关已设定为: 关闭"
+            
+            yellow "正在停止 Argo 进程..."
+            ps aux | grep '[t]unnel --u' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
+            ps aux | grep '[t]unnel --n' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
+            if [ -n "$CF_BINARY" ]; then
+                pkill -x "$CF_BINARY" >/dev/null 2>&1
+            fi
+            green "Argo 进程已关闭"
+            generate_links
+            ;;
+        3)
+            reset_argo
+            ;;
+        0)
+            return
+            ;;
+        *)
+            red "无效选项"
+            ;;
+    esac
+    
+    echo
+    reading "按回车继续..." _
+    argo_management_menu
 }
 
 # ==================== 日志管理 ====================
@@ -6500,7 +6604,7 @@ menu() {
     echo "------------------------------------------------------------"
     green  "  3. 重启所有进程"
     echo "------------------------------------------------------------"
-    green  "  4. 重置Argo隧道"
+    green  "  4. Argo 隧道管理 (开关/重置)"
     echo "------------------------------------------------------------"
     green  "  5. 查看节点信息"
     echo "------------------------------------------------------------"
@@ -6526,7 +6630,7 @@ menu() {
         1) install_nodes ;;
         2) uninstall_nodes ;;
         3) restart_processes ;;
-        4) reset_argo ;;
+        4) argo_management_menu ;;
         5) show_links ;;
         6) custom_push_nodes ;;
         7) reset_all_ports ;;
