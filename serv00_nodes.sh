@@ -1888,35 +1888,16 @@ elif mode == "google_warp":
     if "endpoints" in data:
         del data["endpoints"]
 
-    if mode == "google_warp":
-        try:
-            warp_reserved = json.loads(warp_reserved_str)
-        except Exception:
-            warp_reserved = [215, 69, 233]
-            
-        warp_found = False
-        for o in outbounds:
-            if o.get("tag") == warp_tag:
-                o.clear()
-                o.update({
-                    "type": "wireguard",
-                    "tag": warp_tag,
-                    "server": warp_endpoint,
-                    "server_port": warp_port,
-                    "local_address": [
-                        "172.16.0.2/32",
-                        warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
-                    ],
-                    "private_key": warp_private_key,
-                    "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                    "reserved": warp_reserved,
-                    "mtu": 1280
-                })
-                warp_found = True
-                break
-                
-        if not warp_found:
-            outbounds.append({
+    try:
+        warp_reserved = json.loads(warp_reserved_str)
+    except Exception:
+        warp_reserved = [215, 69, 233]
+        
+    warp_found = False
+    for o in outbounds:
+        if o.get("tag") == warp_tag:
+            o.clear()
+            o.update({
                 "type": "wireguard",
                 "tag": warp_tag,
                 "server": warp_endpoint,
@@ -1930,7 +1911,25 @@ elif mode == "google_warp":
                 "reserved": warp_reserved,
                 "mtu": 1280
             })
-        route["final"] = warp_tag
+            warp_found = True
+            break
+            
+    if not warp_found:
+        outbounds.append({
+            "type": "wireguard",
+            "tag": warp_tag,
+            "server": warp_endpoint,
+            "server_port": warp_port,
+            "local_address": [
+                "172.16.0.2/32",
+                warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
+            ],
+            "private_key": warp_private_key,
+            "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "reserved": warp_reserved,
+            "mtu": 1280
+        })
+    route["final"] = warp_tag
     else:
         outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
         route["final"] = direct_tag
