@@ -1908,7 +1908,6 @@ elif mode in ("google", "google_warp"):
                     "private_key": warp_private_key,
                     "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
                     "reserved": warp_reserved,
-                    "system": False,
                     "mtu": 1280
                 })
                 warp_found = True
@@ -1927,7 +1926,6 @@ elif mode in ("google", "google_warp"):
                 "private_key": warp_private_key,
                 "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
                 "reserved": warp_reserved,
-                "system": False,
                 "mtu": 1280
             })
         route["final"] = warp_tag
@@ -6530,7 +6528,6 @@ if warp_enabled == "true":
                 "private_key": warp_private_key,
                 "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
                 "reserved": warp_reserved,
-                "system": False,
                 "mtu": 1280
             })
             warp_found = True
@@ -6549,7 +6546,6 @@ if warp_enabled == "true":
             "private_key": warp_private_key,
             "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
             "reserved": warp_reserved,
-            "system": False,
             "mtu": 1280
         })
 
