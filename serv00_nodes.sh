@@ -2216,14 +2216,26 @@ get_free_loopback_port() {
     local port
     port=$(python3 -c '
 import socket
-try:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    print(p)
-except:
-    print(25300)
+import random
+
+def is_port_free(port):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.2)
+        s.connect(("127.0.0.1", port))
+        s.close()
+        return False
+    except:
+        return True
+
+port = 25300
+for _ in range(50):
+    p = random.randint(20000, 40000)
+    if is_port_free(p):
+        port = p
+        break
+
+print(port)
 ' 2>/dev/null)
     port=${port:-25300}
     echo "$port" > "$WORKDIR/warp_loopback_port.txt"
