@@ -2213,40 +2213,20 @@ show_supported_psiphon_codes() {
 
 # 获取空闲本地回环端口以防冲突
 get_free_loopback_port() {
-    local port
-    port=$(python3 -c '
-import socket
-import random
-
-def is_port_free(port):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.2)
-        s.connect(("127.0.0.1", port))
-        s.close()
-        return False
-    except:
-        return True
-
-port = 25300
-for _ in range(50):
-    p = random.randint(20000, 40000)
-    if is_port_free(p):
-        port = p
-        break
-
-print(port)
-' 2>/dev/null)
-    port=${port:-25300}
-    echo "$port" > "$WORKDIR/warp_loopback_port.txt"
-    echo "$port"
+    echo "0"
 }
 
 # WARP 出口 IP 检测 - 优化版，减少 fork 压力
 warp_egress_test() {
     local socks
-    socks=$(cat "$WORKDIR/warp_loopback_port.txt" 2>/dev/null)
-    socks=${socks:-25300}
+    socks=$(grep -oE "inbound/socks\[socks-loopback\]: tcp server started at 127.0.0.1:[0-9]+" "$WORKDIR/singbox.log" 2>/dev/null | tail -n 1 | awk -F: '{print $NF}')
+    socks=${socks:-0}
+    
+    if [[ "$socks" == "0" || -z "$socks" ]]; then
+        red "[!] 未检测到已运行的 WARP 环回测试端口"
+        yellow "    这通常表示 sing-box 进程启动失败、或者配置中未添加 socks-loopback"
+        return 1
+    fi
     
     # 检查 sing-box 是否在运行
     local sb_binary
