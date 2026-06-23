@@ -1903,10 +1903,6 @@ elif mode in ("google", "google_warp"):
                     ],
                     "private_key": warp_private_key,
                     "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                    "allowed_ips": [
-                        "0.0.0.0/0",
-                        "::/0"
-                    ],
                     "reserved": warp_reserved
                 })
                 warp_found = True
@@ -1924,10 +1920,6 @@ elif mode in ("google", "google_warp"):
                 ],
                 "private_key": warp_private_key,
                 "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                "allowed_ips": [
-                    "0.0.0.0/0",
-                    "::/0"
-                ],
                 "reserved": warp_reserved
             })
         route["final"] = warp_tag
@@ -6309,10 +6301,6 @@ configure_warp_outbound() {
       ],
       "private_key": "${warp_private_key}",
       "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "allowed_ips": [
-        "0.0.0.0/0",
-        "::/0"
-      ],
       "reserved": ${warp_reserved}
     }
   ],
@@ -6344,10 +6332,6 @@ WARP_ALL
       ],
       "private_key": "${warp_private_key}",
       "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "allowed_ips": [
-        "0.0.0.0/0",
-        "::/0"
-      ],
       "reserved": ${warp_reserved}
     }
   ],
