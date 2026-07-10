@@ -38,13 +38,13 @@
 ## 🚀 一键安装 (Serv00 / Hostuno / CT8)
 
 ```bash
-bash <(curl -Lks https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
+bash <(curl -Lks https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh)
 ```
 
 或者使用 wget:
 
 ```bash
-bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
+bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh)
 ```
 
 **安装完成后，使用快捷命令 `sb` 即可快速进入菜单**
