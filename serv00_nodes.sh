@@ -7516,6 +7516,78 @@ sync_all_proxy_groups() {
     return 0
 }
 
+# ==== 修改代理出站后端 (保持入站配置不变) ====
+edit_proxy_egress_backend() {
+    init_proxy_groups_dir
+    local groups
+    mapfile -t groups < <(get_all_proxy_groups)
+    if [[ ${#groups[@]} -eq 0 ]]; then
+        yellow "暂无代理节点组可修改"
+        return 1
+    fi
+
+    echo
+    green "==== 修改代理出站后端 (保持入站不变) ===="
+    echo "请选择要修改的分组:"
+    for i in "${!groups[@]}"; do
+        local t="${groups[$i]}"
+        local r=$(cat "${PROXY_GROUPS_DIR}/$t/remark.txt" 2>/dev/null || echo "$t")
+        printf "  %d. [%-10s] %s\n" "$((i+1))" "$t" "$r"
+    done
+    echo
+    reading "请输入要修改的分组 tag (如 proxy-1): " edit_tag
+    if ! proxy_group_exists "$edit_tag"; then
+        red "[!] 分组 $edit_tag 不存在"; return 1
+    fi
+
+    local group_dir="${PROXY_GROUPS_DIR}/${edit_tag}"
+    local old_url=$(cat "$group_dir/proxy_url.txt" 2>/dev/null)
+    local old_remark=$(cat "$group_dir/remark.txt" 2>/dev/null)
+    
+    echo
+    blue "当前分组: $old_remark ($edit_tag)"
+    blue "当前后端: $old_url"
+    echo
+    reading "请输入新代理链接: " new_url
+    new_url="${new_url// /}"
+    [[ -z "$new_url" ]] && { red "[!] 链接不能为空"; return 1; }
+
+    local out_tag="${edit_tag}-out"
+    local outbound_json
+    yellow "[*] 正在解析新链接..."
+    outbound_json=$(validate_and_parse_proxy_url "$new_url" "$out_tag")
+    [[ $? -ne 0 ]] && return 1
+
+    local ptype pserver pport
+    ptype=$(echo "$outbound_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('type','?'))" 2>/dev/null)
+    pserver=$(echo "$outbound_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('server','?'))" 2>/dev/null)
+    pport=$(echo "$outbound_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('server_port','?'))" 2>/dev/null)
+    green "[+] 解析成功: [$ptype] $pserver:$pport"
+
+    # 仅更新后端数据，不触碰前端绑定(ip_protos.txt/ports)
+    echo "$new_url"     > "$group_dir/proxy_url.txt"
+    echo "$outbound_json" > "$group_dir/outbound.json"
+
+    # 询问是否顺便修改备注
+    echo
+    reading "是否修改分组备注名称? (当前: $old_remark, 回车不修改): " new_remark
+    if [[ -n "$new_remark" ]]; then
+        echo "$new_remark" > "$group_dir/remark.txt"
+        green "[+] 备注已更新为: $new_remark"
+    fi
+
+    # 同步并重启
+    yellow "[*] 更新 sing-box 配置并重启..."
+    if ! sync_proxy_group_to_singbox "$edit_tag"; then
+        red "[!] 同步配置失败，请检查日志"
+        return 1
+    fi
+
+    start_singbox || { red "[!] sing-box 重启失败"; return 1; }
+    green "==== ✓ 分组后端修改完成！前端客户端链接保持不变 ===="
+    return 0
+}
+
 # ==== 自定义代理出站节点组管理菜单 ====
 proxy_egress_menu() {
     while true; do
@@ -7556,15 +7628,16 @@ proxy_egress_menu() {
         echo
         echo "------------------------------------------------------------"
         green  "  1. 添加新代理节点组"
-        green  "  2. 删除代理节点组"
-        green  "  3. 查看所有节点链接"
+        green  "  2. 修改代理组出站链接 (保持入站不变)"
+        green  "  3. 删除代理节点组"
+        green  "  4. 查看所有节点链接"
         echo "------------------------------------------------------------"
-        yellow "  4. 查看出站代理详细配置"
-        yellow "  5. 重新同步全部配置并重启"
+        yellow "  5. 查看出站代理详细配置"
+        yellow "  6. 重新同步全部配置并重启"
         echo "------------------------------------------------------------"
         red    "  0. 返回上级菜单"
         echo "============================================================"
-        reading "请选择 [0-5]: " choice
+        reading "请选择 [0-6]: " choice
         echo
 
         case "$choice" in
@@ -7572,6 +7645,9 @@ proxy_egress_menu() {
                 add_proxy_egress_group
                 ;;
             2)
+                edit_proxy_egress_backend
+                ;;
+            3)
                 if [[ ${#groups[@]} -eq 0 ]]; then
                     yellow "暂无代理节点组可删除"
                 else
@@ -7586,7 +7662,7 @@ proxy_egress_menu() {
                     [[ -n "$del_tag" ]] && remove_proxy_egress_group "$del_tag"
                 fi
                 ;;
-            3)
+            4)
                 if [[ ${#groups[@]} -eq 0 ]]; then
                     yellow "暂无代理节点组"
                 else
@@ -7595,7 +7671,7 @@ proxy_egress_menu() {
                     done
                 fi
                 ;;
-            4)
+            5)
                 if [[ ${#groups[@]} -eq 0 ]]; then
                     yellow "暂无代理节点组"
                 else
@@ -7615,7 +7691,7 @@ proxy_egress_menu() {
                     done
                 fi
                 ;;
-            5)
+            6)
                 if [[ ${#groups[@]} -eq 0 ]]; then
                     yellow "暂无代理节点组"
                 else
