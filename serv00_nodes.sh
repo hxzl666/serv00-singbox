@@ -7874,9 +7874,18 @@ for name, target, outbound, tag in parsed_nodes:
         time.sleep(0.8)
         if process.poll() is not None:
             latency = -1.0
+            try:
+                log_f.close()
+                with open(temp_log_path, "r", encoding="utf-8", errors="ignore") as f_err:
+                    err_txt = f_err.read().strip()
+                if err_txt:
+                    print(f"\n[!] 节点 [{name}] 测速内核启动失败，报错:\n{err_txt}\n")
+            except Exception as e:
+                print(f"\n[!] 读取日志错误: {e}")
         else:
             latency = test_socks5_http_latency(test_port, timeout=4.0)
-    except Exception:
+    except Exception as e:
+        print(f"\n[!] 测速执行错误: {e}")
         latency = -1.0
     finally:
         if process and process.poll() is None:
