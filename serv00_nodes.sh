@@ -7592,7 +7592,7 @@ test_external_nodes_latency() {
     clear
     echo
     green "============================================================"
-    green "  批量测试外部代理节点延迟 (TCP 建连测试)"
+    green "  批量测试外部代理节点真实延迟 (全链路代理测速)"
     green "  说明: 支持 vless / vmess / trojan / hy2 / tuic / ss 链接"
     green "============================================================"
     echo
@@ -7613,12 +7613,15 @@ test_external_nodes_latency() {
     fi
 
     echo
-    yellow "[*] 正在解析并测试 ${#raw_links[@]} 个节点，请稍候..."
+    yellow "[*] 正在解析并启动临时测速内核，测试 ${#raw_links[@]} 个节点，请稍候..."
     echo
 
+    # 导出必要的变量给 Python 子进程
     export RAW_NODE_LINKS=$(printf "%s\n" "${raw_links[@]}")
+    export WORKDIR="$WORKDIR"
+
     python3 - <<'PY'
-import sys, socket, time, json, base64, os
+import sys, socket, time, json, base64, os, subprocess
 from urllib.parse import urlparse, parse_qs, unquote
 
 def b64d(s):
@@ -7626,76 +7629,302 @@ def b64d(s):
     s += '=' * (4 - len(s) % 4)
     return base64.b64decode(s).decode('utf-8', errors='replace')
 
-def parse_node(url):
+def make_tls(params, host, default_sec='tls'):
+    sec   = (params.get('security', [default_sec])[0] or default_sec).lower()
+    sni   = params.get('sni', [host])[0] or host
+    fp    = params.get('fp',  [''])[0]
+    pbk   = params.get('pbk', [''])[0]
+    sid   = params.get('sid', [''])[0]
+    alpn  = [a for a in params.get('alpn', [''])[0].split(',') if a]
+    insec = params.get('insecure', ['0'])[0] == '1' or \
+            params.get('allowInsecure', ['0'])[0] == '1'
+    if sec in ('none', ''):
+        return None
+    tls = {'enabled': True, 'server_name': sni}
+    if alpn:  tls['alpn'] = alpn
+    if insec: tls['insecure'] = True
+    if fp:    tls['utls'] = {'enabled': True, 'fingerprint': fp}
+    if sec == 'reality':
+        tls['reality'] = {'enabled': True, 'public_key': pbk, 'short_id': sid}
+    return tls
+
+def make_transport(params):
+    net  = params.get('type', ['tcp'])[0].lower()
+    path = params.get('path', ['/'])[0]
+    hdr  = params.get('host', [''])[0]
+    svc  = params.get('serviceName', [''])[0]
+    if net == 'ws':
+        t = {'type': 'ws', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        return t
+    if net == 'grpc':
+        return {'type': 'grpc', 'service_name': svc or path.lstrip('/')}
+    if net in ('httpupgrade', 'h1'):
+        t = {'type': 'httpupgrade', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        return t
+    if net == 'h2':
+        t = {'type': 'http', 'path': path}
+        if hdr: t['host'] = [hdr]
+        return t
+    return None
+
+def parse_vless(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    out = {'type': 'vless', 'tag': tag, 'server': host, 'server_port': p.port,
+           'uuid': unquote(p.username or '')}
+    flow = params.get('flow', [''])[0]
+    if flow: out['flow'] = flow
+    t = make_transport(params)
+    if t: out['transport'] = t
+    tls = make_tls(params, host)
+    if tls: out['tls'] = tls
+    return out
+
+def parse_vmess(url, tag):
+    raw = url[8:]
+    try:    data = json.loads(b64d(raw))
+    except Exception as e: raise ValueError(f'VMess base64 解码失败: {e}')
+    host = data.get('add',''); port = int(data.get('port', 443))
+    net  = data.get('net','tcp'); tls_s = data.get('tls','')
+    sni  = data.get('sni','') or data.get('host','') or host
+    path = data.get('path','/'); hdr = data.get('host',''); fp = data.get('fp','')
+    out  = {'type': 'vmess', 'tag': tag, 'server': host, 'server_port': port,
+            'uuid': data.get('id',''), 'alter_id': int(data.get('aid',0)),
+            'security': data.get('scy','auto')}
+    if net == 'ws':
+        t = {'type': 'ws', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        out['transport'] = t
+    elif net == 'grpc':
+        out['transport'] = {'type': 'grpc', 'service_name': data.get('serviceName', path.lstrip('/'))}
+    elif net in ('httpupgrade', 'h1'):
+        t = {'type': 'httpupgrade', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        out['transport'] = t
+    elif net == 'h2':
+        t = {'type': 'http', 'path': path}
+        if hdr: t['host'] = [hdr]
+        out['transport'] = t
+    if tls_s == 'tls':
+        tls = {'enabled': True, 'server_name': sni}
+        if fp: tls['utls'] = {'enabled': True, 'fingerprint': fp}
+        out['tls'] = tls
+    return out
+
+def parse_trojan(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    out = {'type': 'trojan', 'tag': tag, 'server': host, 'server_port': p.port,
+           'password': unquote(p.username or '')}
+    t = make_transport(params)
+    if t: out['transport'] = t
+    tls = make_tls(params, host) or {'enabled': True, 'server_name': host}
+    out['tls'] = tls
+    return out
+
+def parse_hy2(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    pw = unquote(p.username or '') or unquote(p.password or '')
+    sni = params.get('sni', [host])[0] or host
+    insec = params.get('insecure', ['0'])[0] == '1'
+    obfs_t = params.get('obfs', [''])[0]; obfs_p = params.get('obfs-password', [''])[0]
+    out = {'type': 'hysteria2', 'tag': tag, 'server': host, 'server_port': p.port,
+           'password': pw, 'tls': {'enabled': True, 'server_name': sni, 'insecure': insec}}
+    if obfs_t: out['obfs'] = {'type': obfs_t, 'password': obfs_p}
+    return out
+
+def parse_tuic(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    alpn = [a for a in params.get('alpn', ['h3'])[0].split(',') if a] or ['h3']
+    sni  = params.get('sni', [host])[0] or host
+    insec = params.get('allow_insecure', ['0'])[0] == '1'
+    cc   = params.get('congestion_control', ['bbr'])[0]
+    return {'type': 'tuic', 'tag': tag, 'server': host, 'server_port': p.port,
+            'uuid': unquote(p.username or ''), 'password': unquote(p.password or ''),
+            'congestion_control': cc,
+            'tls': {'enabled': True, 'server_name': sni, 'alpn': alpn, 'insecure': insec}}
+
+def parse_ss(url, tag):
+    p = urlparse(url); host = p.hostname; port = p.port
+    if p.username and p.password:
+        method = unquote(p.username); password = unquote(p.password)
+    else:
+        userinfo = unquote(p.username or '')
+        try:    method, password = b64d(userinfo).split(':', 1)
+        except: method = 'aes-256-gcm'; password = userinfo
+    return {'type': 'shadowsocks', 'tag': tag, 'server': host, 'server_port': port,
+            'method': method, 'password': password}
+
+def parse_to_outbound(url, tag):
     try:
         url = url.strip()
-        if url.startswith('vless://') or url.startswith('trojan://') or url.startswith(('hy2://', 'hysteria2://')) or url.startswith('tuic://') or url.startswith('ss://'):
-            p = urlparse(url)
-            name = unquote(p.fragment) if p.fragment else "未命名节点"
-            host = p.hostname
-            port = p.port
-            if not host or not port:
-                netloc = p.netloc
-                if '@' in netloc:
-                    netloc = netloc.split('@')[-1]
-                if ':' in netloc:
-                    host, port_str = netloc.split(':', 1)
-                    if '?' in port_str:
-                        port_str = port_str.split('?')[0]
-                    port = int(port_str)
-                else:
-                    host = netloc
-                    port = 443
-            return host, port, name
-        elif url.startswith('vmess://'):
-            raw = url[8:]
-            data = json.loads(b64d(raw))
-            host = data.get('add','')
-            port = int(data.get('port', 443))
-            name = data.get('ps', '未命名节点')
-            return host, port, name
+        if url.startswith('vless://'):                   return parse_vless(url, tag)
+        elif url.startswith('vmess://'):                   return parse_vmess(url, tag)
+        elif url.startswith('trojan://'):                  return parse_trojan(url, tag)
+        elif url.startswith(('hy2://', 'hysteria2://')):   return parse_hy2(url, tag)
+        elif url.startswith('tuic://'):                    return parse_tuic(url, tag)
+        elif url.startswith('ss://'):                      return parse_ss(url, tag)
     except Exception:
         pass
-    return None, None, None
+    return None
 
-def test_latency(host, port):
+def test_socks5_http_latency(proxy_port, target_host="cp.cloudflare.com", timeout=3.0):
     start = time.perf_counter()
     try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        if not addr_info:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(("127.0.0.1", proxy_port))
+        
+        # 1. Socks5 协商
+        s.sendall(b"\x05\x01\x00")
+        resp = s.recv(2)
+        if len(resp) < 2 or resp[0] != 5 or resp[1] != 0:
             return -1.0
-        family, socktype, proto, _, sockaddr = addr_info[0]
-        s = socket.socket(family, socktype, proto)
-        s.settimeout(2.0)
-        s.connect(sockaddr)
+        
+        # 2. 连接 target_host:80
+        host_bytes = target_host.encode('utf-8')
+        req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + b"\x00\x50"
+        s.sendall(req)
+        resp2 = s.recv(10)
+        if len(resp2) < 4 or resp2[1] != 0:
+            return -1.0
+            
+        # 3. 发送 HTTP GET
+        http_req = f"GET /generate_204 HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n".encode('utf-8')
+        s.sendall(http_req)
+        
+        # 4. 接收响应首字节
+        data = s.recv(1)
+        if not data:
+            return -1.0
+        
         s.close()
         return round((time.perf_counter() - start) * 1000, 2)
     except Exception:
         return -1.0
 
+# 读取输入
 links_str = os.environ.get("RAW_NODE_LINKS", "")
 inputs = [line.strip() for line in links_str.split('\n') if line.strip()]
-results = []
+
+workdir = os.environ.get("WORKDIR", "/tmp")
+sb_txt_path = os.path.join(workdir, "sb.txt")
+sb_binary = "sing-box"
+if os.path.exists(sb_txt_path):
+    with open(sb_txt_path, "r") as f:
+        name_sb = f.read().strip()
+        if name_sb:
+            sb_binary = os.path.join(workdir, name_sb)
+
+# 构建测试配置
+outbounds = []
+inbounds = []
+rules = []
+valid_nodes = [] # (name, port, target)
+
+base_port = 29000
 
 for idx, url in enumerate(inputs):
-    host, port, name = parse_node(url)
-    if not host or not port:
-        results.append((f"节点-{idx+1}", "解析失败 (格式不正确)", -1.0))
+    tag = f"test-out-{idx}"
+    outbound = parse_to_outbound(url, tag)
+    if not outbound:
         continue
-    latency = test_latency(host, port)
-    results.append((name, f"{host}:{port}", latency))
+    
+    # 提取备注
+    name = "未命名节点"
+    if url.startswith('vmess://'):
+        try:
+            name = json.loads(b64d(url[8:])).get('ps', '未命名节点')
+        except: pass
+    else:
+        p = urlparse(url)
+        if p.fragment:
+            name = unquote(p.fragment)
+            
+    port = base_port + len(outbounds)
+    inbound_tag = f"test-in-{idx}"
+    
+    inbounds.append({
+        "type": "socks",
+        "tag": inbound_tag,
+        "listen": "127.0.0.1",
+        "listen_port": port
+    })
+    outbounds.append(outbound)
+    rules.append({
+        "inbound": [inbound_tag],
+        "outbound": tag
+    })
+    
+    valid_nodes.append((name, port, f"{outbound.get('server')}:{outbound.get('server_port')}"))
 
+if not outbounds:
+    print("[!] 未解析到任何有效的代理节点。")
+    sys.exit(0)
+
+# 写入临时配置文件
+temp_cfg = {
+    "log": {"disabled": True},
+    "inbounds": inbounds,
+    "outbounds": outbounds + [{"type": "direct", "tag": "direct"}],
+    "route": {
+        "rules": rules,
+        "final": "direct"
+    }
+}
+
+temp_config_path = os.path.join(workdir, "temp_test_config.json")
+with open(temp_config_path, "w", encoding="utf-8") as f:
+    json.dump(temp_cfg, f, indent=2)
+
+# 启动临时 sing-box 进程
+process = None
+try:
+    process = subprocess.Popen(
+        [sb_binary, "run", "-c", temp_config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=workdir
+    )
+except Exception as e:
+    print(f"[!] 无法启动 sing-box 进行测速: {e}")
+    if os.path.exists(temp_config_path):
+        os.remove(temp_config_path)
+    sys.exit(1)
+
+# 给 sing-box 留 1.5 秒的初始化建连时间
+time.sleep(1.5)
+
+# 进行测速
+results = []
+for name, port, target in valid_nodes:
+    latency = test_socks5_http_latency(port, timeout=3.5)
+    results.append((name, target, latency))
+
+# 结束并清理
+if process:
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except:
+        try: process.kill()
+        except: pass
+
+if os.path.exists(temp_config_path):
+    os.remove(temp_config_path)
+
+# 排序并展示
 results.sort(key=lambda x: (x[2] == -1.0, x[2]))
 
-print("=" * 70)
-print(f"{'节点名称 (备注)':<25} | {'服务器目标':<28} | {'延迟(ms)':<8}")
-print("-" * 70)
+print("=" * 75)
+print(f"{'节点名称 (备注)':<28} | {'节点出站目标':<30} | {'真实延迟':<10}")
+print("-" * 75)
 for r in results:
     name, target, latency = r
-    name_display = name[:22] + ".." if len(name) > 24 else name
-    lat_str = f"\033[91m超时/不可达\033[0m" if latency == -1.0 else f"\033[92m{latency:.2f} ms\033[0m"
-    print(f"{name_display:<25} | {target:<28} | {lat_str}")
-print("=" * 70)
+    name_display = name[:25] + ".." if len(name) > 27 else name
+    lat_str = f"\033[91m连接超时/不可用\033[0m" if latency == -1.0 else f"\033[92m{latency:.2f} ms\033[0m"
+    print(f"{name_display:<28} | {target:<30} | {lat_str}")
+print("=" * 75)
 PY
     return 0
 }
