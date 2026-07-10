@@ -7585,6 +7585,102 @@ edit_proxy_egress_backend() {
 
     start_singbox || { red "[!] sing-box 重启失败"; return 1; }
     green "==== ✓ 分组后端修改完成！前端客户端链接保持不变 ===="
+}
+
+# ==== 批量测试外部多节点延迟 ====
+test_external_nodes_latency() {
+    clear
+    echo
+    green "============================================================"
+    green "  批量测试外部代理节点延迟 (TCP 建连测试)"
+    green "  说明: 支持 vless / vmess / trojan / hy2 / tuic / ss 链接"
+    green "============================================================"
+    echo
+    yellow "请粘贴你的节点链接 (一行一个)。"
+    yellow "输入完毕后，请在空行中输入 'EOF' 并回车开始测试："
+    echo
+
+    local raw_links=()
+    while read -r line; do
+        line=$(echo "$line" | xargs)
+        [[ "$line" == "EOF" || "$line" == "eof" ]] && break
+        [[ -n "$line" ]] && raw_links+=("$line")
+    done
+
+    if [[ ${#raw_links[@]} -eq 0 ]]; then
+        yellow "未输入任何节点，返回上级菜单。"
+        return 0
+    fi
+
+    echo
+    yellow "[*] 正在解析并测试 ${#raw_links[@]} 个节点，请稍候..."
+    echo
+
+    printf "%s\n" "${raw_links[@]}" | python3 - <<'PY'
+import sys, socket, time, json, base64
+from urllib.parse import urlparse, parse_qs, unquote
+
+def b64d(s):
+    s = s.replace('-', '+').replace('_', '/')
+    s += '=' * (4 - len(s) % 4)
+    return base64.b64decode(s).decode('utf-8', errors='replace')
+
+def parse_node(url):
+    try:
+        url = url.strip()
+        if url.startswith('vless://') or url.startswith('trojan://') or url.startswith(('hy2://', 'hysteria2://')) or url.startswith('tuic://') or url.startswith('ss://'):
+            p = urlparse(url)
+            name = unquote(p.fragment) if p.fragment else "未命名节点"
+            return p.hostname, p.port, name
+        elif url.startswith('vmess://'):
+            raw = url[8:]
+            data = json.loads(b64d(raw))
+            host = data.get('add','')
+            port = int(data.get('port', 443))
+            name = data.get('ps', '未命名节点')
+            return host, port, name
+    except Exception:
+        pass
+    return None, None, None
+
+def test_latency(host, port):
+    start = time.perf_counter()
+    try:
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        if not addr_info:
+            return -1
+        family, socktype, proto, _, sockaddr = addr_info[0]
+        s = socket.socket(family, socktype, proto)
+        s.settimeout(2.0)
+        s.connect(sockaddr)
+        s.close()
+        return int((time.perf_counter() - start) * 1000)
+    except Exception:
+        return -1
+
+inputs = [line.strip() for line in sys.stdin if line.strip()]
+results = []
+
+for idx, url in enumerate(inputs):
+    host, port, name = parse_node(url)
+    if not host or not port:
+        results.append((f"节点-{idx+1}", "解析失败 (格式不正确)", -1))
+        continue
+    latency = test_latency(host, port)
+    results.append((name, f"{host}:{port}", latency))
+
+results.sort(key=lambda x: (x[2] == -1, x[2]))
+
+print("=" * 70)
+print(f"{'节点名称 (备注)':<25} | {'服务器目标':<28} | {'延迟(ms)':<8}")
+print("-" * 70)
+for r in results:
+    name, target, latency = r
+    name_display = name[:22] + ".." if len(name) > 24 else name
+    lat_str = f"\033[91m超时/不可达\033[0m" if latency == -1 else f"\033[92m{latency} ms\033[0m"
+    print(f"{name_display:<25} | {target:<28} | {lat_str}")
+print("=" * 70)
+PY
     return 0
 }
 
@@ -7835,12 +7931,14 @@ menu() {
     echo "------------------------------------------------------------"
     purple " 11. 自定义代理出站多出口路由管理"
     echo "------------------------------------------------------------"
-    red    " 12. 系统初始化清理"
+    green  " 12. 批量测试外部代理节点延迟"
+    echo "------------------------------------------------------------"
+    red    " 13. 系统初始化清理"
     echo "------------------------------------------------------------"
     red    "  0. 退出"
     echo "============================================================"
     
-    reading "请选择 [0-12]: " choice
+    reading "请选择 [0-13]: " choice
     echo
     
     case "$choice" in
@@ -7855,7 +7953,8 @@ menu() {
         9) configure_warp_outbound ;;
         10) psiphon_management_menu ;;
         11) proxy_egress_menu ;;
-        12)
+        12) test_external_nodes_latency ;;
+        13)
             reading "确定清理所有内容? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 # 停止所有服务
