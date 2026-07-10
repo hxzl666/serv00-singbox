@@ -5619,12 +5619,25 @@ EOF
     
     chmod +x "$SCRIPT_PATH"
     
+    # 立即将 ~/bin 加入当前会话的 PATH
     if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
-        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc" 2>/dev/null
-        source "$HOME/.bashrc" 2>/dev/null
+        export PATH="$HOME/bin:$PATH"
     fi
     
-    green "快捷命令 'sb' 已创建"
+    # 持久化：写入所有常见的 shell 配置文件（兼容 FreeBSD / Linux）
+    local path_line='export PATH="$HOME/bin:$PATH"'
+    for rc_file in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+        if [[ -f "$rc_file" ]]; then
+            # 文件存在但尚未包含该行，则追加
+            grep -qxF "$path_line" "$rc_file" 2>/dev/null || \
+                echo "$path_line" >> "$rc_file"
+        else
+            # 文件不存在，创建并写入
+            echo "$path_line" > "$rc_file"
+        fi
+    done
+    
+    green "快捷命令 'sb' 已创建 (重新登录 SSH 后也可使用)"
 }
 
 # ==================== 安装 ====================
