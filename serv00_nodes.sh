@@ -4575,6 +4575,9 @@ start_singbox() {
     cd "$WORKDIR"
     SB_BINARY=$(cat sb.txt 2>/dev/null)
     
+    # 自动同步代理节点组配置
+    sync_all_proxy_groups 2>/dev/null || true
+    
     if [ -z "$SB_BINARY" ] || [ ! -f "$WORKDIR/$SB_BINARY" ]; then
         red "sing-box二进制文件未找到"
         return 1
@@ -6667,6 +6670,741 @@ PY
     green "操作完成！现有节点配置未被改动"
 }
 
+# ==================== 自定义代理出站节点组 ====================
+# 扩展 Psiphon 多出口框架：支持任意代理协议出站
+# 架构: 不同本机IP同一端口(Hy2/TUIC UDP入站) → 路由 → 自定义代理出站
+# 支持的出站协议: vless / vmess / trojan / hy2 / hysteria2 / tuic / ss
+
+PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
+
+# 初始化代理分组目录
+init_proxy_groups_dir() {
+    mkdir -p "${PROXY_GROUPS_DIR}" 2>/dev/null
+    [[ -f "${PROXY_GROUPS_DIR}/groups.txt" ]] || : > "${PROXY_GROUPS_DIR}/groups.txt"
+}
+
+# 获取所有代理分组 tag（逐行输出）
+get_all_proxy_groups() {
+    [[ -f "${PROXY_GROUPS_DIR}/groups.txt" ]] && \
+        grep -v '^$' "${PROXY_GROUPS_DIR}/groups.txt" || true
+}
+
+# 检查代理分组是否存在
+proxy_group_exists() {
+    get_all_proxy_groups | grep -qxF "$1"
+}
+
+# 生成唯一分组 tag（proxy-1, proxy-2 ...）
+generate_proxy_group_tag() {
+    local n=1
+    while proxy_group_exists "proxy-${n}" 2>/dev/null || \
+          [[ -d "${PROXY_GROUPS_DIR}/proxy-${n}" ]]; do
+        ((n++))
+    done
+    echo "proxy-${n}"
+}
+
+# ==== 代理链接解析（全协议支持）====
+# 通过环境变量传入，避免特殊字符转义问题
+# 成功: stdout=JSON; 失败: stdout 以 "ERROR: " 开头且退出码非0
+parse_proxy_url_to_json() {
+    local url="$1"
+    local tag="$2"
+    PROXY_URL="$url" PROXY_TAG="$tag" python3 - <<'PY'
+import json, sys, base64, os
+from urllib.parse import urlparse, parse_qs, unquote
+
+url = os.environ.get('PROXY_URL', '').strip()
+tag = os.environ.get('PROXY_TAG', 'proxy-out')
+
+def b64d(s):
+    s = s.replace('-', '+').replace('_', '/')
+    s += '=' * (4 - len(s) % 4)
+    return base64.b64decode(s).decode('utf-8', errors='replace')
+
+def make_tls(params, host, default_sec='tls'):
+    sec   = (params.get('security', [default_sec])[0] or default_sec).lower()
+    sni   = params.get('sni', [host])[0] or host
+    fp    = params.get('fp',  [''])[0]
+    pbk   = params.get('pbk', [''])[0]
+    sid   = params.get('sid', [''])[0]
+    alpn  = [a for a in params.get('alpn', [''])[0].split(',') if a]
+    insec = params.get('insecure', ['0'])[0] == '1' or \
+            params.get('allowInsecure', ['0'])[0] == '1'
+    if sec in ('none', ''):
+        return None
+    tls = {'enabled': True, 'server_name': sni}
+    if alpn:  tls['alpn'] = alpn
+    if insec: tls['insecure'] = True
+    if fp:    tls['utls'] = {'enabled': True, 'fingerprint': fp}
+    if sec == 'reality':
+        tls['reality'] = {'enabled': True, 'public_key': pbk, 'short_id': sid}
+    return tls
+
+def make_transport(params):
+    net  = params.get('type', ['tcp'])[0].lower()
+    path = params.get('path', ['/'])[0]
+    hdr  = params.get('host', [''])[0]
+    svc  = params.get('serviceName', [''])[0]
+    if net == 'ws':
+        t = {'type': 'ws', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        return t
+    if net == 'grpc':
+        return {'type': 'grpc', 'service_name': svc or path.lstrip('/')}
+    if net in ('httpupgrade', 'h1'):
+        t = {'type': 'httpupgrade', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        return t
+    if net == 'h2':
+        t = {'type': 'http', 'path': path}
+        if hdr: t['host'] = [hdr]
+        return t
+    return None
+
+def parse_vless(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    out = {'type': 'vless', 'tag': tag, 'server': host, 'server_port': p.port,
+           'uuid': unquote(p.username or '')}
+    flow = params.get('flow', [''])[0]
+    if flow: out['flow'] = flow
+    t = make_transport(params)
+    if t: out['transport'] = t
+    tls = make_tls(params, host)
+    if tls: out['tls'] = tls
+    return out
+
+def parse_vmess(url, tag):
+    raw = url[8:]
+    try:    data = json.loads(b64d(raw))
+    except Exception as e: raise ValueError(f'VMess base64 解码失败: {e}')
+    host = data.get('add',''); port = int(data.get('port', 443))
+    net  = data.get('net','tcp'); tls_s = data.get('tls','')
+    sni  = data.get('sni','') or data.get('host','') or host
+    path = data.get('path','/'); hdr = data.get('host',''); fp = data.get('fp','')
+    out  = {'type': 'vmess', 'tag': tag, 'server': host, 'server_port': port,
+            'uuid': data.get('id',''), 'alter_id': int(data.get('aid',0)),
+            'security': data.get('scy','auto')}
+    if net == 'ws':
+        t = {'type': 'ws', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        out['transport'] = t
+    elif net == 'grpc':
+        out['transport'] = {'type': 'grpc', 'service_name': data.get('serviceName', path.lstrip('/'))}
+    elif net in ('httpupgrade', 'h1'):
+        t = {'type': 'httpupgrade', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        out['transport'] = t
+    elif net == 'h2':
+        t = {'type': 'http', 'path': path}
+        if hdr: t['host'] = [hdr]
+        out['transport'] = t
+    if tls_s == 'tls':
+        tls = {'enabled': True, 'server_name': sni}
+        if fp: tls['utls'] = {'enabled': True, 'fingerprint': fp}
+        out['tls'] = tls
+    return out
+
+def parse_trojan(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    out = {'type': 'trojan', 'tag': tag, 'server': host, 'server_port': p.port,
+           'password': unquote(p.username or '')}
+    t = make_transport(params)
+    if t: out['transport'] = t
+    tls = make_tls(params, host) or {'enabled': True, 'server_name': host}
+    out['tls'] = tls
+    return out
+
+def parse_hy2(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    pw = unquote(p.username or '') or unquote(p.password or '')
+    sni = params.get('sni', [host])[0] or host
+    insec = params.get('insecure', ['0'])[0] == '1'
+    obfs_t = params.get('obfs', [''])[0]; obfs_p = params.get('obfs-password', [''])[0]
+    out = {'type': 'hysteria2', 'tag': tag, 'server': host, 'server_port': p.port,
+           'password': pw, 'tls': {'enabled': True, 'server_name': sni, 'insecure': insec}}
+    if obfs_t: out['obfs'] = {'type': obfs_t, 'password': obfs_p}
+    return out
+
+def parse_tuic(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    alpn = [a for a in params.get('alpn', ['h3'])[0].split(',') if a] or ['h3']
+    sni  = params.get('sni', [host])[0] or host
+    insec = params.get('allow_insecure', ['0'])[0] == '1'
+    cc   = params.get('congestion_control', ['bbr'])[0]
+    return {'type': 'tuic', 'tag': tag, 'server': host, 'server_port': p.port,
+            'uuid': unquote(p.username or ''), 'password': unquote(p.password or ''),
+            'congestion_control': cc,
+            'tls': {'enabled': True, 'server_name': sni, 'alpn': alpn, 'insecure': insec}}
+
+def parse_ss(url, tag):
+    p = urlparse(url); host = p.hostname; port = p.port
+    if p.username and p.password:
+        method = unquote(p.username); password = unquote(p.password)
+    else:
+        userinfo = unquote(p.username or '')
+        try:    method, password = b64d(userinfo).split(':', 1)
+        except: method = 'aes-256-gcm'; password = userinfo
+    return {'type': 'shadowsocks', 'tag': tag, 'server': host, 'server_port': port,
+            'method': method, 'password': password}
+
+try:
+    if   url.startswith('vless://'):                   r = parse_vless(url, tag)
+    elif url.startswith('vmess://'):                   r = parse_vmess(url, tag)
+    elif url.startswith('trojan://'):                  r = parse_trojan(url, tag)
+    elif url.startswith(('hy2://', 'hysteria2://')):   r = parse_hy2(url, tag)
+    elif url.startswith('tuic://'):                    r = parse_tuic(url, tag)
+    elif url.startswith('ss://'):                      r = parse_ss(url, tag)
+    else:
+        print('ERROR: 不支持的协议，支持: vless/vmess/trojan/hy2/hysteria2/tuic/ss')
+        sys.exit(1)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+except SystemExit:
+    raise
+except Exception as e:
+    print(f'ERROR: {e}')
+    sys.exit(1)
+PY
+}
+
+# 验证并解析代理链接 → 成功: stdout=JSON 返回0；失败: 打印错误 返回1
+validate_and_parse_proxy_url() {
+    local url="$1" tag="${2:-proxy-out}" result rc
+    result=$(parse_proxy_url_to_json "$url" "$tag" 2>&1); rc=$?
+    if [[ $rc -ne 0 ]] || echo "$result" | grep -q '^ERROR:'; then
+        red "[!] 链接解析失败: $(echo "$result" | grep '^ERROR:' | head -1 | sed 's/^ERROR: //')"
+        return 1
+    fi
+    if ! echo "$result" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+        red "[!] 生成的 JSON 格式不正确"; return 1
+    fi
+    echo "$result"; return 0
+}
+
+# ==== 添加自定义代理出站节点组（交互式）====
+add_proxy_egress_group() {
+    init_proxy_groups_dir
+
+    # 确保 ALL_IPS 已加载
+    if [[ ${#ALL_IPS[@]} -eq 0 ]]; then
+        [[ -f "$WORKDIR/all_ips.txt" ]] && mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt" \
+                                        || get_all_ips > /dev/null 2>&1
+    fi
+    [[ ${#ALL_IPS[@]} -eq 0 ]] && { red "[!] 无法获取本机 IP 列表"; return 1; }
+
+    echo
+    green "==== 添加自定义代理出站节点组 ===="
+    echo
+
+    # 1. 备注名称
+    reading "请输入分组备注名称 (如 美国VPS、JP节点等): " remark
+    remark="${remark:-代理节点}"
+
+    # 2. 代理链接
+    echo
+    yellow "支持的出站链接格式:"
+    blue   "  vless://uuid@host:port?security=tls|reality&flow=xtls-rprx-vision&sni=xxx&..."
+    blue   "  vmess://base64encodedJSON..."
+    blue   "  trojan://password@host:port?security=tls&sni=xxx"
+    blue   "  hy2://password@host:port?sni=xxx  或  hysteria2://..."
+    blue   "  tuic://uuid:password@host:port?alpn=h3&congestion_control=bbr"
+    blue   "  ss://method:password@host:port  或  ss://base64@host:port"
+    echo
+    reading "请粘贴代理链接: " proxy_url
+    proxy_url="${proxy_url// /}"
+    [[ -z "$proxy_url" ]] && { red "[!] 链接不能为空"; return 1; }
+
+    # 3. 解析链接
+    local group_tag out_tag outbound_json
+    group_tag=$(generate_proxy_group_tag)
+    out_tag="${group_tag}-out"
+
+    yellow "[*] 正在解析链接..."
+    outbound_json=$(validate_and_parse_proxy_url "$proxy_url" "$out_tag")
+    [[ $? -ne 0 ]] && return 1
+
+    local ptype pserver pport
+    ptype=$(echo "$outbound_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('type','?'))" 2>/dev/null)
+    pserver=$(echo "$outbound_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('server','?'))" 2>/dev/null)
+    pport=$(echo "$outbound_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('server_port','?'))" 2>/dev/null)
+    green "[+] 解析成功: [$ptype] $pserver:$pport"
+
+    # 4. 为每个 IP 选择入站协议
+    echo
+    green "==== 配置入站 IP 与协议 ===="
+    blue  "说明: 同一分组内所有 Hy2 入站共享一个 UDP 端口（不同 IP 相同端口）"
+    blue  "      所有 TUIC 入站共享另一个 UDP 端口，两者最多消耗 2 个 UDP 端口"
+    echo
+
+    local ip_protos=() need_hy2=false need_tuic=false
+
+    for i in "${!ALL_IPS[@]}"; do
+        local ip="${ALL_IPS[$i]}"
+        local st=$(cat "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null)
+        local st_str=""
+        [[ "$st" == "Available" ]] && st_str=" [大陆可用]"
+        [[ "$st" == "Blocked"   ]] && st_str=" [被墙]"
+        echo
+        blue "  IP[$((i+1))]: $ip${st_str}"
+        yellow "    1. 仅 Hysteria2 UDP 入站"
+        yellow "    2. 仅 TUIC v5   UDP 入站"
+        yellow "    3. Hy2 + TUIC   双 UDP 入站"
+        yellow "    0. 跳过此 IP"
+        reading "    选择 [0-3]: " pc
+        case "$pc" in
+            1) ip_protos+=("${ip}|hy2");  need_hy2=true
+               green "    → $ip 使用 Hysteria2 入站" ;;
+            2) ip_protos+=("${ip}|tuic"); need_tuic=true
+               green "    → $ip 使用 TUIC 入站" ;;
+            3) ip_protos+=("${ip}|both"); need_hy2=true; need_tuic=true
+               green "    → $ip 使用 Hy2 + TUIC 双入站" ;;
+            *) yellow "    → 跳过 $ip" ;;
+        esac
+    done
+
+    [[ ${#ip_protos[@]} -eq 0 ]] && { red "[!] 未选择任何 IP，操作取消"; return 1; }
+
+    # 5. 申请 UDP 端口
+    echo
+    yellow "[*] 申请 UDP 端口..."
+    local hy2_port="" tuic_port="" alloc_result
+
+    if [[ "$need_hy2" == "true" ]]; then
+        local retry=0
+        while [[ $retry -lt 20 && -z "$hy2_port" ]]; do
+            local cand=$(shuf -i 10000-65535 -n 1)
+            if ! check_port_in_use "$cand" > /dev/null 2>&1; then
+                alloc_result=$(devil port add udp "$cand" 2>&1)
+                if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
+                    hy2_port="$cand"
+                    green "    Hy2  UDP 端口: $hy2_port"
+                fi
+            fi
+            ((retry++))
+        done
+        [[ -z "$hy2_port" ]] && { red "[!] Hy2 UDP 端口申请失败（已尝试20次）"; return 1; }
+    fi
+
+    if [[ "$need_tuic" == "true" ]]; then
+        local retry=0
+        while [[ $retry -lt 20 && -z "$tuic_port" ]]; do
+            local cand=$(shuf -i 10000-65535 -n 1)
+            if ! check_port_in_use "$cand" > /dev/null 2>&1; then
+                alloc_result=$(devil port add udp "$cand" 2>&1)
+                if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
+                    tuic_port="$cand"
+                    green "    TUIC UDP 端口: $tuic_port"
+                fi
+            fi
+            ((retry++))
+        done
+        if [[ -z "$tuic_port" ]]; then
+            red "[!] TUIC UDP 端口申请失败（已尝试20次）"
+            [[ -n "$hy2_port" ]] && devil port del udp "$hy2_port" > /dev/null 2>&1
+            return 1
+        fi
+    fi
+
+    # 6. 保存分组数据
+    local group_dir="${PROXY_GROUPS_DIR}/${group_tag}"
+    mkdir -p "$group_dir"
+    echo "proxy"          > "$group_dir/type.txt"
+    echo "$remark"        > "$group_dir/remark.txt"
+    echo "$proxy_url"     > "$group_dir/proxy_url.txt"
+    echo "$outbound_json" > "$group_dir/outbound.json"
+    printf '%s\n' "${ip_protos[@]}" > "$group_dir/ip_protos.txt"
+    [[ -n "$hy2_port"  ]] && echo "$hy2_port"  > "$group_dir/hy2_port.txt"
+    [[ -n "$tuic_port" ]] && echo "$tuic_port" > "$group_dir/tuic_port.txt"
+
+    # 注册到分组列表
+    local existing
+    existing=$(get_all_proxy_groups | tr '\n' ',' | sed 's/,$//')
+    if [[ -n "$existing" ]]; then
+        echo "${existing},${group_tag}" > "${PROXY_GROUPS_DIR}/groups.txt"
+    else
+        echo "$group_tag" > "${PROXY_GROUPS_DIR}/groups.txt"
+    fi
+
+    # 7. 同步到 sing-box 配置
+    yellow "[*] 更新 sing-box 配置..."
+    if ! sync_proxy_group_to_singbox "$group_tag"; then
+        red "[!] 配置更新失败，正在回滚..."
+        rm -rf "$group_dir"
+        existing=$(get_all_proxy_groups | grep -vxF "$group_tag" | tr '\n' ',' | sed 's/,$//')
+        echo "$existing" > "${PROXY_GROUPS_DIR}/groups.txt"
+        [[ -n "$hy2_port"  ]] && devil port del udp "$hy2_port"  > /dev/null 2>&1
+        [[ -n "$tuic_port" ]] && devil port del udp "$tuic_port" > /dev/null 2>&1
+        return 1
+    fi
+
+    # 8. 重启 sing-box
+    yellow "[*] 重启 sing-box..."
+    start_singbox || { red "[!] sing-box 重启失败"; return 1; }
+
+    echo
+    green "==== ✓ 节点组 [$remark] ($group_tag) 添加完成 ===="
+    echo
+    generate_proxy_group_links "$group_tag"
+    return 0
+}
+
+# ==== 同步代理分组到 sing-box config.json ====
+# 使用 sys.argv 传参避免 shell 特殊字符转义问题
+sync_proxy_group_to_singbox() {
+    local group_tag="$1"
+    local group_dir="${PROXY_GROUPS_DIR}/${group_tag}"
+    local cfg="$WORKDIR/config.json"
+
+    [[ -f "$cfg" ]]                        || { red "[!] sing-box 配置不存在"; return 1; }
+    [[ -d "$group_dir" ]]                  || { red "[!] 分组目录不存在: $group_dir"; return 1; }
+    [[ -f "$group_dir/outbound.json" ]]    || { red "[!] outbound.json 不存在"; return 1; }
+    [[ -f "$group_dir/ip_protos.txt"  ]]   || { red "[!] ip_protos.txt 不存在"; return 1; }
+
+    local hy2_port=$(cat  "$group_dir/hy2_port.txt"  2>/dev/null || echo "0")
+    local tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null || echo "0")
+    local uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
+    local out_tag="${group_tag}-out"
+
+    cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+
+    python3 - \
+        "$cfg" \
+        "$group_tag" \
+        "$out_tag" \
+        "${hy2_port:-0}" \
+        "${tuic_port:-0}" \
+        "$uuid" \
+        "$WORKDIR" \
+        "$group_dir/outbound.json" \
+        "$group_dir/ip_protos.txt" <<'PY'
+import json, sys
+
+cfg_path    = sys.argv[1]
+group_tag   = sys.argv[2]
+out_tag     = sys.argv[3]
+hy2_port    = int(sys.argv[4]) if sys.argv[4] else 0
+tuic_port   = int(sys.argv[5]) if sys.argv[5] else 0
+uuid        = sys.argv[6]
+workdir     = sys.argv[7]
+outbound_f  = sys.argv[8]
+ip_protos_f = sys.argv[9]
+
+try:
+    with open(outbound_f, 'r', encoding='utf-8') as f:
+        outbound_obj = json.load(f)
+except Exception as e:
+    print(f'[!] 读取 outbound.json 失败: {e}'); sys.exit(1)
+
+ip_protos = []
+try:
+    with open(ip_protos_f, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if '|' in line:
+                ip, proto = line.split('|', 1)
+                ip_protos.append({'ip': ip.strip(), 'proto': proto.strip()})
+except Exception as e:
+    print(f'[!] 读取 ip_protos.txt 失败: {e}'); sys.exit(1)
+
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception as e:
+    print(f'[!] 读取 config.json 失败: {e}'); sys.exit(1)
+
+inbounds  = data.setdefault('inbounds',  [])
+outbounds = data.setdefault('outbounds', [])
+route     = data.setdefault('route',     {})
+rules     = route.setdefault('rules',    [])
+
+# 更新 outbound（先移除旧的同 tag 配置）
+outbounds[:] = [o for o in outbounds if o.get('tag') != out_tag]
+outbounds.append(outbound_obj)
+
+# 移除本分组旧的 inbound
+def is_mine(ib):
+    t = ib.get('tag', '')
+    return t.startswith(f'hy2-{group_tag}-') or t.startswith(f'tuic-{group_tag}-')
+inbounds[:] = [ib for ib in inbounds if not is_mine(ib)]
+
+cert = f'{workdir}/cert.pem'
+key  = f'{workdir}/private.key'
+inbound_tags = []
+
+for entry in ip_protos:
+    ip    = entry['ip']
+    proto = entry['proto']  # 'hy2' | 'tuic' | 'both'
+    # 用下划线替换点/冒号，保证 tag 合法
+    safe = ip.replace(':', '_').replace('.', '_')
+
+    if proto in ('hy2', 'both') and hy2_port > 0:
+        t = f'hy2-{group_tag}-{safe}'
+        inbound_tags.append(t)
+        inbounds.append({
+            'type': 'hysteria2', 'tag': t,
+            'listen': ip, 'listen_port': hy2_port,
+            'users': [{'password': uuid}],
+            'masquerade': 'https://www.bing.com',
+            'ignore_client_bandwidth': False,
+            'tls': {'enabled': True, 'alpn': ['h3'],
+                    'certificate_path': cert, 'key_path': key}
+        })
+
+    if proto in ('tuic', 'both') and tuic_port > 0:
+        t = f'tuic-{group_tag}-{safe}'
+        inbound_tags.append(t)
+        inbounds.append({
+            'type': 'tuic', 'tag': t,
+            'listen': ip, 'listen_port': tuic_port,
+            'users': [{'uuid': uuid, 'password': uuid}],
+            'congestion_control': 'bbr',
+            'tls': {'enabled': True, 'alpn': ['h3'],
+                    'certificate_path': cert, 'key_path': key}
+        })
+
+# 更新路由规则（移除旧规则，在最前插入新规则）
+rules[:] = [r for r in rules if r.get('outbound') != out_tag]
+if inbound_tags:
+    rules.insert(0, {'inbound': inbound_tags, 'outbound': out_tag})
+
+try:
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f'[+] 配置已更新: {group_tag} → {len(ip_protos)} 个IP, {len(inbound_tags)} 个inbound')
+except Exception as e:
+    print(f'[!] 写入 config.json 失败: {e}'); sys.exit(1)
+PY
+    return $?
+}
+
+# ==== 删除代理出站节点组 ====
+remove_proxy_egress_group() {
+    local group_tag="$1"
+    local group_dir="${PROXY_GROUPS_DIR}/${group_tag}"
+
+    if ! proxy_group_exists "$group_tag"; then
+        yellow "[*] 代理分组 $group_tag 不存在"; return 0
+    fi
+
+    local remark=$(cat "$group_dir/remark.txt" 2>/dev/null || echo "$group_tag")
+    local out_tag="${group_tag}-out"
+    yellow "[*] 正在删除代理节点组: $remark ($group_tag)"
+
+    # 释放端口
+    local hy2_port=$(cat  "$group_dir/hy2_port.txt"  2>/dev/null)
+    local tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null)
+    [[ -n "$hy2_port"  ]] && devil port del udp "$hy2_port"  > /dev/null 2>&1 && \
+        yellow "  已释放 Hy2  UDP 端口: $hy2_port"
+    [[ -n "$tuic_port" ]] && devil port del udp "$tuic_port" > /dev/null 2>&1 && \
+        yellow "  已释放 TUIC UDP 端口: $tuic_port"
+
+    # 从 config.json 移除相关配置
+    local cfg="$WORKDIR/config.json"
+    if [[ -f "$cfg" ]]; then
+        python3 - "$cfg" "$group_tag" "$out_tag" <<'PY'
+import json, sys
+cfg_path = sys.argv[1]; group_tag = sys.argv[2]; out_tag = sys.argv[3]
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    def is_mine(ib):
+        t = ib.get('tag', '')
+        return t.startswith(f'hy2-{group_tag}-') or t.startswith(f'tuic-{group_tag}-')
+    data.get('inbounds',  [])[:] = [i for i in data.get('inbounds',  []) if not is_mine(i)]
+    data.get('outbounds', [])[:] = [o for o in data.get('outbounds', []) if o.get('tag') != out_tag]
+    data.get('route', {}).get('rules', [])[:] = \
+        [r for r in data.get('route', {}).get('rules', []) if r.get('outbound') != out_tag]
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f'[+] 已从配置移除: {group_tag}')
+except Exception as e:
+    print(f'[!] 配置更新失败: {e}')
+PY
+    fi
+
+    rm -rf "$group_dir" 2>/dev/null
+
+    local new_list
+    new_list=$(get_all_proxy_groups | grep -vxF "$group_tag" | tr '\n' ',' | sed 's/,$//')
+    echo "$new_list" > "${PROXY_GROUPS_DIR}/groups.txt"
+
+    start_singbox
+    green "[+] 已删除代理节点组: $remark"
+}
+
+# ==== 生成代理分组节点链接 ====
+generate_proxy_group_links() {
+    local group_tag="$1"
+    local group_dir="${PROXY_GROUPS_DIR}/${group_tag}"
+
+    local remark=$(cat   "$group_dir/remark.txt"   2>/dev/null || echo "$group_tag")
+    local hy2_port=$(cat "$group_dir/hy2_port.txt"  2>/dev/null)
+    local tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null)
+    local uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
+
+    echo
+    green "========== 代理节点组 [$remark] 节点链接 =========="
+
+    if [[ ! -f "$group_dir/ip_protos.txt" ]]; then
+        yellow "  暂无入站配置"; echo "=================================================="; return
+    fi
+
+    while IFS='|' read -r ip proto; do
+        [[ -z "$ip" ]] && continue
+        echo
+        if [[ "$proto" == "hy2" || "$proto" == "both" ]] && [[ -n "$hy2_port" ]]; then
+            local name="${remark}-Hy2-${ip}"
+            local link="hysteria2://${uuid}@${ip}:${hy2_port}?insecure=1&sni=${HOSTNAME}#${name}"
+            purple "Hysteria2 | 入站: $ip:$hy2_port → 出站: $remark"
+            echo "$link"
+        fi
+        if [[ "$proto" == "tuic" || "$proto" == "both" ]] && [[ -n "$tuic_port" ]]; then
+            local name="${remark}-TUIC-${ip}"
+            local link="tuic://${uuid}:${uuid}@${ip}:${tuic_port}?congestion_control=bbr&alpn=h3&allow_insecure=1#${name}"
+            purple "TUIC v5   | 入站: $ip:$tuic_port → 出站: $remark"
+            echo "$link"
+        fi
+    done < "$group_dir/ip_protos.txt"
+    echo "=================================================="
+}
+
+# 重启时同步所有代理分组配置（供 restart_processes 等调用）
+sync_all_proxy_groups() {
+    init_proxy_groups_dir
+    local groups
+    mapfile -t groups < <(get_all_proxy_groups)
+    [[ ${#groups[@]} -eq 0 ]] && return 0
+    yellow "[*] 同步代理分组配置 (共 ${#groups[@]} 个)..."
+    for tag in "${groups[@]}"; do
+        [[ -d "${PROXY_GROUPS_DIR}/${tag}" ]] && sync_proxy_group_to_singbox "$tag"
+    done
+    return 0
+}
+
+# ==== 自定义代理出站节点组管理菜单 ====
+proxy_egress_menu() {
+    while true; do
+        clear
+        echo
+        green "============================================================"
+        green "  自定义代理出站节点组管理"
+        green "  原理: 本机不同IP同一端口(Hy2/TUIC入站) → 路由 → 代理出站"
+        green "============================================================"
+        echo
+
+        init_proxy_groups_dir
+        local groups
+        mapfile -t groups < <(get_all_proxy_groups)
+
+        purple "当前代理节点组 (共 ${#groups[@]} 个):"
+        if [[ ${#groups[@]} -gt 0 ]]; then
+            for tag in "${groups[@]}"; do
+                local dir="${PROXY_GROUPS_DIR}/$tag"
+                local remark=$(cat "$dir/remark.txt"   2>/dev/null || echo "$tag")
+                local hy2_p=$(cat  "$dir/hy2_port.txt"  2>/dev/null)
+                local tuic_p=$(cat "$dir/tuic_port.txt" 2>/dev/null)
+                local ip_cnt=$(wc -l < "$dir/ip_protos.txt" 2>/dev/null || echo 0)
+                local ports=""
+                [[ -n "$hy2_p"  ]] && ports+="Hy2:${hy2_p} "
+                [[ -n "$tuic_p" ]] && ports+="TUIC:${tuic_p}"
+                local ptype pserver pport
+                ptype=$(python3 -c "import json; d=json.load(open('$dir/outbound.json')); print(d.get('type','?'))" 2>/dev/null)
+                pserver=$(python3 -c "import json; d=json.load(open('$dir/outbound.json')); print(d.get('server','?'))" 2>/dev/null)
+                pport=$(python3 -c "import json; d=json.load(open('$dir/outbound.json')); print(d.get('server_port','?'))" 2>/dev/null)
+                printf "  %-12s %-20s IP数:%-3s 端口: %s\n" "[$tag]" "$remark" "$ip_cnt" "$ports"
+                printf "              出站: %-10s → %s:%s\n" "$ptype" "$pserver" "$pport"
+            done
+        else
+            yellow "  暂无代理节点组"
+        fi
+
+        echo
+        echo "------------------------------------------------------------"
+        green  "  1. 添加新代理节点组"
+        green  "  2. 删除代理节点组"
+        green  "  3. 查看所有节点链接"
+        echo "------------------------------------------------------------"
+        yellow "  4. 查看出站代理详细配置"
+        yellow "  5. 重新同步全部配置并重启"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回上级菜单"
+        echo "============================================================"
+        reading "请选择 [0-5]: " choice
+        echo
+
+        case "$choice" in
+            1)
+                add_proxy_egress_group
+                ;;
+            2)
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无代理节点组可删除"
+                else
+                    echo
+                    for i in "${!groups[@]}"; do
+                        local t="${groups[$i]}"
+                        local r=$(cat "${PROXY_GROUPS_DIR}/$t/remark.txt" 2>/dev/null || echo "$t")
+                        printf "  %d. [%-10s] %s\n" "$((i+1))" "$t" "$r"
+                    done
+                    echo
+                    reading "请输入要删除的分组 tag (如 proxy-1): " del_tag
+                    [[ -n "$del_tag" ]] && remove_proxy_egress_group "$del_tag"
+                fi
+                ;;
+            3)
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无代理节点组"
+                else
+                    for tag in "${groups[@]}"; do
+                        generate_proxy_group_links "$tag"
+                    done
+                fi
+                ;;
+            4)
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无代理节点组"
+                else
+                    for tag in "${groups[@]}"; do
+                        local dir="${PROXY_GROUPS_DIR}/$tag"
+                        local r=$(cat "$dir/remark.txt" 2>/dev/null || echo "$tag")
+                        echo
+                        blue "=== [$tag] $r ==="
+                        echo "出站配置 (sing-box outbound JSON):"
+                        python3 -m json.tool "$dir/outbound.json" 2>/dev/null || \
+                            cat "$dir/outbound.json" 2>/dev/null
+                        echo
+                        echo "IP-协议 绑定关系:"
+                        while IFS='|' read -r ip proto; do
+                            printf "  %-22s → %s 入站\n" "$ip" "$proto"
+                        done < "$dir/ip_protos.txt" 2>/dev/null
+                    done
+                fi
+                ;;
+            5)
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无代理节点组"
+                else
+                    for tag in "${groups[@]}"; do
+                        yellow "[*] 同步 $tag..."
+                        sync_proxy_group_to_singbox "$tag"
+                    done
+                    yellow "[*] 重启 sing-box..."
+                    start_singbox
+                fi
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                red "无效选项"
+                ;;
+        esac
+
+        echo
+        reading "按回车继续..." _
+    done
+}
+
 # ==================== 菜单 ====================
 
 menu() {
@@ -6784,12 +7522,14 @@ menu() {
     echo "------------------------------------------------------------"
     purple " 10. Psiphon 出站管理"
     echo "------------------------------------------------------------"
-    red    " 11. 系统初始化清理"
+    purple " 11. 自定义代理出站多出口路由管理"
+    echo "------------------------------------------------------------"
+    red    " 12. 系统初始化清理"
     echo "------------------------------------------------------------"
     red    "  0. 退出"
     echo "============================================================"
     
-    reading "请选择 [0-11]: " choice
+    reading "请选择 [0-12]: " choice
     echo
     
     case "$choice" in
@@ -6803,7 +7543,8 @@ menu() {
         8) view_logs_menu ;;
         9) configure_warp_outbound ;;
         10) psiphon_management_menu ;;
-        11)
+        11) proxy_egress_menu ;;
+        12)
             reading "确定清理所有内容? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 # 停止所有服务
