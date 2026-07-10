@@ -7816,115 +7816,108 @@ if os.path.exists(sb_txt_path):
         if name_sb:
             sb_binary = os.path.join(workdir, name_sb)
 
-# 构建测试配置
-outbounds = []
-inbounds = []
-rules = []
-valid_nodes = [] # (name, port, target)
+temp_config_path = os.path.join(workdir, "temp_test_config.json")
+temp_log_path    = os.path.join(workdir, "temp_test_sb.log")
+test_port = 29876
 
-base_port = 29000
-
+# 解析所有节点
+parsed_nodes = []
 for idx, url in enumerate(inputs):
     tag = f"test-out-{idx}"
     outbound = parse_to_outbound(url, tag)
-    if not outbound:
-        continue
-    
-    # 提取备注
     name = "未命名节点"
-    if url.startswith('vmess://'):
+    if url.strip().startswith('vmess://'):
         try:
-            name = json.loads(b64d(url[8:])).get('ps', '未命名节点')
+            name = json.loads(b64d(url.strip()[8:])).get('ps', '未命名节点')
         except: pass
     else:
-        p = urlparse(url)
-        if p.fragment:
-            name = unquote(p.fragment)
-            
-    port = base_port + len(outbounds)
-    inbound_tag = f"test-in-{idx}"
-    
-    inbounds.append({
-        "type": "socks",
-        "tag": inbound_tag,
-        "listen": "127.0.0.1",
-        "listen_port": port
-    })
-    outbounds.append(outbound)
-    rules.append({
-        "inbound": [inbound_tag],
-        "outbound": tag
-    })
-    
-    valid_nodes.append((name, port, f"{outbound.get('server')}:{outbound.get('server_port')}"))
+        try:
+            p = urlparse(url.strip())
+            if p.fragment: name = unquote(p.fragment)
+        except: pass
+    target = "解析失败"
+    if outbound:
+        target = f"{outbound.get('server','')}:{outbound.get('server_port','')}"
+    parsed_nodes.append((name, target, outbound, tag))
 
-if not outbounds:
+if not any(n[2] for n in parsed_nodes):
     print("[!] 未解析到任何有效的代理节点。")
     sys.exit(0)
 
-# 写入临时配置文件
-temp_cfg = {
-    "log": {"disabled": True},
-    "inbounds": inbounds,
-    "outbounds": outbounds + [{"type": "direct", "tag": "direct"}],
-    "route": {
-        "rules": rules,
-        "final": "direct"
-    }
-}
+total = sum(1 for n in parsed_nodes if n[2])
+print(f"[*] 已解析 {total} 个有效节点，开始逐个测速...")
+print()
 
-temp_config_path = os.path.join(workdir, "temp_test_config.json")
-with open(temp_config_path, "w", encoding="utf-8") as f:
-    json.dump(temp_cfg, f, indent=2)
-
-# 启动临时 sing-box 进程
-process = None
-try:
-    process = subprocess.Popen(
-        [sb_binary, "run", "-c", temp_config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=workdir
-    )
-except Exception as e:
-    print(f"[!] 无法启动 sing-box 进行测速: {e}")
-    if os.path.exists(temp_config_path):
-        os.remove(temp_config_path)
-    sys.exit(1)
-
-# 给 sing-box 留 1.5 秒的初始化建连时间
-time.sleep(1.5)
-
-# 进行测速
 results = []
-for name, port, target in valid_nodes:
-    latency = test_socks5_http_latency(port, timeout=3.5)
+tested = 0
+for name, target, outbound, tag in parsed_nodes:
+    if not outbound:
+        results.append((name, target, -1.0))
+        continue
+    tested += 1
+    sys.stdout.write(f"\r[{tested}/{total}] 正在测试: {name[:30]}...")
+    sys.stdout.flush()
+    temp_cfg = {
+        "log": {"disabled": True},
+        "inbounds": [{"type":"socks","tag":"test-in","listen":"127.0.0.1","listen_port":test_port}],
+        "outbounds": [outbound, {"type":"direct","tag":"direct"}],
+        "route": {"rules":[{"inbound":["test-in"],"outbound":tag}],"final":"direct"}
+    }
+    with open(temp_config_path, "w", encoding="utf-8") as f:
+        json.dump(temp_cfg, f, indent=2)
+    process = None; latency = -1.0; log_f = None
+    try:
+        log_f = open(temp_log_path, "w")
+        process = subprocess.Popen(
+            [sb_binary, "run", "-c", temp_config_path],
+            stdout=subprocess.DEVNULL, stderr=log_f, cwd=workdir)
+        time.sleep(0.8)
+        if process.poll() is not None:
+            latency = -1.0
+        else:
+            latency = test_socks5_http_latency(test_port, timeout=4.0)
+    except Exception:
+        latency = -1.0
+    finally:
+        if process and process.poll() is None:
+            try: process.terminate(); process.wait(timeout=2)
+            except:
+                try: process.kill()
+                except: pass
+        if log_f:
+            try: log_f.close()
+            except: pass
     results.append((name, target, latency))
 
-# 结束并清理
-if process:
-    try:
-        process.terminate()
-        process.wait(timeout=2)
-    except:
-        try: process.kill()
-        except: pass
+for fp in [temp_config_path, temp_log_path]:
+    try: os.remove(fp)
+    except: pass
 
-if os.path.exists(temp_config_path):
-    os.remove(temp_config_path)
+sys.stdout.write("\r" + " " * 60 + "\r")
+sys.stdout.flush()
+print()
 
-# 排序并展示
-results.sort(key=lambda x: (x[2] == -1.0, x[2]))
+results.sort(key=lambda x: (x[2] < 0, x[2]))
+ok_count   = sum(1 for r in results if r[2] > 0)
+fail_count = sum(1 for r in results if r[2] <= 0)
 
-print("=" * 75)
-print(f"{'节点名称 (备注)':<28} | {'节点出站目标':<30} | {'真实延迟':<10}")
-print("-" * 75)
+print("=" * 78)
+print(f"{'节点名称 (备注)':<28} | {'节点出站目标':<30} | {'真实延迟':<12}")
+print("-" * 78)
 for r in results:
     name, target, latency = r
-    name_display = name[:25] + ".." if len(name) > 27 else name
-    lat_str = f"\033[91m连接超时/不可用\033[0m" if latency == -1.0 else f"\033[92m{latency:.2f} ms\033[0m"
-    print(f"{name_display:<28} | {target:<30} | {lat_str}")
-print("=" * 75)
+    nd = name[:25] + ".." if len(name) > 27 else name
+    if latency <= 0:
+        ls = f"\033[91m不可用\033[0m"
+    elif latency < 500:
+        ls = f"\033[92m{latency:.0f} ms\033[0m"
+    elif latency < 1500:
+        ls = f"\033[93m{latency:.0f} ms\033[0m"
+    else:
+        ls = f"\033[91m{latency:.0f} ms\033[0m"
+    print(f"{nd:<28} | {target:<30} | {ls}")
+print("=" * 78)
+print(f"\n\033[92m可用: {ok_count}\033[0m | \033[91m不可用: {fail_count}\033[0m | 共计: {len(results)}")
 PY
     return 0
 }
