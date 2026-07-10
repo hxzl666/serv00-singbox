@@ -6680,7 +6680,16 @@ PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
 # 初始化代理分组目录
 init_proxy_groups_dir() {
     mkdir -p "${PROXY_GROUPS_DIR}" 2>/dev/null
-    [[ -f "${PROXY_GROUPS_DIR}/groups.txt" ]] || : > "${PROXY_GROUPS_DIR}/groups.txt"
+    if [[ ! -f "${PROXY_GROUPS_DIR}/groups.txt" ]]; then
+        : > "${PROXY_GROUPS_DIR}/groups.txt"
+    else
+        # 兼容与修复：如果包含逗号，转为换行符
+        if grep -q ',' "${PROXY_GROUPS_DIR}/groups.txt" 2>/dev/null; then
+            local content
+            content=$(cat "${PROXY_GROUPS_DIR}/groups.txt" | tr ',' '\n' | grep -v '^$')
+            echo "$content" > "${PROXY_GROUPS_DIR}/groups.txt"
+        fi
+    fi
 }
 
 # 获取所有代理分组 tag（逐行输出）
@@ -6929,83 +6938,261 @@ add_proxy_egress_group() {
     pport=$(echo "$outbound_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('server_port','?'))" 2>/dev/null)
     green "[+] 解析成功: [$ptype] $pserver:$pport"
 
-    # 4. 为每个 IP 选择入站协议
+    # 4. 询问所需入站协议类型
     echo
-    green "==== 配置入站 IP 与协议 ===="
-    blue  "说明: 同一分组内所有 Hy2 入站共享一个 UDP 端口（不同 IP 相同端口）"
-    blue  "      所有 TUIC 入站共享另一个 UDP 端口，两者最多消耗 2 个 UDP 端口"
+    green "==== 选择此出站组所需的入站协议 ===="
+    yellow "  1. 仅 Hysteria2 UDP 入站"
+    yellow "  2. 仅 TUIC v5   UDP 入站"
+    yellow "  3. Hy2 + TUIC   双 UDP 入站"
+    reading "  请选择 [1-3]: " proto_type
+    
+    local need_hy2=false need_tuic=false
+    case "$proto_type" in
+        1) need_hy2=true ;;
+        2) need_tuic=true ;;
+        3) need_hy2=true; need_tuic=true ;;
+        *) red "[!] 无效选择，默认启用仅 Hysteria2"; need_hy2=true ;;
+    esac
+
+    # 收集当前已有的端口和绑定关系
+    local used_binds=()
+    local used_hy2_ports=()
+    local used_tuic_ports=()
+    local g
+    for g in $(get_all_proxy_groups); do
+        local g_dir="${PROXY_GROUPS_DIR}/$g"
+        [[ -d "$g_dir" ]] || continue
+        local h_p=$(cat "$g_dir/hy2_port.txt" 2>/dev/null)
+        local t_p=$(cat "$g_dir/tuic_port.txt" 2>/dev/null)
+        if [[ -f "$g_dir/ip_protos.txt" ]]; then
+            while IFS='|' read -r ip proto; do
+                [[ -z "$ip" ]] && continue
+                if [[ -n "$h_p" ]] && [[ "$proto" == "hy2" || "$proto" == "both" ]]; then
+                    used_binds+=("${h_p}|${ip}|hy2")
+                    local found=false
+                    for p in "${used_hy2_ports[@]}"; do [[ "$p" == "$h_p" ]] && found=true; done
+                    [[ "$found" == "false" ]] && used_hy2_ports+=("$h_p")
+                fi
+                if [[ -n "$t_p" ]] && [[ "$proto" == "tuic" || "$proto" == "both" ]]; then
+                    used_binds+=("${t_p}|${ip}|tuic")
+                    local found=false
+                    for p in "${used_tuic_ports[@]}"; do [[ "$p" == "$t_p" ]] && found=true; done
+                    [[ "$found" == "false" ]] && used_tuic_ports+=("$t_p")
+                fi
+            done < "$g_dir/ip_protos.txt"
+        fi
+    done
+
+    # 5. 确定 Hysteria2 端口
+    local hy2_port=""
+    if [[ "$need_hy2" == "true" ]]; then
+        if [[ ${#used_hy2_ports[@]} -gt 0 ]]; then
+            echo
+            yellow "检测到目前已有 Hysteria2 端口: ${used_hy2_ports[*]}"
+            yellow "为了节省端口资源（每个账号限额通常为3个），你可以选择复用已有端口，绑定至不同的本机 IP。"
+            echo "  1. 复用已有 Hysteria2 端口"
+            echo "  2. 申请新的 Hysteria2 端口"
+            reading "  请选择 [1-2]: " port_choice
+            if [[ "$port_choice" == "1" ]]; then
+                echo "已有端口列表:"
+                for i in "${!used_hy2_ports[@]}"; do
+                    echo "  $((i+1)). ${used_hy2_ports[$i]}"
+                done
+                reading "  请选择复用的端口序号: " p_idx
+                p_idx=$((p_idx-1))
+                if [[ $p_idx -ge 0 && $p_idx -lt ${#used_hy2_ports[@]} ]]; then
+                    hy2_port="${used_hy2_ports[$p_idx]}"
+                    green "  → 选择复用 Hysteria2 端口: $hy2_port"
+                else
+                    red "  [!] 无效选择，将申请新端口"
+                fi
+            fi
+        fi
+
+        # 如果没有复用，则申请新端口
+        if [[ -z "$hy2_port" ]]; then
+            yellow "[*] 申请新的 Hysteria2 UDP 端口..."
+            local retry=0
+            while [[ $retry -lt 20 && -z "$hy2_port" ]]; do
+                local cand=$(shuf -i 10000-65535 -n 1)
+                if ! check_port_in_use "$cand" > /dev/null 2>&1; then
+                    local alloc_result
+                    alloc_result=$(devil port add udp "$cand" 2>&1)
+                    if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
+                        hy2_port="$cand"
+                        green "    已成功申请 Hy2 UDP 端口: $hy2_port"
+                    fi
+                fi
+                ((retry++))
+            done
+            [[ -z "$hy2_port" ]] && { red "[!] Hy2 UDP 端口申请失败"; return 1; }
+        fi
+    fi
+
+    # 6. 确定 TUIC 端口
+    local tuic_port=""
+    if [[ "$need_tuic" == "true" ]]; then
+        if [[ ${#used_tuic_ports[@]} -gt 0 ]]; then
+            echo
+            yellow "检测到目前已有 TUIC 端口: ${used_tuic_ports[*]}"
+            yellow "为了节省端口资源，建议复用已有端口绑定到不同的本机 IP。"
+            echo "  1. 复用已有 TUIC 端口"
+            echo "  2. 申请新的 TUIC 端口"
+            reading "  请选择 [1-2]: " port_choice
+            if [[ "$port_choice" == "1" ]]; then
+                echo "已有端口列表:"
+                for i in "${!used_tuic_ports[@]}"; do
+                    echo "  $((i+1)). ${used_tuic_ports[$i]}"
+                done
+                reading "  请选择复用的端口序号: " p_idx
+                p_idx=$((p_idx-1))
+                if [[ $p_idx -ge 0 && $p_idx -lt ${#used_tuic_ports[@]} ]]; then
+                    tuic_port="${used_tuic_ports[$p_idx]}"
+                    green "  → 选择复用 TUIC 端口: $tuic_port"
+                else
+                    red "  [!] 无效选择，将申请新端口"
+                fi
+            fi
+        fi
+
+        # 如果没有复用，则申请新端口
+        if [[ -z "$tuic_port" ]]; then
+            yellow "[*] 申请新的 TUIC UDP 端口..."
+            local retry=0
+            while [[ $retry -lt 20 && -z "$tuic_port" ]]; do
+                local cand=$(shuf -i 10000-65535 -n 1)
+                if ! check_port_in_use "$cand" > /dev/null 2>&1; then
+                    local alloc_result
+                    alloc_result=$(devil port add udp "$cand" 2>&1)
+                    if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
+                        tuic_port="$cand"
+                        green "    已成功申请 TUIC UDP 端口: $tuic_port"
+                    fi
+                fi
+                ((retry++))
+            done
+            if [[ -z "$tuic_port" ]]; then
+                red "[!] TUIC UDP 端口申请失败"
+                local is_new_hy2=true
+                for p in "${used_hy2_ports[@]}"; do [[ "$p" == "$hy2_port" ]] && is_new_hy2=false; done
+                if [[ "$is_new_hy2" == "true" && -n "$hy2_port" ]]; then
+                    devil port del udp "$hy2_port" > /dev/null 2>&1
+                fi
+                return 1
+            fi
+        fi
+    fi
+
+    # 7. 为每个 IP 选择是否绑定
+    echo
+    green "==== 配置入站 IP ===="
+    blue  "在此步骤，你将选择哪些 IP 映射到此出站组"
     echo
 
-    local ip_protos=() need_hy2=false need_tuic=false
-
+    local ip_protos=()
     for i in "${!ALL_IPS[@]}"; do
         local ip="${ALL_IPS[$i]}"
         local st=$(cat "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null)
         local st_str=""
         [[ "$st" == "Available" ]] && st_str=" [大陆可用]"
         [[ "$st" == "Blocked"   ]] && st_str=" [被墙]"
+        
+        # 探测是否在选定的端口上已被绑定
+        local hy2_already_used=false
+        local tuic_already_used=false
+        
+        if [[ "$need_hy2" == "true" ]]; then
+            for b in "${used_binds[@]}"; do
+                if [[ "$b" == "${hy2_port}|${ip}|hy2" ]]; then
+                    hy2_already_used=true
+                    break
+                fi
+            done
+        fi
+        
+        if [[ "$need_tuic" == "true" ]]; then
+            for b in "${used_binds[@]}"; do
+                if [[ "$b" == "${tuic_port}|${ip}|tuic" ]]; then
+                    tuic_already_used=true
+                    break
+                fi
+            done
+        fi
+
         echo
         blue "  IP[$((i+1))]: $ip${st_str}"
-        yellow "    1. 仅 Hysteria2 UDP 入站"
-        yellow "    2. 仅 TUIC v5   UDP 入站"
-        yellow "    3. Hy2 + TUIC   双 UDP 入站"
-        yellow "    0. 跳过此 IP"
-        reading "    选择 [0-3]: " pc
-        case "$pc" in
-            1) ip_protos+=("${ip}|hy2");  need_hy2=true
-               green "    → $ip 使用 Hysteria2 入站" ;;
-            2) ip_protos+=("${ip}|tuic"); need_tuic=true
-               green "    → $ip 使用 TUIC 入站" ;;
-            3) ip_protos+=("${ip}|both"); need_hy2=true; need_tuic=true
-               green "    → $ip 使用 Hy2 + TUIC 双入站" ;;
-            *) yellow "    → 跳过 $ip" ;;
-        esac
+
+        local can_hy2=false
+        local can_tuic=false
+        [[ "$need_hy2" == "true" && "$hy2_already_used" == "false" ]] && can_hy2=true
+        [[ "$need_tuic" == "true" && "$tuic_already_used" == "false" ]] && can_tuic=true
+
+        if [[ "$can_hy2" == "false" && "$can_tuic" == "false" ]]; then
+            if [[ "$need_hy2" == "true" && "$need_tuic" == "true" ]]; then
+                red "    [!] 该 IP 的 Hysteria2(端口 ${hy2_port}) 和 TUIC(端口 ${tuic_port}) 均已被其它节点组占用，无法在此 IP 上绑定双入站。"
+            elif [[ "$need_hy2" == "true" ]]; then
+                red "    [!] 该 IP 的 Hysteria2(端口 ${hy2_port}) 已被其它节点组占用，无法绑定。"
+            else
+                red "    [!] 该 IP 的 TUIC(端口 ${tuic_port}) 已被其它节点组占用，无法绑定。"
+            fi
+            yellow "    0. 跳过此 IP"
+            reading "    选择 [0]: " pc
+            continue
+        fi
+
+        if [[ "$can_hy2" == "true" && "$can_tuic" == "true" ]]; then
+            yellow "    1. 启用 Hysteria2 + TUIC 双入站"
+            yellow "    2. 仅启用 Hysteria2 入站"
+            yellow "    3. 仅启用 TUIC 入站"
+            yellow "    0. 跳过此 IP"
+            reading "    选择 [0-3]: " pc
+            case "$pc" in
+                1) ip_protos+=("${ip}|both"); green "    → 绑定 Hysteria2 + TUIC" ;;
+                2) ip_protos+=("${ip}|hy2");  green "    → 仅绑定 Hysteria2" ;;
+                3) ip_protos+=("${ip}|tuic"); green "    → 仅绑定 TUIC" ;;
+                *) yellow "    → 跳过 $ip" ;;
+            esac
+        elif [[ "$can_hy2" == "true" ]]; then
+            if [[ "$need_tuic" == "true" ]]; then
+                yellow "    (此 IP 在端口 ${tuic_port} 上已被别的组占用 TUIC)"
+            fi
+            yellow "    1. 启用 Hysteria2 入站"
+            yellow "    0. 跳过此 IP"
+            reading "    选择 [0-1]: " pc
+            case "$pc" in
+                1) ip_protos+=("${ip}|hy2"); green "    → 仅绑定 Hysteria2" ;;
+                *) yellow "    → 跳过 $ip" ;;
+            esac
+        elif [[ "$can_tuic" == "true" ]]; then
+            if [[ "$need_hy2" == "true" ]]; then
+                yellow "    (此 IP 在端口 ${hy2_port} 上已被别的组占用 Hysteria2)"
+            fi
+            yellow "    1. 启用 TUIC 入站"
+            yellow "    0. 跳过此 IP"
+            reading "    选择 [0-1]: " pc
+            case "$pc" in
+                1) ip_protos+=("${ip}|tuic"); green "    → 仅绑定 TUIC" ;;
+                *) yellow "    → 跳过 $ip" ;;
+            esac
+        fi
     done
 
-    [[ ${#ip_protos[@]} -eq 0 ]] && { red "[!] 未选择任何 IP，操作取消"; return 1; }
-
-    # 5. 申请 UDP 端口
-    echo
-    yellow "[*] 申请 UDP 端口..."
-    local hy2_port="" tuic_port="" alloc_result
-
-    if [[ "$need_hy2" == "true" ]]; then
-        local retry=0
-        while [[ $retry -lt 20 && -z "$hy2_port" ]]; do
-            local cand=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_in_use "$cand" > /dev/null 2>&1; then
-                alloc_result=$(devil port add udp "$cand" 2>&1)
-                if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
-                    hy2_port="$cand"
-                    green "    Hy2  UDP 端口: $hy2_port"
-                fi
-            fi
-            ((retry++))
-        done
-        [[ -z "$hy2_port" ]] && { red "[!] Hy2 UDP 端口申请失败（已尝试20次）"; return 1; }
-    fi
-
-    if [[ "$need_tuic" == "true" ]]; then
-        local retry=0
-        while [[ $retry -lt 20 && -z "$tuic_port" ]]; do
-            local cand=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_in_use "$cand" > /dev/null 2>&1; then
-                alloc_result=$(devil port add udp "$cand" 2>&1)
-                if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
-                    tuic_port="$cand"
-                    green "    TUIC UDP 端口: $tuic_port"
-                fi
-            fi
-            ((retry++))
-        done
-        if [[ -z "$tuic_port" ]]; then
-            red "[!] TUIC UDP 端口申请失败（已尝试20次）"
-            [[ -n "$hy2_port" ]] && devil port del udp "$hy2_port" > /dev/null 2>&1
-            return 1
+    if [[ ${#ip_protos[@]} -eq 0 ]]; then
+        red "[!] 未绑定任何 IP，操作取消。"
+        local is_new_hy2=true
+        for p in "${used_hy2_ports[@]}"; do [[ "$p" == "$hy2_port" ]] && is_new_hy2=false; done
+        if [[ "$is_new_hy2" == "true" && -n "$hy2_port" ]]; then
+            devil port del udp "$hy2_port" > /dev/null 2>&1
         fi
+        local is_new_tuic=true
+        for p in "${used_tuic_ports[@]}"; do [[ "$p" == "$tuic_port" ]] && is_new_tuic=false; done
+        if [[ "$is_new_tuic" == "true" && -n "$tuic_port" ]]; then
+            devil port del udp "$tuic_port" > /dev/null 2>&1
+        fi
+        return 1
     fi
 
-    # 6. 保存分组数据
+    # 8. 保存分组数据
     local group_dir="${PROXY_GROUPS_DIR}/${group_tag}"
     mkdir -p "$group_dir"
     echo "proxy"          > "$group_dir/type.txt"
@@ -7016,28 +7203,34 @@ add_proxy_egress_group() {
     [[ -n "$hy2_port"  ]] && echo "$hy2_port"  > "$group_dir/hy2_port.txt"
     [[ -n "$tuic_port" ]] && echo "$tuic_port" > "$group_dir/tuic_port.txt"
 
-    # 注册到分组列表
-    local existing
-    existing=$(get_all_proxy_groups | tr '\n' ',' | sed 's/,$//')
-    if [[ -n "$existing" ]]; then
-        echo "${existing},${group_tag}" > "${PROXY_GROUPS_DIR}/groups.txt"
-    else
-        echo "$group_tag" > "${PROXY_GROUPS_DIR}/groups.txt"
-    fi
+    # 注册到分组列表 (一行一个)
+    echo "$group_tag" >> "${PROXY_GROUPS_DIR}/groups.txt"
 
-    # 7. 同步到 sing-box 配置
+    # 9. 同步到 sing-box 配置
     yellow "[*] 更新 sing-box 配置..."
     if ! sync_proxy_group_to_singbox "$group_tag"; then
         red "[!] 配置更新失败，正在回滚..."
         rm -rf "$group_dir"
-        existing=$(get_all_proxy_groups | grep -vxF "$group_tag" | tr '\n' ',' | sed 's/,$//')
-        echo "$existing" > "${PROXY_GROUPS_DIR}/groups.txt"
-        [[ -n "$hy2_port"  ]] && devil port del udp "$hy2_port"  > /dev/null 2>&1
-        [[ -n "$tuic_port" ]] && devil port del udp "$tuic_port" > /dev/null 2>&1
+        
+        local temp_file
+        temp_file=$(mktemp)
+        get_all_proxy_groups | grep -vxF "$group_tag" > "$temp_file"
+        mv "$temp_file" "${PROXY_GROUPS_DIR}/groups.txt"
+        
+        local is_new_hy2=true
+        for p in "${used_hy2_ports[@]}"; do [[ "$p" == "$hy2_port" ]] && is_new_hy2=false; done
+        if [[ "$is_new_hy2" == "true" && -n "$hy2_port" ]]; then
+            devil port del udp "$hy2_port" > /dev/null 2>&1
+        fi
+        local is_new_tuic=true
+        for p in "${used_tuic_ports[@]}"; do [[ "$p" == "$tuic_port" ]] && is_new_tuic=false; done
+        if [[ "$is_new_tuic" == "true" && -n "$tuic_port" ]]; then
+            devil port del udp "$tuic_port" > /dev/null 2>&1
+        fi
         return 1
     fi
 
-    # 8. 重启 sing-box
+    # 10. 重启 sing-box
     yellow "[*] 重启 sing-box..."
     start_singbox || { red "[!] sing-box 重启失败"; return 1; }
 
@@ -7190,13 +7383,42 @@ remove_proxy_egress_group() {
     local out_tag="${group_tag}-out"
     yellow "[*] 正在删除代理节点组: $remark ($group_tag)"
 
-    # 释放端口
+    # 释放端口（检测是否有其它组在使用）
     local hy2_port=$(cat  "$group_dir/hy2_port.txt"  2>/dev/null)
     local tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null)
-    [[ -n "$hy2_port"  ]] && devil port del udp "$hy2_port"  > /dev/null 2>&1 && \
-        yellow "  已释放 Hy2  UDP 端口: $hy2_port"
-    [[ -n "$tuic_port" ]] && devil port del udp "$tuic_port" > /dev/null 2>&1 && \
-        yellow "  已释放 TUIC UDP 端口: $tuic_port"
+    
+    local other_groups=()
+    for og in $(get_all_proxy_groups); do
+        [[ "$og" != "$group_tag" ]] && other_groups+=("$og")
+    done
+    
+    if [[ -n "$hy2_port" ]]; then
+        local hy2_in_use=false
+        for og in "${other_groups[@]}"; do
+            local og_hy2=$(cat "${PROXY_GROUPS_DIR}/${og}/hy2_port.txt" 2>/dev/null)
+            [[ "$og_hy2" == "$hy2_port" ]] && hy2_in_use=true
+        done
+        if [[ "$hy2_in_use" == "false" ]]; then
+            devil port del udp "$hy2_port" > /dev/null 2>&1
+            yellow "  已释放 Hysteria2 UDP 端口: $hy2_port"
+        else
+            yellow "  Hysteria2 端口 $hy2_port 仍被其它组复用，不执行释放"
+        fi
+    fi
+    
+    if [[ -n "$tuic_port" ]]; then
+        local tuic_in_use=false
+        for og in "${other_groups[@]}"; do
+            local og_tuic=$(cat "${PROXY_GROUPS_DIR}/${og}/tuic_port.txt" 2>/dev/null)
+            [[ "$og_tuic" == "$tuic_port" ]] && tuic_in_use=true
+        done
+        if [[ "$tuic_in_use" == "false" ]]; then
+            devil port del udp "$tuic_port" > /dev/null 2>&1
+            yellow "  已释放 TUIC UDP 端口: $tuic_port"
+        else
+            yellow "  TUIC 端口 $tuic_port 仍被其它组复用，不执行释放"
+        fi
+    fi
 
     # 从 config.json 移除相关配置
     local cfg="$WORKDIR/config.json"
@@ -7222,11 +7444,11 @@ except Exception as e:
 PY
     fi
 
+    local temp_file
+    temp_file=$(mktemp)
+    get_all_proxy_groups | grep -vxF "$group_tag" > "$temp_file"
+    mv "$temp_file" "${PROXY_GROUPS_DIR}/groups.txt"
     rm -rf "$group_dir" 2>/dev/null
-
-    local new_list
-    new_list=$(get_all_proxy_groups | grep -vxF "$group_tag" | tr '\n' ',' | sed 's/,$//')
-    echo "$new_list" > "${PROXY_GROUPS_DIR}/groups.txt"
 
     start_singbox
     green "[+] 已删除代理节点组: $remark"
