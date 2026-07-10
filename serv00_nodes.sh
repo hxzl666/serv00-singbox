@@ -7617,8 +7617,21 @@ test_external_nodes_latency() {
     echo
 
     # 导出必要的变量给 Python 子进程
+    # 获取用户在 devil 下注册的有效 TCP 端口列表
+    local tcp_ports=()
+    if command -v devil &>/dev/null; then
+        mapfile -t tcp_ports < <(devil port list 2>/dev/null | grep -i 'tcp' | awk '{print $1}')
+    fi
+
+    # 转成逗号隔开的字符串
+    local ports_str=""
+    if [[ ${#tcp_ports[@]} -gt 0 ]]; then
+        ports_str=$(IFS=,; echo "${tcp_ports[*]}")
+    fi
+
     export RAW_NODE_LINKS=$(printf "%s\n" "${raw_links[@]}")
     export WORKDIR="$WORKDIR"
+    export DEVIL_TCP_PORTS="$ports_str"
 
     python3 - <<'PY'
 import sys, socket, time, json, base64, os, subprocess
@@ -7818,7 +7831,47 @@ if os.path.exists(sb_txt_path):
 
 temp_config_path = os.path.join(workdir, "temp_test_config.json")
 temp_log_path    = os.path.join(workdir, "temp_test_sb.log")
-test_port = 29876
+
+def check_port_in_use(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        s.close()
+        return False
+    except:
+        return True
+
+# 自动匹配 Devil 允许的 TCP 端口
+ports_str = os.environ.get("DEVIL_TCP_PORTS", "")
+allowed_ports = [int(p) for p in ports_str.split(',') if p.strip().isdigit()]
+
+test_port = None
+need_stop_sb = False
+
+if allowed_ports:
+    # 优先找一个未被占用的端口
+    for p in allowed_ports:
+        if not check_port_in_use(p):
+            test_port = p
+            break
+    # 若都被占用，借用第一个并设置 need_stop_sb
+    if not test_port:
+        test_port = allowed_ports[0]
+        need_stop_sb = True
+else:
+    # Fallback
+    test_port = 29876
+
+# 如果需要释放已占用端口，临时杀掉主进程
+if need_stop_sb:
+    subprocess.run(["pkill", "-x", "sing-box"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.path.exists(sb_txt_path):
+        with open(sb_txt_path, "r") as f:
+            name_sb = f.read().strip()
+            if name_sb:
+                subprocess.run(["pkill", "-x", name_sb], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.0)
+
 
 # 解析所有节点
 parsed_nodes = []
@@ -7927,7 +7980,13 @@ for r in results:
     print(f"{nd:<28} | {target:<30} | {ls}")
 print("=" * 78)
 print(f"\n\033[92m可用: {ok_count}\033[0m | \033[91m不可用: {fail_count}\033[0m | 共计: {len(results)}")
+sys.exit(99 if need_stop_sb else 0)
 PY
+    local py_status=$?
+    if [[ $py_status -eq 99 ]]; then
+        yellow "[*] 测速结束，正在重新启动主代理服务以恢复运行..."
+        start_singbox
+    fi
     return 0
 }
 
