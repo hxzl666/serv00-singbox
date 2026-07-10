@@ -7616,8 +7616,9 @@ test_external_nodes_latency() {
     yellow "[*] 正在解析并测试 ${#raw_links[@]} 个节点，请稍候..."
     echo
 
-    printf "%s\n" "${raw_links[@]}" | python3 - <<'PY'
-import sys, socket, time, json, base64
+    export RAW_NODE_LINKS=$(printf "%s\n" "${raw_links[@]}")
+    python3 - <<'PY'
+import sys, socket, time, json, base64, os
 from urllib.parse import urlparse, parse_qs, unquote
 
 def b64d(s):
@@ -7631,7 +7632,21 @@ def parse_node(url):
         if url.startswith('vless://') or url.startswith('trojan://') or url.startswith(('hy2://', 'hysteria2://')) or url.startswith('tuic://') or url.startswith('ss://'):
             p = urlparse(url)
             name = unquote(p.fragment) if p.fragment else "未命名节点"
-            return p.hostname, p.port, name
+            host = p.hostname
+            port = p.port
+            if not host or not port:
+                netloc = p.netloc
+                if '@' in netloc:
+                    netloc = netloc.split('@')[-1]
+                if ':' in netloc:
+                    host, port_str = netloc.split(':', 1)
+                    if '?' in port_str:
+                        port_str = port_str.split('?')[0]
+                    port = int(port_str)
+                else:
+                    host = netloc
+                    port = 443
+            return host, port, name
         elif url.startswith('vmess://'):
             raw = url[8:]
             data = json.loads(b64d(raw))
@@ -7658,7 +7673,8 @@ def test_latency(host, port):
     except Exception:
         return -1
 
-inputs = [line.strip() for line in sys.stdin if line.strip()]
+links_str = os.environ.get("RAW_NODE_LINKS", "")
+inputs = [line.strip() for line in links_str.split('\n') if line.strip()]
 results = []
 
 for idx, url in enumerate(inputs):
