@@ -7663,15 +7663,15 @@ def test_latency(host, port):
     try:
         addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         if not addr_info:
-            return -1
+            return -1.0
         family, socktype, proto, _, sockaddr = addr_info[0]
         s = socket.socket(family, socktype, proto)
         s.settimeout(2.0)
         s.connect(sockaddr)
         s.close()
-        return int((time.perf_counter() - start) * 1000)
+        return round((time.perf_counter() - start) * 1000, 2)
     except Exception:
-        return -1
+        return -1.0
 
 links_str = os.environ.get("RAW_NODE_LINKS", "")
 inputs = [line.strip() for line in links_str.split('\n') if line.strip()]
@@ -7680,12 +7680,12 @@ results = []
 for idx, url in enumerate(inputs):
     host, port, name = parse_node(url)
     if not host or not port:
-        results.append((f"节点-{idx+1}", "解析失败 (格式不正确)", -1))
+        results.append((f"节点-{idx+1}", "解析失败 (格式不正确)", -1.0))
         continue
     latency = test_latency(host, port)
     results.append((name, f"{host}:{port}", latency))
 
-results.sort(key=lambda x: (x[2] == -1, x[2]))
+results.sort(key=lambda x: (x[2] == -1.0, x[2]))
 
 print("=" * 70)
 print(f"{'节点名称 (备注)':<25} | {'服务器目标':<28} | {'延迟(ms)':<8}")
@@ -7693,7 +7693,7 @@ print("-" * 70)
 for r in results:
     name, target, latency = r
     name_display = name[:22] + ".." if len(name) > 24 else name
-    lat_str = f"\033[91m超时/不可达\033[0m" if latency == -1 else f"\033[92m{latency} ms\033[0m"
+    lat_str = f"\033[91m超时/不可达\033[0m" if latency == -1.0 else f"\033[92m{latency:.2f} ms\033[0m"
     print(f"{name_display:<25} | {target:<28} | {lat_str}")
 print("=" * 70)
 PY
