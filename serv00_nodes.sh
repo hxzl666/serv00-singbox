@@ -5614,7 +5614,7 @@ create_quick_command() {
     
     cat > "$SCRIPT_PATH" <<'EOF'
 #!/bin/bash
-bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh)
 EOF
     
     chmod +x "$SCRIPT_PATH"
