@@ -5145,9 +5145,24 @@ stop_all() {
 load_saved_config() {
     cd "$WORKDIR" 2>/dev/null || return 1
 
-    # 加载端口
+    # 加载端口 (带自动净化与纯数字严格校验)
     if [ -f "$WORKDIR/ports.txt" ]; then
-        source "$WORKDIR/ports.txt"
+        while IFS='=' read -r key val; do
+            key=$(echo "$key" | tr -d ' \r\n')
+            val=$(echo "$val" | grep -oE '[0-9]+' | head -n1)
+            [[ "$key" == "VMESS_PORT" ]] && export VMESS_PORT="$val"
+            [[ "$key" == "VLESS_PORT" ]] && export VLESS_PORT="$val"
+            [[ "$key" == "HY2_PORT"   ]] && export HY2_PORT="$val"
+            [[ "$key" == "TUIC_PORT"  ]] && export TUIC_PORT="$val"
+        done < "$WORKDIR/ports.txt"
+
+        # 自动将净化后的端口回写盘中
+        cat > "$WORKDIR/ports.txt" <<EOF
+VMESS_PORT=${VMESS_PORT:-}
+VLESS_PORT=${VLESS_PORT:-}
+HY2_PORT=${HY2_PORT:-}
+TUIC_PORT=${TUIC_PORT:-}
+EOF
     fi
 
     # 加载UUID
@@ -7587,8 +7602,10 @@ sync_proxy_group_to_singbox() {
     [[ -f "$group_dir/outbound.json" ]]    || { red "[!] outbound.json 不存在"; return 1; }
     [[ -f "$group_dir/ip_protos.txt"  ]]   || { red "[!] ip_protos.txt 不存在"; return 1; }
 
-    local hy2_port=$(cat  "$group_dir/hy2_port.txt"  2>/dev/null || echo "0")
-    local tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null || echo "0")
+    local hy2_port=$(cat  "$group_dir/hy2_port.txt"  2>/dev/null | grep -oE '[0-9]+' | head -n1 || echo "0")
+    local tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null | grep -oE '[0-9]+' | head -n1 || echo "0")
+    hy2_port=${hy2_port:-0}
+    tuic_port=${tuic_port:-0}
     local uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
     local out_tag="${group_tag}-out"
 
