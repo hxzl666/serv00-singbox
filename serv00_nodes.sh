@@ -302,6 +302,7 @@ except Exception:
     sys.exit(1)
 
 sock_type = socket.SOCK_STREAM if proto == 'tcp' else socket.SOCK_DGRAM
+is_udp = (proto != 'tcp')
 
 for ip in ips:
     ip = ip.strip()
@@ -309,7 +310,10 @@ for ip in ips:
         continue
     try:
         s = socket.socket(socket.AF_INET, sock_type)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # TCP: SO_REUSEADDR 防止 TIME_WAIT 导致的误判
+        # UDP: 不用 SO_REUSEADDR，否则 FreeBSD 下会与已绑定的 UDP 端口共存（假阳性）
+        if not is_udp:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((ip, port))
         s.close()
     except Exception:
@@ -356,10 +360,14 @@ except Exception:
     sys.exit(1)
 
 sock_type = socket.SOCK_STREAM if proto == 'tcp' else socket.SOCK_DGRAM
+is_udp = (proto != 'tcp')
 
 try:
     s = socket.socket(socket.AF_INET, sock_type)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # TCP: SO_REUSEADDR 防止 TIME_WAIT 导致的误判
+    # UDP: 不用 SO_REUSEADDR，否则 FreeBSD 下会与已绑定的 UDP 端口共存（假阳性）
+    if not is_udp:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((ip, port))
     s.close()
     sys.exit(0)
@@ -737,6 +745,13 @@ check_port() {
         red "⚠ 检测到端口冲突 (部分 IP 无法绑定相应端口)！"
         yellow "正在自动重置被占用的冲突端口并申请全 IP 可用的新端口..."
         auto_repair_conflicting_ports
+        local rc=$?
+        if [[ $rc -eq 2 ]]; then
+            red "[!] 端口冲突修复失败 (全量重置未成功)，请检查端口额度后重试"
+            return 1
+        elif [[ $rc -eq 0 ]]; then
+            green "端口冲突已修复"
+        fi
     else
         green "✓ 所有端口在全 IP 上测试可用"
     fi
@@ -2598,10 +2613,9 @@ psiphon_country_test() {
             continue
         fi
 
-        got="$(python3 - <<PY
-import json
-import sys
-raw = '''$json'''
+        got="$(python3 - "$json" <<'PY'
+import json, sys
+raw = sys.argv[1]
 try:
     j = json.loads(raw)
     c = j.get("country") or j.get("countryCode") or ""
@@ -5065,11 +5079,35 @@ auto_repair_conflicting_ports() {
                 fi
                 if [[ "$hy2_need_repair" == "true" ]]; then
                     yellow "[!] 代理组 [$gtag] 的 Hysteria2 端口 $g_hy2 (UDP) 在绑定 IP 上不可用，更换中..."
-                    local new_p=$(replace_occupied_port "udp" "singbox-proxy-hy2" "$g_hy2")
+                    # 代理组端口复用模式：仅需在绑定的 IP 上可用，而非全 IP
+                    # 先删除旧端口释放额度，再按单 IP 检查申请新端口
+                    devil port del udp "$g_hy2" >/dev/null 2>&1
+                    sleep 1
+                    local new_p=""
+                    local retry=0
+                    while [[ $retry -lt 40 && -z "$new_p" ]]; do
+                        local cand=$(shuf -i 10000-65535 -n 1)
+                        local can_use=true
+                        if [[ ${#hy2_ips[@]} -gt 0 ]]; then
+                            for ip in "${hy2_ips[@]}"; do
+                                check_port_available_on_ip "$cand" "udp" "$ip" || { can_use=false; break; }
+                            done
+                        else
+                            check_port_available_all_ips "$cand" "udp" || can_use=false
+                        fi
+                        if [[ "$can_use" == "true" ]]; then
+                            local res=$(devil port add udp "$cand" "singbox-proxy-hy2" 2>&1)
+                            local ec=$?
+                            if [[ $ec -eq 0 ]] && ! echo "$res" | grep -qiE 'błąd|error|limit|istnieje|fail'; then
+                                new_p="$cand"
+                            fi
+                        fi
+                        ((retry++))
+                    done
                     if [[ "$new_p" =~ ^[0-9]+$ ]]; then
                         echo "$new_p" > "$g_dir/hy2_port.txt"
                         repaired_proxy=true
-                        green "  → 已申请新端口并更新代理组 [$gtag] Hysteria2 入站端口: $new_p"
+                        green "  → 已申请新端口并更新代理组 [$gtag] Hysteria2 入站端口: $new_p (绑定 IP 检查)"
                     else
                         red "  [!] 代理组 [$gtag] Hy2 端口修复失败，触发全量端口重置..."
                         full_port_reset_and_realloc
@@ -5090,11 +5128,35 @@ auto_repair_conflicting_ports() {
                 fi
                 if [[ "$tuic_need_repair" == "true" ]]; then
                     yellow "[!] 代理组 [$gtag] 的 TUIC 端口 $g_tuic (UDP) 在绑定 IP 上不可用，更换中..."
-                    local new_p=$(replace_occupied_port "udp" "singbox-proxy-tuic" "$g_tuic")
+                    # 代理组端口复用模式：仅需在绑定的 IP 上可用，而非全 IP
+                    # 先删除旧端口释放额度，再按单 IP 检查申请新端口
+                    devil port del udp "$g_tuic" >/dev/null 2>&1
+                    sleep 1
+                    local new_p=""
+                    local retry=0
+                    while [[ $retry -lt 40 && -z "$new_p" ]]; do
+                        local cand=$(shuf -i 10000-65535 -n 1)
+                        local can_use=true
+                        if [[ ${#tuic_ips[@]} -gt 0 ]]; then
+                            for ip in "${tuic_ips[@]}"; do
+                                check_port_available_on_ip "$cand" "udp" "$ip" || { can_use=false; break; }
+                            done
+                        else
+                            check_port_available_all_ips "$cand" "udp" || can_use=false
+                        fi
+                        if [[ "$can_use" == "true" ]]; then
+                            local res=$(devil port add udp "$cand" "singbox-proxy-tuic" 2>&1)
+                            local ec=$?
+                            if [[ $ec -eq 0 ]] && ! echo "$res" | grep -qiE 'błąd|error|limit|istnieje|fail'; then
+                                new_p="$cand"
+                            fi
+                        fi
+                        ((retry++))
+                    done
                     if [[ "$new_p" =~ ^[0-9]+$ ]]; then
                         echo "$new_p" > "$g_dir/tuic_port.txt"
                         repaired_proxy=true
-                        green "  → 已申请新端口并更新代理组 [$gtag] TUIC 入站端口: $new_p"
+                        green "  → 已申请新端口并更新代理组 [$gtag] TUIC 入站端口: $new_p (绑定 IP 检查)"
                     else
                         red "  [!] 代理组 [$gtag] TUIC 端口修复失败，触发全量端口重置..."
                         full_port_reset_and_realloc
@@ -5338,9 +5400,9 @@ start_nezha() {
         return 1
     fi
     
-    # 杀掉现有进程
-    pkill -f "nezha" >/dev/null 2>&1
-    pkill -f "$NZ_BINARY" >/dev/null 2>&1
+    # 杀掉现有进程 (精确匹配 nezha 二进制)
+    [ -n "$NZ_BINARY" ] && pkill -x "$NZ_BINARY" >/dev/null 2>&1 || true
+    [ -n "$NZ_BINARY" ] && pkill -f "$WORKDIR/$NZ_BINARY" >/dev/null 2>&1 || true
     
     # 确定TLS设置
     tlsPorts=("443" "8443" "2096" "2087" "2083" "2053")
@@ -5400,8 +5462,10 @@ stop_all() {
     [ -n "$CF_BINARY" ] && pkill -x "$CF_BINARY" >/dev/null 2>&1
     [ -n "$NZ_BINARY" ] && pkill -x "$NZ_BINARY" >/dev/null 2>&1
     
-    pkill -f "run -c config.json" >/dev/null 2>&1
-    pkill -f "tunnel" >/dev/null 2>&1
+    # 精确兜底: 用工作目录路径匹配，避免误杀其他用户的同名进程
+    [ -n "$SB_BINARY" ] && pkill -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || true
+    [ -n "$CF_BINARY" ] && pkill -f "$WORKDIR/$CF_BINARY" >/dev/null 2>&1 || true
+    [ -n "$NZ_BINARY" ] && pkill -f "$WORKDIR/$NZ_BINARY" >/dev/null 2>&1 || true
     
     green "所有进程已停止"
 }
@@ -6375,6 +6439,7 @@ restart_processes() {
         generate_singbox_config 2>/dev/null || true
     else
         red "[!] 端口修复/重置失败 (exit=$repair_rc)，配置可能已损坏，请手动检查后重试"
+        return 1
     fi
     
     # 重启 Psiphon 实例 (如果启用)
@@ -6968,7 +7033,8 @@ configure_warp_outbound() {
                 local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
                 if [ -n "$sb_binary" ]; then
                     yellow "正在重启 sing-box..."
-                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
+                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
                     sleep 1
                     nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
                     sleep 2
@@ -6999,7 +7065,8 @@ configure_warp_outbound() {
                 local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
                 if [ -n "$sb_binary" ]; then
                     yellow "正在重启 sing-box..."
-                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
+                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
                     sleep 1
                     nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
                     sleep 2
@@ -7035,7 +7102,8 @@ configure_warp_outbound() {
                 local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
                 if [ -n "$sb_binary" ]; then
                     yellow "正在重启 sing-box..."
-                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
+                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
                     sleep 1
                     nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
                     sleep 2
@@ -7058,7 +7126,8 @@ configure_warp_outbound() {
                 local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
                 if [ -n "$sb_binary" ]; then
                     yellow "正在重启 sing-box..."
-                    pkill -f "run -c config.json" >/dev/null 2>&1
+                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
+                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
                     sleep 1
                     nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
                     sleep 2
@@ -7267,7 +7336,8 @@ PY
         yellow "正在重启服务..."
         
         # 只重启 sing-box
-        pkill -f "run -c config.json" >/dev/null 2>&1
+        pkill -x "$SB_BINARY" >/dev/null 2>&1 || true
+        pkill -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || true
         sleep 1
         
         run_detached "$WORKDIR/singbox.pid" "$WORKDIR/singbox.log" \
