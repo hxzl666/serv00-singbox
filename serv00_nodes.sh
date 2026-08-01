@@ -245,7 +245,7 @@ display_ip_list() {
 
 
 
-# 检测端口是否被占用
+# 检测端口是否被占用 (sockstat 基础检测)
 check_port_in_use() {
     local port=$1
     local protocol=${2:-tcp}
@@ -258,6 +258,69 @@ check_port_in_use() {
         return 0  # 被占用
     fi
     return 1  # 未被占用
+}
+
+# 校验端口是否能在所有可用 IP ($ALL_IPS) 上成功 bind (TCP / UDP)
+check_port_available_all_ips() {
+    local port=$1
+    local protocol=${2:-tcp}
+    
+    [ -z "$port" ] && return 1
+
+    # 1. 基础 sockstat 检测
+    if check_port_in_use "$port" "$protocol" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # 2. 如果 ALL_IPS 为空，先获取 IP 列表
+    if [ ${#ALL_IPS[@]} -eq 0 ]; then
+        get_all_ips 2>/dev/null || true
+    fi
+
+    # 如果依旧没有 IP 列表，则仅依赖 sockstat
+    if [ ${#ALL_IPS[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    # 3. 使用 Python 尝试在每个 IP 上 bind 该端口
+    local py_cmd=""
+    if command -v python3 >/dev/null 2>&1; then
+        py_cmd="python3"
+    elif command -v python >/dev/null 2>&1; then
+        py_cmd="python"
+    fi
+
+    if [ -n "$py_cmd" ]; then
+        $py_cmd - "$port" "$protocol" "${ALL_IPS[@]}" <<'PYEOF' >/dev/null 2>&1
+import sys, socket
+
+try:
+    port = int(sys.argv[1])
+    proto = sys.argv[2].lower()
+    ips = sys.argv[3:]
+except Exception:
+    sys.exit(1)
+
+sock_type = socket.SOCK_STREAM if proto == 'tcp' else socket.SOCK_DGRAM
+
+for ip in ips:
+    ip = ip.strip()
+    if not ip:
+        continue
+    try:
+        s = socket.socket(socket.AF_INET, sock_type)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((ip, port))
+        s.close()
+    except Exception:
+        sys.exit(1)
+
+sys.exit(0)
+PYEOF
+        return $?
+    fi
+
+    return 0
 }
 
 # 显示端口占用详情
@@ -283,44 +346,44 @@ show_port_usage() {
     return 1
 }
 
+# 添加端口的通用函数 (带描述，并严格校验全 IP 绑定可用性)
+add_port_with_desc() {
+    local port_type=$1
+    local desc=${2:-"singbox-port"}
+    local added_port=""
+    local retry=0
+    
+    while [[ $retry -lt 40 && -z "$added_port" ]]; do
+        local candidate=$(shuf -i 10000-65535 -n 1)
+        
+        # 检查端口在所有 IP 上是否均空闲且可绑定
+        if ! check_port_available_all_ips "$candidate" "$port_type"; then
+            ((retry++))
+            continue
+        fi
+        
+        # 尝试使用 devil port add 端口
+        local result
+        result=$(devil port add $port_type $candidate "$desc" 2>&1)
+        if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]] || [[ $result == *"success"* ]]; then
+            added_port=$candidate
+        else
+            result=$(devil port add $port_type $candidate 2>&1)
+            if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]] || [[ $result == *"success"* ]]; then
+                added_port=$candidate
+            fi
+        fi
+        ((retry++))
+    done
+    
+    echo "$added_port"
+}
+
 # 检查和配置端口
 check_port() {
     # Hostuno: 直接添加4个新端口（带描述）
     if [[ "$PLATFORM" == "hostuno" ]]; then
         yellow "Hostuno平台: 直接添加新端口..."
-        
-        # 添加端口的通用函数
-        add_port_with_desc() {
-            local port_type=$1
-            local desc=$2
-            local added_port=""
-            local retry=0
-            
-            while [[ $retry -lt 30 && -z "$added_port" ]]; do
-                local candidate=$(shuf -i 10000-65535 -n 1)
-                
-                # 检查端口是否被占用
-                if check_port_in_use $candidate >/dev/null 2>&1; then
-                    ((retry++))
-                    continue
-                fi
-                
-                # 先尝试带描述添加
-                result=$(devil port add $port_type $candidate "$desc" 2>&1)
-                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]] || [[ $result == *"success"* ]]; then
-                    added_port=$candidate
-                else
-                    # 如果带描述失败，尝试不带描述
-                    result=$(devil port add $port_type $candidate 2>&1)
-                    if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]] || [[ $result == *"success"* ]]; then
-                        added_port=$candidate
-                    fi
-                fi
-                ((retry++))
-            done
-            
-            echo "$added_port"
-        }
         
         # VMess端口 (TCP)
         local vmess_port=$(add_port_with_desc "tcp" "singbox-vmess")
@@ -437,7 +500,7 @@ check_port() {
             while [[ $tcp_ports_added -lt $tcp_ports_to_add && $retry_count -lt 30 ]]; do
                 tcp_port=$(shuf -i 10000-65535 -n 1)
                 
-                if check_port_in_use $tcp_port >/dev/null 2>&1; then
+                if ! check_port_available_all_ips $tcp_port "tcp"; then
                     ((retry_count++))
                     continue
                 fi
@@ -459,7 +522,7 @@ check_port() {
             while [[ $udp_ports_added -lt $udp_ports_to_add && $retry_count -lt 30 ]]; do
                 udp_port=$(shuf -i 10000-65535 -n 1)
                 
-                if check_port_in_use $udp_port >/dev/null 2>&1; then
+                if ! check_port_available_all_ips $udp_port "udp"; then
                     ((retry_count++))
                     continue
                 fi
@@ -529,76 +592,34 @@ check_port() {
     [[ -n "$HY2_PORT" ]] && purple "  Hysteria2:       $HY2_PORT (UDP)"
     [[ -n "$TUIC_PORT" ]] && purple "  TUIC v5:         $TUIC_PORT (UDP)"
     
-    # 检测端口占用情况 (仅Serv00)
+    # 检测端口在全 IP 上的占用及绑定冲突
     echo
     local has_conflict=false
-    local conflict_ports=()
     
-    for port in $VMESS_PORT $VLESS_PORT $HY2_PORT $TUIC_PORT; do
-        if [ -n "$port" ] && check_port_in_use $port >/dev/null 2>&1; then
-            has_conflict=true
-            conflict_ports+=("$port")
-            show_port_usage $port
-        fi
-    done
+    if [ -n "$VMESS_PORT" ] && ! check_port_available_all_ips "$VMESS_PORT" "tcp"; then
+        has_conflict=true
+        show_port_usage "$VMESS_PORT"
+    fi
+    if [ -n "$VLESS_PORT" ] && ! check_port_available_all_ips "$VLESS_PORT" "tcp"; then
+        has_conflict=true
+        show_port_usage "$VLESS_PORT"
+    fi
+    if [ -n "$HY2_PORT" ] && ! check_port_available_all_ips "$HY2_PORT" "udp"; then
+        has_conflict=true
+        show_port_usage "$HY2_PORT"
+    fi
+    if [ -n "$TUIC_PORT" ] && ! check_port_available_all_ips "$TUIC_PORT" "udp"; then
+        has_conflict=true
+        show_port_usage "$TUIC_PORT"
+    fi
     
     if $has_conflict; then
         echo
-        red "⚠ 检测到端口冲突！"
-        yellow "Serv00平台: 删除被占用端口并重新分配..."
-        
-        for conflict_port in "${conflict_ports[@]}"; do
-            local port_type=$(devil port list | grep "^$conflict_port" | awk '{print $2}')
-            
-            # 删除被占用的端口
-            devil port del $port_type $conflict_port >/dev/null 2>&1
-            yellow "已删除被占用端口: $conflict_port ($port_type)"
-            
-            # 添加一个新端口
-            local new_port_added=false
-            local retry=0
-            while [[ $retry -lt 20 && "$new_port_added" == "false" ]]; do
-                local new_port=$(shuf -i 10000-65535 -n 1)
-                
-                # 检查新端口是否被占用
-                if check_port_in_use $new_port >/dev/null 2>&1; then
-                    ((retry++))
-                    continue
-                fi
-                
-                result=$(devil port add $port_type $new_port 2>&1)
-                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                    green "已添加新端口: $new_port ($port_type)"
-                    new_port_added=true
-                fi
-                ((retry++))
-            done
-        done
-        
-        # 重新获取端口分配
-        sleep 1
-        port_list=$(devil port list)
-        tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
-        TCP_PORT1=$(echo "$tcp_ports" | sed -n '1p')
-        TCP_PORT2=$(echo "$tcp_ports" | sed -n '2p')
-        
-        udp_ports=$(echo "$port_list" | awk '/udp/ {print $1}')
-        UDP_PORT1=$(echo "$udp_ports" | sed -n '1p')
-        UDP_PORT2=$(echo "$udp_ports" | sed -n '2p')
-        
-        export VMESS_PORT=$TCP_PORT1
-        export VLESS_PORT=$TCP_PORT2
-        export HY2_PORT=$UDP_PORT1
-        export TUIC_PORT=$UDP_PORT2
-        
-        echo
-        green "端口已重新分配:"
-        purple "  VMess-WS/Trojan: $VMESS_PORT (TCP)"
-        purple "  VLESS-Reality:   $VLESS_PORT (TCP)"
-        purple "  Hysteria2:       $HY2_PORT (UDP)"
-        purple "  TUIC v5:         $TUIC_PORT (UDP)"
+        red "⚠ 检测到端口冲突 (部分 IP 无法绑定相应端口)！"
+        yellow "正在自动重置被占用的冲突端口并申请全 IP 可用的新端口..."
+        auto_repair_conflicting_ports
     else
-        green "✓ 所有端口可用"
+        green "✓ 所有端口在全 IP 上测试可用"
     fi
 }
 
@@ -4568,10 +4589,109 @@ EOF
     green "配置文件已生成"
 }
 
-# ==================== 进程管理 ====================
+# 自动探测冲突端口，删除旧端口并重新申请满足所有 IP 均可用的新端口
+auto_repair_conflicting_ports() {
+    load_saved_config 2>/dev/null || true
+    get_all_ips 2>/dev/null || true
 
-# 启动sing-box
+    local repaired=false
+
+    # 1. 检测 VMESS_PORT (TCP)
+    if [ -n "$VMESS_PORT" ] && ! check_port_available_all_ips "$VMESS_PORT" "tcp"; then
+        yellow "[!] VMess 端口 $VMESS_PORT (TCP) 在部分 IP 上无法绑定，正在更换..."
+        devil port del tcp "$VMESS_PORT" >/dev/null 2>&1
+        local new_p=$(add_port_with_desc "tcp" "singbox-vmess")
+        if [ -n "$new_p" ]; then
+            export VMESS_PORT=$new_p
+            repaired=true
+            green "  → 新 VMess 端口: $VMESS_PORT"
+        fi
+    fi
+
+    # 2. 检测 VLESS_PORT (TCP)
+    if [ -n "$VLESS_PORT" ] && ! check_port_available_all_ips "$VLESS_PORT" "tcp"; then
+        yellow "[!] VLESS 端口 $VLESS_PORT (TCP) 在部分 IP 上无法绑定，正在更换..."
+        devil port del tcp "$VLESS_PORT" >/dev/null 2>&1
+        local new_p=$(add_port_with_desc "tcp" "singbox-vless")
+        if [ -n "$new_p" ]; then
+            export VLESS_PORT=$new_p
+            repaired=true
+            green "  → 新 VLESS 端口: $VLESS_PORT"
+        fi
+    fi
+
+    # 3. 检测 HY2_PORT (UDP)
+    if [ -n "$HY2_PORT" ] && ! check_port_available_all_ips "$HY2_PORT" "udp"; then
+        yellow "[!] Hysteria2 端口 $HY2_PORT (UDP) 在部分 IP 上无法绑定，正在更换..."
+        devil port del udp "$HY2_PORT" >/dev/null 2>&1
+        local new_p=$(add_port_with_desc "udp" "singbox-hy2")
+        if [ -n "$new_p" ]; then
+            export HY2_PORT=$new_p
+            repaired=true
+            green "  → 新 Hysteria2 端口: $HY2_PORT"
+        fi
+    fi
+
+    # 4. 检测 TUIC_PORT (UDP)
+    if [ -n "$TUIC_PORT" ] && ! check_port_available_all_ips "$TUIC_PORT" "udp"; then
+        yellow "[!] TUIC 端口 $TUIC_PORT (UDP) 在部分 IP 上无法绑定，正在更换..."
+        devil port del udp "$TUIC_PORT" >/dev/null 2>&1
+        local new_p=$(add_port_with_desc "udp" "singbox-tuic")
+        if [ -n "$new_p" ]; then
+            export TUIC_PORT=$new_p
+            repaired=true
+            green "  → 新 TUIC 端口: $TUIC_PORT"
+        fi
+    fi
+
+    # 如果以上具体端口检测没有命中，但日志提示特定端口（从日志提取冲突端口做兜底重置）
+    if [ "$repaired" = false ] && [ -f "$WORKDIR/singbox.log" ]; then
+        local err_line=$(grep -E "listen (udp|tcp) .*: bind: address already in use" "$WORKDIR/singbox.log" 2>/dev/null | head -n1)
+        if [ -n "$err_line" ]; then
+            local err_port=$(echo "$err_line" | grep -oE ":[0-9]+" | head -n1 | tr -d ':')
+            if [ -n "$err_port" ]; then
+                yellow "[!] 从日志精确匹配到冲突端口: $err_port，正在强制清理并重置..."
+                devil port del udp "$err_port" >/dev/null 2>&1
+                devil port del tcp "$err_port" >/dev/null 2>&1
+                if [ "$err_port" = "$TUIC_PORT" ] || echo "$err_line" | grep -qi "tuic"; then
+                    local new_p=$(add_port_with_desc "udp" "singbox-tuic")
+                    [ -n "$new_p" ] && export TUIC_PORT=$new_p && repaired=true
+                elif [ "$err_port" = "$HY2_PORT" ] || echo "$err_line" | grep -qi "hysteria"; then
+                    local new_p=$(add_port_with_desc "udp" "singbox-hy2")
+                    [ -n "$new_p" ] && export HY2_PORT=$new_p && repaired=true
+                elif [ "$err_port" = "$VLESS_PORT" ] || echo "$err_line" | grep -qi "vless"; then
+                    local new_p=$(add_port_with_desc "tcp" "singbox-vless")
+                    [ -n "$new_p" ] && export VLESS_PORT=$new_p && repaired=true
+                elif [ "$err_port" = "$VMESS_PORT" ] || echo "$err_line" | grep -qi "vmess"; then
+                    local new_p=$(add_port_with_desc "tcp" "singbox-vmess")
+                    [ -n "$new_p" ] && export VMESS_PORT=$new_p && repaired=true
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$repaired" = true ]; then
+        # 保存新的端口配置
+        cat > "$WORKDIR/ports.txt" <<EOF
+VMESS_PORT=$VMESS_PORT
+VLESS_PORT=$VLESS_PORT
+HY2_PORT=$HY2_PORT
+TUIC_PORT=$TUIC_PORT
+EOF
+        # 重新生成主配置文件
+        generate_singbox_config
+        return 0
+    else
+        red "[!] 未能检测到待修复的具体冲突端口"
+        return 1
+    fi
+}
+
+# 启动sing-box (支持端口冲突捕获与自愈重试)
 start_singbox() {
+    local retry_count=${1:-0}
+    local max_retries=3
+
     cd "$WORKDIR"
     SB_BINARY=$(cat sb.txt 2>/dev/null)
     
@@ -4614,6 +4734,17 @@ start_singbox() {
         yellow "========== sing-box 错误日志 =========="
         tail -30 "$WORKDIR/singbox.log" 2>/dev/null
         yellow "======================================"
+
+        # 捕获端口占用/绑定错误，自动自愈换端口并重试
+        if grep -qE "address already in use|bind:" "$WORKDIR/singbox.log" 2>/dev/null; then
+            if [ $retry_count -lt $max_retries ]; then
+                yellow "[!] 检测到端口冲突 (address already in use)，正在自动更换全 IP 可用的新端口并重试 (尝试 $((retry_count + 1))/$max_retries)..."
+                if auto_repair_conflicting_ports; then
+                    start_singbox $((retry_count + 1))
+                    return $?
+                fi
+            fi
+        fi
         return 1
     fi
 }
