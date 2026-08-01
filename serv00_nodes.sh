@@ -372,20 +372,33 @@ PYEOF
     return 0
 }
 
-# 申请一个满足 3 个 IP (全 IP) 均可用的全新端口
+# 申请一个满足 3 个 IP (全 IP) 均可用的全新端口 (兼容 Serv00 波兰语/英语面板)
 alloc_new_port_all_ips() {
     local proto=$1
     local desc=${2:-"singbox-port"}
     
     local new_port=""
     local retry=0
-    while [[ $retry -lt 40 && -z "$new_port" ]]; do
+    while [[ $retry -lt 50 && -z "$new_port" ]]; do
         local cand=$(shuf -i 10000-65535 -n 1)
         if check_port_available_all_ips "$cand" "$proto"; then
-            local res
+            local res=""
+            local ec=0
+            
+            # 先尝试带描述添加
             res=$(devil port add $proto $cand "$desc" 2>&1)
-            if [[ $res == *"succesfully"* || $res == *"Ok"* || $res == *"success"* ]]; then
+            ec=$?
+            
+            # 如果带描述失败，尝试不带描述添加
+            if [[ $ec -ne 0 ]] || echo "$res" | grep -qiE "błąd|error|limit|usage"; then
+                res=$(devil port add $proto $cand 2>&1)
+                ec=$?
+            fi
+
+            # 判断面板返回是否成功 (Serv00 波兰语: został dodany / 英语: succesfully, Ok, success)
+            if [[ $ec -eq 0 ]] && ! echo "$res" | grep -qiE "błąd|error|limit|istnieje|fail"; then
                 new_port=$cand
+                break
             fi
         fi
         ((retry++))
@@ -394,29 +407,39 @@ alloc_new_port_all_ips() {
     echo "$new_port"
 }
 
-# 标准端口更换逻辑 (先申请 3 个 IP 可用的新端口 → 删掉原端口 → 返回新端口供节点更新)
+# 标准端口更换逻辑 (先申请 3 个 IP 可用的新端口 → 删掉原端口 → 返回纯数字新端口供节点更新)
 replace_occupied_port() {
     local proto=$1
     local desc=$2
     local old_port=$3
     
     # 1. 先去申请一个新的三个 IP 均可用的端口
-    local new_p
+    local new_p=""
     new_p=$(alloc_new_port_all_ips "$proto" "$desc")
     
-    if [ -z "$new_p" ]; then
-        red "[!] 无法申请到全 IP 可用的新端口"
-        return 1
+    # 2. 如果直接申请成功，删掉原端口
+    if [ -n "$new_p" ]; then
+        if [ -n "$old_port" ] && [ "$old_port" != "0" ] && [ "$old_port" != "$new_p" ]; then
+            devil port del "$proto" "$old_port" >/dev/null 2>&1
+        fi
+        echo "$new_p"
+        return 0
     fi
 
-    # 2. 然后删掉原端口
+    # 3. 如果因为端口额度超限导致未直接申请成功，先删除原冲突端口释放额度，再重试申请
     if [ -n "$old_port" ] && [ "$old_port" != "0" ]; then
         devil port del "$proto" "$old_port" >/dev/null 2>&1
+        sleep 1
+        new_p=$(alloc_new_port_all_ips "$proto" "$desc")
     fi
 
-    # 3. 返回新申请的端口供绑定节点更新
-    echo "$new_p"
-    return 0
+    if [ -n "$new_p" ]; then
+        echo "$new_p"
+        return 0
+    fi
+
+    echo -e "\e[1;91m[!] 无法申请到全 IP 可用的新端口\033[0m" >&2
+    return 1
 }
 
 # 显示端口占用详情
@@ -4698,7 +4721,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$VMESS_PORT" ] && ! check_port_available_all_ips "$VMESS_PORT" "tcp"; then
         yellow "[!] VMess 主端口 $VMESS_PORT (TCP) 部分 IP 不可用，更换中..."
         local new_p=$(replace_occupied_port "tcp" "singbox-vmess" "$VMESS_PORT")
-        if [ -n "$new_p" ]; then
+        if [[ "$new_p" =~ ^[0-9]+$ ]]; then
             export VMESS_PORT=$new_p
             repaired_main=true
             green "  → 已申请新端口并更新 VMess 主节点端口: $VMESS_PORT"
@@ -4708,7 +4731,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$VLESS_PORT" ] && ! check_port_available_all_ips "$VLESS_PORT" "tcp"; then
         yellow "[!] VLESS 主端口 $VLESS_PORT (TCP) 部分 IP 不可用，更换中..."
         local new_p=$(replace_occupied_port "tcp" "singbox-vless" "$VLESS_PORT")
-        if [ -n "$new_p" ]; then
+        if [[ "$new_p" =~ ^[0-9]+$ ]]; then
             export VLESS_PORT=$new_p
             repaired_main=true
             green "  → 已申请新端口并更新 VLESS 主节点端口: $VLESS_PORT"
@@ -4718,7 +4741,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$HY2_PORT" ] && ! check_port_available_all_ips "$HY2_PORT" "udp"; then
         yellow "[!] Hysteria2 主端口 $HY2_PORT (UDP) 部分 IP 不可用，更换中..."
         local new_p=$(replace_occupied_port "udp" "singbox-hy2" "$HY2_PORT")
-        if [ -n "$new_p" ]; then
+        if [[ "$new_p" =~ ^[0-9]+$ ]]; then
             export HY2_PORT=$new_p
             repaired_main=true
             green "  → 已申请新端口并更新 Hysteria2 主节点端口: $HY2_PORT"
@@ -4728,7 +4751,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$TUIC_PORT" ] && ! check_port_available_all_ips "$TUIC_PORT" "udp"; then
         yellow "[!] TUIC 主端口 $TUIC_PORT (UDP) 部分 IP 不可用，更换中..."
         local new_p=$(replace_occupied_port "udp" "singbox-tuic" "$TUIC_PORT")
-        if [ -n "$new_p" ]; then
+        if [[ "$new_p" =~ ^[0-9]+$ ]]; then
             export TUIC_PORT=$new_p
             repaired_main=true
             green "  → 已申请新端口并更新 TUIC 主节点端口: $TUIC_PORT"
@@ -4751,7 +4774,7 @@ auto_repair_conflicting_ports() {
                 if ! check_port_available_all_ips "$g_hy2" "udp"; then
                     yellow "[!] 代理组 [$gtag] 的 Hysteria2 端口 $g_hy2 (UDP) 部分 IP 不可用，更换中..."
                     local new_p=$(replace_occupied_port "udp" "singbox-proxy-hy2" "$g_hy2")
-                    if [ -n "$new_p" ]; then
+                    if [[ "$new_p" =~ ^[0-9]+$ ]]; then
                         echo "$new_p" > "$g_dir/hy2_port.txt"
                         repaired_proxy=true
                         green "  → 已申请新端口并更新代理组 [$gtag] Hysteria2 入站端口: $new_p"
@@ -4764,7 +4787,7 @@ auto_repair_conflicting_ports() {
                 if ! check_port_available_all_ips "$g_tuic" "udp"; then
                     yellow "[!] 代理组 [$gtag] 的 TUIC 端口 $g_tuic (UDP) 部分 IP 不可用，更换中..."
                     local new_p=$(replace_occupied_port "udp" "singbox-proxy-tuic" "$g_tuic")
-                    if [ -n "$new_p" ]; then
+                    if [[ "$new_p" =~ ^[0-9]+$ ]]; then
                         echo "$new_p" > "$g_dir/tuic_port.txt"
                         repaired_proxy=true
                         green "  → 已申请新端口并更新代理组 [$gtag] TUIC 入站端口: $new_p"
@@ -4789,7 +4812,9 @@ auto_repair_conflicting_ports() {
                 yellow "[!] 日志定位到端口 $bad_port ($bad_proto) 发生冲突，按规则自动更换..."
 
                 local new_p=$(replace_occupied_port "$bad_proto" "singbox-repaired" "$bad_port")
-                [ -z "$new_p" ] && continue
+                if [[ ! "$new_p" =~ ^[0-9]+$ ]]; then
+                    continue
+                fi
 
                 # 将使用原端口 bad_port 的 3 个 IP 绑定的所有节点更新为 new_p
                 # 1) 主节点
