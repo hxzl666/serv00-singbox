@@ -372,22 +372,74 @@ PYEOF
     return 0
 }
 
-# 获取或申请在指定 IP 列表上均可用的端口 (优先复用已有可用空闲端口，没有则申请新端口)
+# 获取在指定 IP 上已被其他 Inbound 占据的所有 UDP/TCP 端口列表
+get_used_ports_on_ip() {
+    local ip=$1
+    local proto=${2:-udp}
+    local ignore_group=${3:-""}
+    
+    local used=""
+    
+    # 1. 主节点端口
+    if [[ "$proto" == "udp" ]]; then
+        [[ -n "$HY2_PORT" ]] && used+=" $HY2_PORT "
+        [[ -n "$TUIC_PORT" ]] && used+=" $TUIC_PORT "
+    else
+        [[ -n "$VLESS_PORT" ]] && used+=" $VLESS_PORT "
+        [[ -n "$VMESS_PORT" ]] && used+=" $VMESS_PORT "
+    fi
+    
+    # 2. 其他代理分组端口
+    local gtags
+    gtags=$(get_all_proxy_groups 2>/dev/null || true)
+    if [ -n "$gtags" ]; then
+        for g in $gtags; do
+            [[ "$g" == "$ignore_group" ]] && continue
+            local g_dir="${PROXY_GROUPS_DIR}/$g"
+            [[ ! -d "$g_dir" ]] && continue
+            
+            local has_ip=false
+            if [[ -f "$g_dir/ip_protos.txt" ]]; then
+                grep -q "^${ip}|" "$g_dir/ip_protos.txt" 2>/dev/null && has_ip=true
+            else
+                has_ip=true
+            fi
+            
+            if $has_ip; then
+                if [[ "$proto" == "udp" ]]; then
+                    local gh=$(cat "$g_dir/hy2_port.txt" 2>/dev/null || echo "")
+                    local gt=$(cat "$g_dir/tuic_port.txt" 2>/dev/null || echo "")
+                    [[ -n "$gh" && "$gh" != "0" ]] && used+=" $gh "
+                    [[ -n "$gt" && "$gt" != "0" ]] && used+=" $gt "
+                fi
+            fi
+        done
+    fi
+    
+    echo "$used"
+}
+
+# 获取或申请在指定 IP 列表上可用且不与同 IP 现存 Inbounds 冲突的唯一端口
 get_or_alloc_available_port() {
     local proto=$1
     local desc=${2:-"singbox-port"}
-    shift 2
+    local exclude_ports_str=$3
+    shift 3 || shift $#
     local target_ips=("$@")
 
     if [ ${#target_ips[@]} -eq 0 ]; then
         target_ips=("${ALL_IPS[@]}")
     fi
 
-    # 1. 优先尝试从面板已有的端口列表中寻找在 target_ips 上均空闲可绑定的端口
+    # 1. 优先尝试从面板已有的端口列表中寻找在 target_ips 上均空闲、且不在排除列表中的端口
     local existing_ports
     existing_ports=$(devil port list 2>/dev/null | grep -i "$proto" | awk '{print $1}')
     if [ -n "$existing_ports" ]; then
         for p in $existing_ports; do
+            # 避开已有相同 IP 监听的重复端口
+            if [[ " $exclude_ports_str " =~ " $p " ]]; then
+                continue
+            fi
             local p_ok=true
             for tip in "${target_ips[@]}"; do
                 if ! check_port_available_on_ip "$p" "$proto" "$tip"; then
@@ -402,13 +454,33 @@ get_or_alloc_available_port() {
         done
     fi
 
-    # 2. 没有可用空闲端口，申请新端口
-    local new_p
-    new_p=$(add_port_with_desc "$proto" "$desc")
-    if [ -n "$new_p" ]; then
-        echo "$new_p"
-        return 0
-    fi
+    # 2. 没有可用空闲端口，申请新端口 (需避开 exclude_ports_str)
+    local retry=0
+    while [[ $retry -lt 40 ]]; do
+        local candidate=$(shuf -i 10000-65535 -n 1)
+        if [[ " $exclude_ports_str " =~ " $candidate " ]]; then
+            ((retry++))
+            continue
+        fi
+
+        local p_ok=true
+        for tip in "${target_ips[@]}"; do
+            if ! check_port_available_on_ip "$candidate" "$proto" "$tip"; then
+                p_ok=false
+                break
+            fi
+        done
+
+        if [ "$p_ok" = true ]; then
+            local result
+            result=$(devil port add $proto $candidate "$desc" 2>&1)
+            if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]] || [[ $result == *"success"* ]]; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+        ((retry++))
+    done
 
     return 1
 }
@@ -4692,7 +4764,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$VMESS_PORT" ] && ! check_port_available_all_ips "$VMESS_PORT" "tcp"; then
         yellow "[!] VMess 主端口 $VMESS_PORT (TCP) 在部分 IP 上无法绑定，正在更换..."
         devil port del tcp "$VMESS_PORT" >/dev/null 2>&1
-        local new_p=$(get_or_alloc_available_port "tcp" "singbox-vmess")
+        local new_p=$(get_or_alloc_available_port "tcp" "singbox-vmess" "")
         if [ -n "$new_p" ]; then
             export VMESS_PORT=$new_p
             repaired_main=true
@@ -4703,7 +4775,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$VLESS_PORT" ] && ! check_port_available_all_ips "$VLESS_PORT" "tcp"; then
         yellow "[!] VLESS 主端口 $VLESS_PORT (TCP) 在部分 IP 上无法绑定，正在更换..."
         devil port del tcp "$VLESS_PORT" >/dev/null 2>&1
-        local new_p=$(get_or_alloc_available_port "tcp" "singbox-vless")
+        local new_p=$(get_or_alloc_available_port "tcp" "singbox-vless" "")
         if [ -n "$new_p" ]; then
             export VLESS_PORT=$new_p
             repaired_main=true
@@ -4714,7 +4786,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$HY2_PORT" ] && ! check_port_available_all_ips "$HY2_PORT" "udp"; then
         yellow "[!] Hysteria2 主端口 $HY2_PORT (UDP) 在部分 IP 上无法绑定，正在更换..."
         devil port del udp "$HY2_PORT" >/dev/null 2>&1
-        local new_p=$(get_or_alloc_available_port "udp" "singbox-hy2")
+        local new_p=$(get_or_alloc_available_port "udp" "singbox-hy2" "")
         if [ -n "$new_p" ]; then
             export HY2_PORT=$new_p
             repaired_main=true
@@ -4725,7 +4797,7 @@ auto_repair_conflicting_ports() {
     if [ -n "$TUIC_PORT" ] && ! check_port_available_all_ips "$TUIC_PORT" "udp"; then
         yellow "[!] TUIC 主端口 $TUIC_PORT (UDP) 在部分 IP 上无法绑定，正在更换..."
         devil port del udp "$TUIC_PORT" >/dev/null 2>&1
-        local new_p=$(get_or_alloc_available_port "udp" "singbox-tuic")
+        local new_p=$(get_or_alloc_available_port "udp" "singbox-tuic" "")
         if [ -n "$new_p" ]; then
             export TUIC_PORT=$new_p
             repaired_main=true
@@ -4754,19 +4826,21 @@ auto_repair_conflicting_ports() {
             fi
             [ ${#g_ips[@]} -eq 0 ] && g_ips=("${ALL_IPS[@]}")
 
-            # 检查代理组 Hysteria2 端口
+            # 检查代理组 Hysteria2 端口 (防物理占用 + 防同 IP 主节点/其他代理组内部重复)
             if [ -n "$g_hy2" ] && [ "$g_hy2" != "0" ]; then
                 local hy2_bad=false
+                local used_excl=""
                 for tip in "${g_ips[@]}"; do
-                    if ! check_port_available_on_ip "$g_hy2" "udp" "$tip"; then
+                    local in_use_on_ip=$(get_used_ports_on_ip "$tip" "udp" "$gtag")
+                    used_excl+="$in_use_on_ip "
+                    if [[ " $in_use_on_ip " =~ " $g_hy2 " ]] || ! check_port_available_on_ip "$g_hy2" "udp" "$tip"; then
                         hy2_bad=true
-                        break
                     fi
                 done
                 if [ "$hy2_bad" = true ]; then
-                    yellow "[!] 代理组 [$gtag] 的 Hysteria2 端口 $g_hy2 (UDP) 在绑定 IP 上不可用，正在寻找空闲端口/重置..."
+                    yellow "[!] 代理组 [$gtag] 的 Hysteria2 端口 $g_hy2 (UDP) 在绑定 IP 上被占用或与现存节点重叠，正在寻找空闲端口/重置..."
                     devil port del udp "$g_hy2" >/dev/null 2>&1
-                    local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-hy2" "${g_ips[@]}")
+                    local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-hy2" "$used_excl" "${g_ips[@]}")
                     if [ -n "$new_p" ]; then
                         echo "$new_p" > "$g_dir/hy2_port.txt"
                         repaired_proxy=true
@@ -4778,16 +4852,18 @@ auto_repair_conflicting_ports() {
             # 检查代理组 TUIC 端口
             if [ -n "$g_tuic" ] && [ "$g_tuic" != "0" ]; then
                 local tuic_bad=false
+                local used_excl=""
                 for tip in "${g_ips[@]}"; do
-                    if ! check_port_available_on_ip "$g_tuic" "udp" "$tip"; then
+                    local in_use_on_ip=$(get_used_ports_on_ip "$tip" "udp" "$gtag")
+                    used_excl+="$in_use_on_ip "
+                    if [[ " $in_use_on_ip " =~ " $g_tuic " ]] || ! check_port_available_on_ip "$g_tuic" "udp" "$tip"; then
                         tuic_bad=true
-                        break
                     fi
                 done
                 if [ "$tuic_bad" = true ]; then
-                    yellow "[!] 代理组 [$gtag] 的 TUIC 端口 $g_tuic (UDP) 在绑定 IP 上不可用，正在寻找空闲端口/重置..."
+                    yellow "[!] 代理组 [$gtag] 的 TUIC 端口 $g_tuic (UDP) 在绑定 IP 上被占用或与现存节点重叠，正在寻找空闲端口/重置..."
                     devil port del udp "$g_tuic" >/dev/null 2>&1
-                    local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-tuic" "${g_ips[@]}")
+                    local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-tuic" "$used_excl" "${g_ips[@]}")
                     if [ -n "$new_p" ]; then
                         echo "$new_p" > "$g_dir/tuic_port.txt"
                         repaired_proxy=true
@@ -4819,14 +4895,16 @@ auto_repair_conflicting_ports() {
                 if [ -n "$matched_tag" ] && [ -d "${PROXY_GROUPS_DIR}/${matched_tag}" ]; then
                     local g_dir="${PROXY_GROUPS_DIR}/${matched_tag}"
                     if echo "$eline" | grep -qi "hysteria"; then
-                        local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-hy2")
+                        local excl=$(get_used_ports_on_ip "" "udp" "$matched_tag")
+                        local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-hy2" "$excl")
                         if [ -n "$new_p" ]; then
                             echo "$new_p" > "$g_dir/hy2_port.txt"
                             repaired_proxy=true
                             green "  → 精准从日志修补代理组 [$matched_tag] Hysteria2 端口: $new_p"
                         fi
                     elif echo "$eline" | grep -qi "tuic"; then
-                        local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-tuic")
+                        local excl=$(get_used_ports_on_ip "" "udp" "$matched_tag")
+                        local new_p=$(get_or_alloc_available_port "udp" "singbox-proxy-tuic" "$excl")
                         if [ -n "$new_p" ]; then
                             echo "$new_p" > "$g_dir/tuic_port.txt"
                             repaired_proxy=true
@@ -4842,11 +4920,13 @@ auto_repair_conflicting_ports() {
                             local gh=$(cat "$g_dir/hy2_port.txt" 2>/dev/null || echo "")
                             local gt=$(cat "$g_dir/tuic_port.txt" 2>/dev/null || echo "")
                             if [ "$gh" = "$bad_port" ]; then
-                                local np=$(get_or_alloc_available_port "udp" "singbox-proxy-hy2")
+                                local excl=$(get_used_ports_on_ip "" "udp" "$gtag")
+                                local np=$(get_or_alloc_available_port "udp" "singbox-proxy-hy2" "$excl")
                                 [ -n "$np" ] && echo "$np" > "$g_dir/hy2_port.txt" && repaired_proxy=true
                             fi
                             if [ "$gt" = "$bad_port" ]; then
-                                local np=$(get_or_alloc_available_port "udp" "singbox-proxy-tuic")
+                                local excl=$(get_used_ports_on_ip "" "udp" "$gtag")
+                                local np=$(get_or_alloc_available_port "udp" "singbox-proxy-tuic" "$excl")
                                 [ -n "$np" ] && echo "$np" > "$g_dir/tuic_port.txt" && repaired_proxy=true
                             fi
                         done
@@ -4855,16 +4935,16 @@ auto_repair_conflicting_ports() {
 
                 # 检查是否为主节点端口
                 if [ "$bad_port" = "$TUIC_PORT" ]; then
-                    local np=$(get_or_alloc_available_port "udp" "singbox-tuic")
+                    local np=$(get_or_alloc_available_port "udp" "singbox-tuic" "$HY2_PORT")
                     [ -n "$np" ] && export TUIC_PORT=$np && repaired_main=true
                 elif [ "$bad_port" = "$HY2_PORT" ]; then
-                    local np=$(get_or_alloc_available_port "udp" "singbox-hy2")
+                    local np=$(get_or_alloc_available_port "udp" "singbox-hy2" "$TUIC_PORT")
                     [ -n "$np" ] && export HY2_PORT=$np && repaired_main=true
                 elif [ "$bad_port" = "$VLESS_PORT" ]; then
-                    local np=$(get_or_alloc_available_port "tcp" "singbox-vless")
+                    local np=$(get_or_alloc_available_port "tcp" "singbox-vless" "$VMESS_PORT")
                     [ -n "$np" ] && export VLESS_PORT=$np && repaired_main=true
                 elif [ "$bad_port" = "$VMESS_PORT" ]; then
-                    local np=$(get_or_alloc_available_port "tcp" "singbox-vmess")
+                    local np=$(get_or_alloc_available_port "tcp" "singbox-vmess" "$VLESS_PORT")
                     [ -n "$np" ] && export VMESS_PORT=$np && repaired_main=true
                 fi
             done <<< "$err_lines"
