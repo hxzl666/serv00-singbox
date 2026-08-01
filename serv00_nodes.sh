@@ -6094,6 +6094,9 @@ restart_processes() {
     
     cd "$WORKDIR"
     
+    # 强制重新生成干净的基础 config.json (擦除历史损坏文件)
+    generate_singbox_config 2>/dev/null || true
+    
     # 重启 Psiphon 实例 (如果启用)
     local psi_enabled
     psi_enabled="$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null || echo "false")"
@@ -7847,6 +7850,13 @@ sync_all_proxy_groups() {
     local groups
     mapfile -t groups < <(get_all_proxy_groups)
     [[ ${#groups[@]} -eq 0 ]] && return 0
+
+    # 检查基础 config.json 是否有效，如损毁或缺失自动重新构建
+    if [[ ! -f "$WORKDIR/config.json" ]] || ! python3 -c "import json, sys; json.load(open('$WORKDIR/config.json'))" >/dev/null 2>&1; then
+        yellow "[!] 监测到 config.json 损毁或格式异常，正在重新生成基础配置..."
+        generate_singbox_config 2>/dev/null || true
+    fi
+
     yellow "[*] 同步代理分组配置 (共 ${#groups[@]} 个)..."
     for tag in "${groups[@]}"; do
         [[ -d "${PROXY_GROUPS_DIR}/${tag}" ]] && sync_proxy_group_to_singbox "$tag"
