@@ -4797,39 +4797,40 @@ auto_repair_conflicting_ports() {
         done
     fi
 
-    # ---------------- 3. 日志精确错误抓取与兜底定位更换 ----------------
+    # ---------------- 3. 从日志集中提取冲突端口并去重复用更换 ----------------
     if [ -f "$WORKDIR/singbox.log" ]; then
-        local err_lines
-        err_lines=$(grep -E "initialize inbound/.*: bind: address already in use" "$WORKDIR/singbox.log" 2>/dev/null || true)
-        if [ -n "$err_lines" ]; then
-            while read -r eline; do
-                [ -z "$eline" ] && continue
-                local bad_port=$(echo "$eline" | grep -oE ":[0-9]+" | head -n1 | tr -d ':')
-                local bad_proto="udp"
-                echo "$eline" | grep -qi "tcp" && bad_proto="tcp"
-
+        local err_ports
+        err_ports=$(grep -E "initialize inbound/.*: bind: address already in use" "$WORKDIR/singbox.log" 2>/dev/null | grep -oE ":[0-9]+" | tr -d ':' | sort -u || true)
+        
+        if [ -n "$err_ports" ]; then
+            for bad_port in $err_ports; do
                 [ -z "$bad_port" ] && continue
-                yellow "[!] 日志定位到端口 $bad_port ($bad_proto) 发生冲突，按规则自动更换..."
+                
+                local bad_proto="udp"
+                grep -E ":$bad_port: bind: address already in use" "$WORKDIR/singbox.log" 2>/dev/null | grep -qi "tcp" && bad_proto="tcp"
 
+                yellow "[!] 集中解决冲突端口 $bad_port ($bad_proto)，申请 1 个全 IP 可用的新端口进行复用替换..."
+
+                # 申请 1 个在 3 个 IP 上均可用的全新端口
                 local new_p=$(replace_occupied_port "$bad_proto" "singbox-repaired" "$bad_port")
                 if [[ ! "$new_p" =~ ^[0-9]+$ ]]; then
                     continue
                 fi
 
-                # 将使用原端口 bad_port 的 3 个 IP 绑定的所有节点更新为 new_p
+                # 一次性将所有复用 bad_port 的 3 个 IP 入站节点集中更新为 new_p
                 # 1) 主节点
                 if [ "$bad_port" = "$TUIC_PORT" ]; then
                     export TUIC_PORT=$new_p && repaired_main=true
-                    green "  → 更新 TUIC 主节点端口: $new_p"
+                    green "  → 复用更新 TUIC 主节点 3 个 IP 入站端口: $new_p"
                 elif [ "$bad_port" = "$HY2_PORT" ]; then
                     export HY2_PORT=$new_p && repaired_main=true
-                    green "  → 更新 Hysteria2 主节点端口: $new_p"
+                    green "  → 复用更新 Hysteria2 主节点 3 个 IP 入站端口: $new_p"
                 elif [ "$bad_port" = "$VLESS_PORT" ]; then
                     export VLESS_PORT=$new_p && repaired_main=true
-                    green "  → 更新 VLESS 主节点端口: $new_p"
+                    green "  → 复用更新 VLESS 主节点 3 个 IP 入站端口: $new_p"
                 elif [ "$bad_port" = "$VMESS_PORT" ]; then
                     export VMESS_PORT=$new_p && repaired_main=true
-                    green "  → 更新 VMess 主节点端口: $new_p"
+                    green "  → 复用更新 VMess 主节点 3 个 IP 入站端口: $new_p"
                 fi
 
                 # 2) 代理分组节点
@@ -4837,19 +4838,19 @@ auto_repair_conflicting_ports() {
                     for gtag in $group_tags; do
                         local g_dir="${PROXY_GROUPS_DIR}/${gtag}"
                         [ ! -d "$g_dir" ] && continue
-                        local gh=$(cat "$g_dir/hy2_port.txt" 2>/dev/null || echo "")
-                        local gt=$(cat "$g_dir/tuic_port.txt" 2>/dev/null || echo "")
+                        local gh=$(cat "$g_dir/hy2_port.txt" 2>/dev/null | grep -oE '[0-9]+' | head -n1 || echo "")
+                        local gt=$(cat "$g_dir/tuic_port.txt" 2>/dev/null | grep -oE '[0-9]+' | head -n1 || echo "")
                         if [ "$gh" = "$bad_port" ]; then
                             echo "$new_p" > "$g_dir/hy2_port.txt" && repaired_proxy=true
-                            green "  → 更新代理组 [$gtag] Hysteria2 端口: $new_p"
+                            green "  → 复用更新代理组 [$gtag] 对应 3 个 IP 的 Hysteria2 入站端口: $new_p"
                         fi
                         if [ "$gt" = "$bad_port" ]; then
                             echo "$new_p" > "$g_dir/tuic_port.txt" && repaired_proxy=true
-                            green "  → 更新代理组 [$gtag] TUIC 端口: $new_p"
+                            green "  → 复用更新代理组 [$gtag] 对应 3 个 IP 的 TUIC 入站端口: $new_p"
                         fi
                     done
                 fi
-            done <<< "$err_lines"
+            done
         fi
     fi
 
@@ -6094,8 +6095,17 @@ restart_processes() {
     
     cd "$WORKDIR"
     
-    # 强制重新生成干净的基础 config.json (擦除历史损坏文件)
-    generate_singbox_config 2>/dev/null || true
+    # 主动检测所有端口在 3 个 IP 上的可用性，提前修复不可用端口
+    # 原理：同一个端口在主 IP 上可用不代表在其他 IP 上也可用；
+    #       如果重启前不检查，sing-box 可能因为另两个 IP 的端口被占用而启动失败
+    yellow "检测所有端口在多IP上的可用性..."
+    if auto_repair_conflicting_ports; then
+        yellow "已修复端口冲突 (旧端口已删除，新端口在 3 个 IP 上均可绑定)，配置已重新生成"
+    else
+        green "所有端口在全部 IP 上均可用，无需修复"
+        # 强制重新生成干净的基础 config.json (擦除历史损坏文件)
+        generate_singbox_config 2>/dev/null || true
+    fi
     
     # 重启 Psiphon 实例 (如果启用)
     local psi_enabled
