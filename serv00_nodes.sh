@@ -1345,7 +1345,45 @@ init_psiphon_state_files() {
     [[ -f "$WORKDIR/psiphon_http_listen.txt" ]]  || : > "$WORKDIR/psiphon_http_listen.txt"
 }
 
-# 获取 Psiphon 实际 SOCKS 端口 (优先读运行时端口)
+# 从系统监听套接字中探测 Psiphon 实际绑定的 TCP 端口
+detect_psiphon_port_from_system() {
+    local pid_file="${1:-$WORKDIR/psiphon.pid}"
+    local pid=""
+    if [[ -f "$pid_file" ]]; then
+        pid="$(cat "$pid_file" 2>/dev/null)"
+    fi
+    
+    local port=""
+    # 1. FreeBSD sockstat
+    if command -v sockstat >/dev/null 2>&1; then
+        if [[ -n "$pid" ]]; then
+            port=$(sockstat -4 -l -p "$pid" 2>/dev/null | awk '/tcp/ {print $6}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | head -n1)
+        fi
+        if [[ -z "$port" ]]; then
+            port=$(sockstat -4 -l 2>/dev/null | grep -E 'psiphon' | awk '/tcp/ {print $6}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | head -n1)
+        fi
+    fi
+    
+    # 2. Linux lsof
+    if [[ -z "$port" ]] && command -v lsof >/dev/null 2>&1; then
+        if [[ -n "$pid" ]]; then
+            port=$(lsof -a -p "$pid" -i TCP -s TCP:LISTEN 2>/dev/null | awk 'NR>1 {print $9}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | head -n1)
+        fi
+    fi
+    
+    # 3. netstat
+    if [[ -z "$port" ]] && command -v netstat >/dev/null 2>&1; then
+        port=$(netstat -an 2>/dev/null | grep LISTEN | grep -E '127\.0\.0\.1' | grep -E 'psiphon' | awk '{print $4}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | head -n1)
+    fi
+
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 )); then
+        echo "$port"
+        return 0
+    fi
+    return 1
+}
+
+# 获取 Psiphon 实际 SOCKS 端口 (优先读运行时端口，其次调用底层 Socket 探针)
 get_psiphon_socks_port() {
     local p=""
     # 优先读运行时实际监听端口
@@ -1354,7 +1392,14 @@ get_psiphon_socks_port() {
         echo "$p"
         return 0
     fi
-    # fallback: 读配置端口 (可能是 0)
+    # 尝试底层系统 Socket 探针
+    p="$(detect_psiphon_port_from_system "$WORKDIR/psiphon.pid")"
+    if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then
+        echo "$p" > "$WORKDIR/psiphon_socks_listen.txt" 2>/dev/null
+        echo "$p"
+        return 0
+    fi
+    # fallback: 读配置端口 (如果是固定非 0 端口)
     p="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || true)"
     if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then
         echo "$p"
@@ -1368,16 +1413,20 @@ get_psiphon_socks_port() {
             return 0
         fi
     fi
-    echo "25400"
+    echo "0"
 }
 
-# 从 psiphon.log 解析实际监听端口 (ListeningSocksProxyPort notice)
+# 从 psiphon.log 或底层系统 socket 解析实际监听端口
 psiphon_update_listen_ports_from_log() {
     local log="$WORKDIR/psiphon.log"
     local socks http
 
-    # 提取 SOCKS 端口
+    # 1. 提取 SOCKS 端口
     socks="$(grep -a '"ListeningSocksProxyPort"' "$log" 2>/dev/null | tail -n 1 | grep -oE '"port":[[:space:]]*[0-9]+' | grep -oE '[0-9]+')"
+    if [[ -z "$socks" || "$socks" == "0" ]]; then
+        socks="$(detect_psiphon_port_from_system "$WORKDIR/psiphon.pid")"
+    fi
+
     if [[ "$socks" =~ ^[0-9]+$ ]] && (( socks > 0 )); then
         echo "$socks" > "$WORKDIR/psiphon_socks_listen.txt"
         green "[+] Psiphon SOCKS 实际端口: $socks"
@@ -1533,14 +1582,14 @@ write_psiphon_config() {
   "SponsorId": "FFFFFFFFFFFFFFFF",
   "RemoteServerListDownloadFilename": "${WORKDIR}/remote_server_list",
   "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
-  "RemoteServerListUrl": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+  "RemoteServerListUrl": "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
   "UseIndistinguishableTLS": true
 }
 EOF
     green "[+] Psiphon 配置已生成 (SOCKS: 自动端口, 数据目录: $datadir)"
 }
 
-# 等待 Psiphon 就绪 (基于 notice 事件检测)
+# 等待 Psiphon 就绪 (基于 notice 事件及底层系统套接字检测)
 psiphon_wait_ready() {
     local log="$WORKDIR/psiphon.log"
 
@@ -1551,44 +1600,53 @@ psiphon_wait_ready() {
     yellow "[*] 等待 Psiphon 就绪 (最多 ${timeout} 秒)..."
 
     while (( elapsed < timeout )); do
-        # 1) 检查端口占用 notice
+        # 1) 检查底层系统 Socket 监听 (最快最可靠)
+        local sys_port
+        sys_port="$(detect_psiphon_port_from_system "$WORKDIR/psiphon.pid")"
+        if [[ "$sys_port" =~ ^[0-9]+$ ]] && (( sys_port > 0 )); then
+            echo "$sys_port" > "$WORKDIR/psiphon_socks_listen.txt"
+            green "\n[+] Psiphon SOCKS 端口已就绪 (端口: $sys_port)"
+            return 0
+        fi
+
+        # 2) 检查端口占用 notice
         if tail -n 200 "$log" 2>/dev/null | grep -q '"noticeType":"SocksProxyPortInUse"'; then
             red "[!] Psiphon SOCKS 端口被占用"
             yellow "    如果使用固定端口请换一个，或使用 0 (自动端口)"
             return 2
         fi
 
-        # 2) 检查已开始监听 notice (最可靠的就绪信号)
+        # 3) 检查已开始监听 notice (最可靠的就绪信号)
         if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"ListeningSocksProxyPort"'; then
             # 解析实际端口
             psiphon_update_listen_ports_from_log
             local actual_port
             actual_port="$(get_psiphon_socks_port)"
-            green "[+] Psiphon SOCKS 已监听 (端口: $actual_port)"
+            green "\n[+] Psiphon SOCKS 已监听 (端口: $actual_port)"
             return 0
         fi
 
-        # 3) 检查 Tunnels notice (已建立隧道)
+        # 4) 检查 Tunnels notice (已建立隧道)
         if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"Tunnels"'; then
             if tail -n 400 "$log" 2>/dev/null | grep '"noticeType":"Tunnels"' | grep -q '"count":[1-9]'; then
                 # 隧道建立，也解析端口
                 psiphon_update_listen_ports_from_log
                 local actual_port
                 actual_port="$(get_psiphon_socks_port)"
-                green "[+] Psiphon 隧道已建立 (SOCKS: $actual_port)"
+                green "\n[+] Psiphon 隧道已建立 (SOCKS: $actual_port)"
                 return 0
             fi
         fi
 
-        # 4) 检查进程是否还活着
-        if ! pgrep -x "psiphon-tunnel-core" >/dev/null 2>&1; then
+        # 5) 检查进程是否还活着
+        if ! pgrep -x "psiphon-tunnel-core" >/dev/null 2>&1 && ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
             red "[!] Psiphon 进程已退出"
             tail -15 "$log" 2>/dev/null
             return 1
         fi
 
-        sleep 3
-        elapsed=$((elapsed + 3))
+        sleep 2
+        elapsed=$((elapsed + 2))
         printf "\r[*] 等待 Psiphon 就绪... %ds/%ds" "$elapsed" "$timeout"
     done
 
@@ -2380,21 +2438,45 @@ show_supported_psiphon_codes() {
     yellow "  非洲: KE=肯尼亚 ZA=南非 AUTO=自动"
 }
 
-# 获取空闲本地回环端口以防冲突
+# 获取空闲本地回环端口以防冲突 (默认 31092)
 get_free_loopback_port() {
-    echo "0"
+    local target_port=31092
+    if check_port_available_on_ip "$target_port" "tcp" "127.0.0.1" >/dev/null 2>&1; then
+        echo "$target_port"
+        return 0
+    fi
+    local candidate
+    for candidate in {31093..31150}; do
+        if check_port_available_on_ip "$candidate" "tcp" "127.0.0.1" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    echo "31092"
 }
 
 # WARP 出口 IP 检测 - 智能坚固版
 warp_egress_test() {
     cd "$WORKDIR" 2>/dev/null || return 1
     
-    # 检查 sing-box 是否在运行
+    # 检查 sing-box 是否在运行 (改进 PID 与 pgrep 兼容判定)
     local sb_binary
     sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
-    if [[ -z "$sb_binary" ]] || ! pgrep -x "$sb_binary" >/dev/null 2>&1; then
-        red "[!] sing-box 进程未运行，无法检测 WARP"
-        return 1
+    local is_sb_running=false
+    if [[ -f "$WORKDIR/singbox.pid" ]]; then
+        local sb_pid=$(cat "$WORKDIR/singbox.pid" 2>/dev/null)
+        if [[ -n "$sb_pid" ]] && kill -0 "$sb_pid" 2>/dev/null; then
+            is_sb_running=true
+        fi
+    fi
+    if [[ "$is_sb_running" == "false" ]]; then
+        if pgrep -f "$sb_binary" >/dev/null 2>&1 || pgrep -x "sing-box" >/dev/null 2>&1; then
+            is_sb_running=true
+        fi
+    fi
+    if [[ "$is_sb_running" == "false" ]]; then
+        yellow "[*] sing-box 进程未运行，正在尝试自动拉起..."
+        start_singbox_safe || { red "[!] sing-box 启动失败，无法检测 WARP"; return 1; }
     fi
 
     # 动态从 config.json 获取 socks-loopback 端口
@@ -2961,7 +3043,14 @@ psiphon_management_menu() {
         local is_running=false
         if [[ -f "$psi_pid_file" ]]; then
             local pid=$(cat "$psi_pid_file" 2>/dev/null)
-            if kill -0 "$pid" 2>/dev/null; then
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                is_running=true
+            fi
+        fi
+        if [[ "$is_running" == "false" ]]; then
+            if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1 || pgrep -x "psiphon-tunnel-core" >/dev/null 2>&1; then
+                is_running=true
+            elif [[ -n "$(detect_psiphon_port_from_system "$WORKDIR/psiphon.pid")" ]]; then
                 is_running=true
             fi
         fi
@@ -3138,7 +3227,7 @@ write_instance_config() {
   "SponsorId": "FFFFFFFFFFFFFFFF",
   "RemoteServerListDownloadFilename": "${instance_dir}/remote_server_list",
   "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
-  "RemoteServerListUrl": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+  "RemoteServerListUrl": "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
   "UseIndistinguishableTLS": true
 }
 EOF
@@ -3149,12 +3238,17 @@ parse_instance_port() {
     local cc="${1^^}"
     local log="$PSI_INSTANCES_DIR/$cc/psiphon.log"
     local port_file="$PSI_INSTANCES_DIR/$cc/socks_port.txt"
+    local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
     
     local socks
     socks="$(grep -a '"noticeType":"ListeningSocksProxyPort"' "$log" 2>/dev/null \
         | tail -n 1 \
         | sed -E 's/.*"port":[[:space:]]*([0-9]+).*/\1/' )"
     
+    if [[ -z "$socks" || "$socks" == "0" ]]; then
+        socks="$(detect_psiphon_port_from_system "$pid_file")"
+    fi
+
     if [[ "$socks" =~ ^[0-9]+$ ]] && (( socks > 0 )); then
         echo "$socks" > "$port_file"
         echo "$socks"
