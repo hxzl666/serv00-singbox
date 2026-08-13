@@ -1360,27 +1360,31 @@ get_psiphon_socks_port() {
         echo "$p"
         return 0
     fi
-    echo "0"
+    # fallback: 读 psiphon.config 内部端口
+    if [ -f "$WORKDIR/psiphon.config" ]; then
+        p=$(grep -oE '"LocalSocksProxyPort":[[:space:]]*[0-9]+' "$WORKDIR/psiphon.config" | awk -F: '{print $2}' | tr -d ' ,')
+        if [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )); then
+            echo "$p"
+            return 0
+        fi
+    fi
+    echo "25400"
 }
 
 # 从 psiphon.log 解析实际监听端口 (ListeningSocksProxyPort notice)
 psiphon_update_listen_ports_from_log() {
     local log="$WORKDIR/psiphon.log"
     local socks http
-    
-    # 解析 SOCKS 端口
-    socks="$(grep -a '"noticeType":"ListeningSocksProxyPort"' "$log" 2>/dev/null \
-        | tail -n 1 \
-        | sed -E 's/.*"port":[[:space:]]*([0-9]+).*/\1/' )"
+
+    # 提取 SOCKS 端口
+    socks="$(grep -a '"ListeningSocksProxyPort"' "$log" 2>/dev/null | tail -n 1 | grep -oE '"port":[[:space:]]*[0-9]+' | grep -oE '[0-9]+')"
     if [[ "$socks" =~ ^[0-9]+$ ]] && (( socks > 0 )); then
         echo "$socks" > "$WORKDIR/psiphon_socks_listen.txt"
         green "[+] Psiphon SOCKS 实际端口: $socks"
     fi
 
-    # 解析 HTTP 端口
-    http="$(grep -a '"noticeType":"ListeningHttpProxyPort"' "$log" 2>/dev/null \
-        | tail -n 1 \
-        | sed -E 's/.*"port":[[:space:]]*([0-9]+).*/\1/' )"
+    # 提取 HTTP 端口
+    http="$(grep -a '"ListeningHttpProxyPort"' "$log" 2>/dev/null | tail -n 1 | grep -oE '"port":[[:space:]]*[0-9]+' | grep -oE '[0-9]+')"
     if [[ "$http" =~ ^[0-9]+$ ]] && (( http > 0 )); then
         echo "$http" > "$WORKDIR/psiphon_http_listen.txt"
     fi
@@ -1503,7 +1507,7 @@ write_psiphon_config() {
     region="$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)"
     
     # FreeBSD mac_portacl 限制固定端口 bind，必须用 0 (自动端口)
-    socks="${socks:-0}"
+    if [[ -f "$WORKDIR/ports.txt" ]] || [[ "$(detect_os_slim)" == "freebsd" ]]; then socks="0"; else socks="${socks:-0}"; fi
     region="${region:-US}"
     
     # AUTO 时写空字符串
@@ -1577,7 +1581,7 @@ psiphon_wait_ready() {
         fi
 
         # 4) 检查进程是否还活着
-        if ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        if ! pgrep -x "psiphon-tunnel-core" >/dev/null 2>&1; then
             red "[!] Psiphon 进程已退出"
             tail -15 "$log" 2>/dev/null
             return 1
@@ -2193,12 +2197,19 @@ outbounds[:] = [o for o in outbounds if o.get("tag") != psiphon_tag]
 # 移除 psiphon 相关规则
 rules[:] = [r for r in rules if r.get("outbound") != psiphon_tag]
 
-# 确保从 outbounds 移除 warp-out 痕迹，并彻底删除 endpoints 字段以兼容旧版
-outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
-if "endpoints" in data:
-    del data["endpoints"]
+# 检查 WARP 是否启用，如果不启用才移除 warp-out 痕迹
+warp_enabled = "false"
+try:
+    with open(r"$WORKDIR/warp_enabled.txt", "r") as wf:
+        warp_enabled = wf.read().strip()
+except Exception:
+    pass
 
-# 恢复 final 为 direct
+if warp_enabled != "true":
+    outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+    if "endpoints" in data:
+        del data["endpoints"]
+
 def first_tag_by_type(t, fallback):
     for o in outbounds:
         if o.get("type") == t and o.get("tag"):
@@ -2206,7 +2217,10 @@ def first_tag_by_type(t, fallback):
     return fallback
 
 direct_tag = first_tag_by_type("direct", "direct")
-route["final"] = direct_tag
+if warp_enabled == "true":
+    route["final"] = warp_tag
+else:
+    route["final"] = direct_tag
 
 # 动态处理 socks-loopback
 warp_tags = ["warp-out", "wireguard-out"]
@@ -2217,7 +2231,7 @@ for o in outbounds:
         break
 
 inbound_tag = "socks-loopback"
-loopback_port = 25300
+loopback_port = 31092
 
 # 移除旧的 loopback 路由规则
 rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
@@ -2371,17 +2385,9 @@ get_free_loopback_port() {
     echo "0"
 }
 
-# WARP 出口 IP 检测 - 优化版，减少 fork 压力
+# WARP 出口 IP 检测 - 智能坚固版
 warp_egress_test() {
-    local socks
-    socks=$(grep -oE "inbound/socks\[socks-loopback\]: tcp server started at 127.0.0.1:[0-9]+" "$WORKDIR/singbox.log" 2>/dev/null | tail -n 1 | awk -F: '{print $NF}')
-    socks=${socks:-0}
-    
-    if [[ "$socks" == "0" || -z "$socks" ]]; then
-        red "[!] 未检测到已运行的 WARP 环回测试端口"
-        yellow "    这通常表示 sing-box 进程启动失败、或者配置中未添加 socks-loopback"
-        return 1
-    fi
+    cd "$WORKDIR" 2>/dev/null || return 1
     
     # 检查 sing-box 是否在运行
     local sb_binary
@@ -2391,15 +2397,34 @@ warp_egress_test() {
         return 1
     fi
 
-    # 检查当前是否配置了 WARP
-    local warp_enabled
-    warp_enabled=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
-    if [[ "$warp_enabled" != "true" ]]; then
-        red "[!] WARP 未启用"
-        return 1
+    # 动态从 config.json 获取 socks-loopback 端口
+    local socks=""
+    if [ -f "$WORKDIR/config.json" ]; then
+        socks=$(python3 -c "import json; data=json.load(open('$WORKDIR/config.json')); print([ib.get('listen_port') for ib in data.get('inbounds',[]) if ib.get('tag')=='socks-loopback'][0])" 2>/dev/null || echo "")
     fi
 
-    yellow "[*] 正在检测 WARP 出口 IP..."
+    # 如果配置中不存在 socks-loopback，自动补充
+    if [[ -z "$socks" || "$socks" == "None" || "$socks" == "0" ]]; then
+        socks=31092
+        yellow "[*] 配置中未检测到 socks-loopback 节点，正在自动补充..."
+        python3 -c "
+import json
+cfg = r'$WORKDIR/config.json'
+try:
+    with open(cfg, 'r') as f: data = json.load(f)
+    ibs = data.setdefault('inbounds', [])
+    rules = data.setdefault('route', {}).setdefault('rules', [])
+    if not any(ib.get('tag') == 'socks-loopback' for ib in ibs):
+        ibs.append({'tag': 'socks-loopback', 'type': 'socks', 'listen': '127.0.0.1', 'listen_port': 31092})
+    if not any(r.get('inbound') == ['socks-loopback'] for r in rules):
+        rules.insert(0, {'inbound': ['socks-loopback'], 'outbound': 'warp-out'})
+    with open(cfg, 'w') as f: json.dump(data, f, ensure_ascii=False, indent=2)
+except Exception: pass
+"
+        start_singbox_safe
+    fi
+
+    yellow "[*] 正在检测 WARP 出口 IP (SOCKS5 端口: $socks)..."
 
     local json=""
     # 尝试 ipinfo.io (可能限流/403)
@@ -2748,6 +2773,179 @@ psiphon_smart_country() {
     fi
 }
 
+# 搭建/更新 英国出口 (Psiphon GB) 端口复用 Hy2 节点
+setup_psiphon_gb_hy2_node() {
+    clear
+    echo
+    green "============================================================"
+    green "  搭建/更新 英国出口 (Psiphon GB) 端口复用 Hy2 节点"
+    green "============================================================"
+    echo
+    
+    if [ ! -f "$WORKDIR/config.json" ]; then
+        red "未检测到节点安装，请先在主菜单选项 1 安装节点"
+        return 1
+    fi
+    
+    cd "$WORKDIR" || return 1
+    
+    yellow "[*] 配置 Psiphon 英国出口 (GB)..."
+    echo "GB" > "$WORKDIR/psiphon_region.txt"
+    echo "true" > "$WORKDIR/psiphon_enabled.txt"
+    echo "gb_hy2" > "$WORKDIR/psiphon_mode.txt"
+    
+    if ! install_psiphon_userland; then
+        red "[!] Psiphon 安装失败"
+        return 1
+    fi
+    
+    write_psiphon_config
+    
+    if ! start_psiphon_userland; then
+        red "[!] Psiphon 启动失败"
+        return 1
+    fi
+    
+    local socks_port
+    socks_port="$(get_psiphon_socks_port)"
+    if [[ "$socks_port" == "0" || -z "$socks_port" ]]; then
+        red "[!] 无法获取 Psiphon 实际监听端口"
+        return 1
+    fi
+    
+    green "[+] Psiphon 英国 (GB) SOCKS5 出站端口: 127.0.0.1:$socks_port"
+    yellow "[*] 正在向 sing-box 配置加入端口复用的 Hy2 英国节点..."
+    
+    local cfg="$WORKDIR/config.json"
+    cp "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+    
+    python3 - <<PY
+import json
+import sys
+
+cfg_path = r"$cfg"
+socks_port = int(r"$socks_port")
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取配置失败: {e}")
+    sys.exit(1)
+
+outbounds = data.setdefault("outbounds", [])
+inbounds = data.setdefault("inbounds", [])
+route = data.setdefault("route", {})
+rules = route.setdefault("rules", [])
+
+gb_out_tag = "psiphon-gb-out"
+outbound_found = False
+for o in outbounds:
+    if o.get("tag") == gb_out_tag:
+        o.clear()
+        o.update({
+            "type": "socks",
+            "tag": gb_out_tag,
+            "server": "127.0.0.1",
+            "server_port": socks_port,
+            "version": "5"
+        })
+        outbound_found = True
+        break
+if not outbound_found:
+    outbounds.append({
+        "type": "socks",
+        "tag": gb_out_tag,
+        "server": "127.0.0.1",
+        "server_port": socks_port,
+        "version": "5"
+    })
+
+hy2_port = 0
+main_uuid = "secret"
+
+# 移除历史残留的不合规 inbound (如果有)
+inbounds[:] = [ib for ib in inbounds if ib.get("tag") != "hy2-psiphon-gb-in"]
+
+# 在现有的 Hysteria2 入站中加入 gb_user 实现端口全复用
+for ib in inbounds:
+    if ib.get("type") == "hysteria2":
+        if not hy2_port and ib.get("listen_port"):
+            hy2_port = ib["listen_port"]
+        users = ib.setdefault("users", [])
+        if users:
+            main_uuid = users[0].get("password", "secret")
+            users[0]["name"] = "main_user"
+            gb_pwd = f"{main_uuid}-gb"
+            has_gb_user = False
+            for u in users:
+                if u.get("name") == "gb_user" or u.get("password") == gb_pwd:
+                    u["name"] = "gb_user"
+                    u["password"] = gb_pwd
+                    has_gb_user = True
+                    break
+            if not has_gb_user:
+                users.append({
+                    "name": "gb_user",
+                    "password": gb_pwd
+                })
+
+if hy2_port == 0:
+    print("[!] 未找到主 Hysteria2 入站配置")
+    sys.exit(1)
+
+gb_uuid = f"{main_uuid}-gb"
+
+# 在 rules 顶部添加用户路由规则 (gb_user -> psiphon-gb-out)
+rules[:] = [r for r in rules if not (isinstance(r.get("user"), list) and "gb_user" in r["user"])]
+rules.insert(0, {
+    "user": ["gb_user"],
+    "outbound": gb_out_tag
+})
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("[+] 英国 Psiphon 端口复用 Hy2 节点 JSON 修改成功")
+except Exception as e:
+    print(f"[!] 写入配置失败: {e}")
+    sys.exit(1)
+PY
+
+    if [ $? -ne 0 ]; then
+        red "[!] 配置写入失败"
+        return 1
+    fi
+
+    start_singbox_safe || return 1
+    echo "true" > "$WORKDIR/psiphon_gb_node_enabled.txt"
+    
+    echo
+    green "============================================================"
+    green "  ✓ 英国出口 (Psiphon GB) 端口复用 Hy2 节点搭建完成！"
+    green "============================================================"
+    
+    local main_ip=""
+    if [ -f "$WORKDIR/all_ips.txt" ]; then
+        main_ip=$(head -n 1 "$WORKDIR/all_ips.txt")
+    fi
+    main_ip=${main_ip:-"$(curl -s4m2 https://api.ipify.org 2>/dev/null)"}
+    
+    local main_uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || echo "secret")
+    local gb_uuid="${main_uuid}-gb"
+    local hy2_port=$(jq -r '.inbounds[] | select(.tag=="hy2-psiphon-gb-in") | .listen_port' config.json 2>/dev/null)
+    hy2_port=${hy2_port:-$(grep -oE '"listen_port": [0-9]+' config.json | head -n 1 | awk '{print $2}')}
+
+    echo
+    yellow "复用端口: $hy2_port (与主节点共享端口)"
+    yellow "专属密码: $gb_uuid"
+    echo
+    purple "Hysteria2 英国 (GB) 出口节点链接 (端口复用):"
+    green "hy2://${gb_uuid}@${main_ip}:${hy2_port}/?insecure=1&sni=www.bing.com#GB-Psiphon-Hy2-Reuse"
+    echo "============================================================"
+    return 0
+}
+
 # Psiphon 管理菜单 (psictl 等价)
 psiphon_management_menu() {
     while true; do
@@ -2805,10 +3003,11 @@ psiphon_management_menu() {
         blue   "  7. 查看 Psiphon 日志"
         blue   "  8. 重启 Psiphon"
         purple "  9. 多出口节点组管理"
+        green  " 10. 搭建/更新 英国 (GB) 出口 Hy2 节点 (单IP+端口复用)"
         echo "------------------------------------------------------------"
         red    "  0. 返回主菜单"
         echo "============================================================"
-        reading "请选择 [0-9]: " choice
+        reading "请选择 [0-10]: " choice
         echo
         
         case "$choice" in
@@ -2859,6 +3058,9 @@ psiphon_management_menu() {
                 ;;
             9)
                 multi_egress_menu
+                ;;
+            10)
+                setup_psiphon_gb_hy2_node
                 ;;
             0)
                 return 0
@@ -4326,7 +4528,6 @@ select_protocols() {
             esac
         done
     fi
-    
     echo
     green "已启用的协议:"
     [[ "$ENABLE_ARGO" == "true" ]] && purple "  ✓ Argo隧道 (0端口)"
@@ -4809,9 +5010,15 @@ full_port_reset_and_realloc() {
         fi
     fi
     
-    # 4. 分配代理组端口（端口复用模式: 每个入站只绑定一个 IP）
+    # 4. 分配代理组端口（端口复用模式: 单 IP 绑定, 同端口可跨不同 IP 复用）
     yellow "[4/5] 分配代理组端口 (端口复用: 单 IP 绑定, 同端口可跨不同 IP 复用)..."
     
+    # 可用端口池 (预先包含主节点端口，支持跨 IP / 多代理组智能复用)
+    local available_hy2_ports=()
+    local available_tuic_ports=()
+    [[ -n "$HY2_PORT" && "$HY2_PORT" =~ ^[0-9]+$ ]] && available_hy2_ports+=("$HY2_PORT")
+    [[ -n "$TUIC_PORT" && "$TUIC_PORT" =~ ^[0-9]+$ ]] && available_tuic_ports+=("$TUIC_PORT")
+
     # 追踪已分配的 (port,ip) 对，防止同端口同 IP 冲突
     local port_ip_map=()
     local proxy_all_ok=true
@@ -4841,27 +5048,24 @@ full_port_reset_and_realloc() {
             # --- Hy2 端口 ---
             if [[ "$need_hy2" == "true" && ${#hy2_ips[@]} -gt 0 ]]; then
                 local hy2_port=""
-                # 尝试复用已有端口
-                for mapping in "${port_ip_map[@]}"; do
-                    local m_port="${mapping%%|*}"
-                    local m_ip="${mapping##*|}"
+                # 1. 尝试复用已有可用端口 (在绑定的 IP 上无映射冲突)
+                for cand_p in "${available_hy2_ports[@]}"; do
                     local can_reuse=true
                     for ip in "${hy2_ips[@]}"; do
-                        # 端口在该 IP 上必须可用，且不与已有映射冲突
-                        if ! check_port_available_on_ip "$m_port" "udp" "$ip"; then
+                        if ! check_port_available_on_ip "$cand_p" "udp" "$ip"; then
                             can_reuse=false; break
                         fi
                         for m2 in "${port_ip_map[@]}"; do
-                            [[ "$m2" == "${m_port}|${ip}" ]] && { can_reuse=false; break; }
+                            [[ "$m2" == "${cand_p}|${ip}" ]] && { can_reuse=false; break; }
                         done
                         [[ "$can_reuse" == "false" ]] && break
                     done
                     if [[ "$can_reuse" == "true" ]]; then
-                        hy2_port="$m_port"
+                        hy2_port="$cand_p"
                         break
                     fi
                 done
-                # 无法复用则申请新端口
+                # 2. 无法复用且额度未满，尝试申请新端口
                 if [[ -z "$hy2_port" ]]; then
                     local retry=0
                     while [[ $retry -lt 40 && -z "$hy2_port" ]]; do
@@ -4873,14 +5077,20 @@ full_port_reset_and_realloc() {
                         if [[ "$can_use" == "true" ]]; then
                             local res=$(devil port add udp "$cand" "singbox-proxy-hy2" 2>&1)
                             local ec=$?
-                            # 兼容波兰语面板 (został dodany) 和英语面板 (succesfully/Ok/success)
                             if [[ $ec -eq 0 ]] && ! echo "$res" | grep -qiE 'błąd|error|limit|istnieje|fail'; then
                                 hy2_port="$cand"
+                                available_hy2_ports+=("$cand")
                             fi
                         fi
                         ((retry++))
                     done
                 fi
+                # 3. 智能 Fallback: 如果端口额度受限 (limit) 导致申请新端口失败，退回复用已有端口
+                if [[ -z "$hy2_port" && ${#available_hy2_ports[@]} -gt 0 ]]; then
+                    hy2_port="${available_hy2_ports[0]}"
+                    yellow "  [!] 代理组 [$gtag] 端口配额已满，自动退回复用端口: $hy2_port"
+                fi
+
                 if [[ -n "$hy2_port" ]]; then
                     echo "$hy2_port" > "$g_dir/hy2_port.txt"
                     for ip in "${hy2_ips[@]}"; do port_ip_map+=("${hy2_port}|${ip}"); done
@@ -4894,24 +5104,24 @@ full_port_reset_and_realloc() {
             # --- TUIC 端口 ---
             if [[ "$need_tuic" == "true" && ${#tuic_ips[@]} -gt 0 ]]; then
                 local tuic_port=""
-                for mapping in "${port_ip_map[@]}"; do
-                    local m_port="${mapping%%|*}"
-                    local m_ip="${mapping##*|}"
+                # 1. 尝试复用已有可用端口 (在绑定的 IP 上无映射冲突)
+                for cand_p in "${available_tuic_ports[@]}"; do
                     local can_reuse=true
                     for ip in "${tuic_ips[@]}"; do
-                        if ! check_port_available_on_ip "$m_port" "udp" "$ip"; then
+                        if ! check_port_available_on_ip "$cand_p" "udp" "$ip"; then
                             can_reuse=false; break
                         fi
                         for m2 in "${port_ip_map[@]}"; do
-                            [[ "$m2" == "${m_port}|${ip}" ]] && { can_reuse=false; break; }
+                            [[ "$m2" == "${cand_p}|${ip}" ]] && { can_reuse=false; break; }
                         done
                         [[ "$can_reuse" == "false" ]] && break
                     done
                     if [[ "$can_reuse" == "true" ]]; then
-                        tuic_port="$m_port"
+                        tuic_port="$cand_p"
                         break
                     fi
                 done
+                # 2. 无法复用且额度未满，尝试申请新端口
                 if [[ -z "$tuic_port" ]]; then
                     local retry=0
                     while [[ $retry -lt 40 && -z "$tuic_port" ]]; do
@@ -4923,14 +5133,20 @@ full_port_reset_and_realloc() {
                         if [[ "$can_use" == "true" ]]; then
                             local res=$(devil port add udp "$cand" "singbox-proxy-tuic" 2>&1)
                             local ec=$?
-                            # 兼容波兰语面板 (został dodany) 和英语面板 (succesfully/Ok/success)
                             if [[ $ec -eq 0 ]] && ! echo "$res" | grep -qiE 'błąd|error|limit|istnieje|fail'; then
                                 tuic_port="$cand"
+                                available_tuic_ports+=("$cand")
                             fi
                         fi
                         ((retry++))
                     done
                 fi
+                # 3. 智能 Fallback: 如果端口额度受限 (limit) 导致申请新端口失败，退回复用已有端口
+                if [[ -z "$tuic_port" && ${#available_tuic_ports[@]} -gt 0 ]]; then
+                    tuic_port="${available_tuic_ports[0]}"
+                    yellow "  [!] 代理组 [$gtag] 端口配额已满，自动退回复用端口: $tuic_port"
+                fi
+
                 if [[ -n "$tuic_port" ]]; then
                     echo "$tuic_port" > "$g_dir/tuic_port.txt"
                     for ip in "${tuic_ips[@]}"; do port_ip_map+=("${tuic_port}|${ip}"); done
@@ -5108,6 +5324,10 @@ auto_repair_conflicting_ports() {
                         echo "$new_p" > "$g_dir/hy2_port.txt"
                         repaired_proxy=true
                         green "  → 已申请新端口并更新代理组 [$gtag] Hysteria2 入站端口: $new_p (绑定 IP 检查)"
+                    elif [[ -n "$HY2_PORT" && "$HY2_PORT" =~ ^[0-9]+$ ]]; then
+                        echo "$HY2_PORT" > "$g_dir/hy2_port.txt"
+                        repaired_proxy=true
+                        yellow "  → 端口配额已满，代理组 [$gtag] 自动退回使用 Hysteria2 主节点端口: $HY2_PORT"
                     else
                         red "  [!] 代理组 [$gtag] Hy2 端口修复失败，触发全量端口重置..."
                         full_port_reset_and_realloc
@@ -5157,6 +5377,10 @@ auto_repair_conflicting_ports() {
                         echo "$new_p" > "$g_dir/tuic_port.txt"
                         repaired_proxy=true
                         green "  → 已申请新端口并更新代理组 [$gtag] TUIC 入站端口: $new_p (绑定 IP 检查)"
+                    elif [[ -n "$TUIC_PORT" && "$TUIC_PORT" =~ ^[0-9]+$ ]]; then
+                        echo "$TUIC_PORT" > "$g_dir/tuic_port.txt"
+                        repaired_proxy=true
+                        yellow "  → 端口配额已满，代理组 [$gtag] 自动退回使用 TUIC 主节点端口: $TUIC_PORT"
                     else
                         red "  [!] 代理组 [$gtag] TUIC 端口修复失败，触发全量端口重置..."
                         full_port_reset_and_realloc
@@ -7396,8 +7620,11 @@ init_proxy_groups_dir() {
 
 # 获取所有代理分组 tag（逐行输出）
 get_all_proxy_groups() {
-    [[ -f "${PROXY_GROUPS_DIR}/groups.txt" ]] && \
+    if [[ -f "${PROXY_GROUPS_DIR}/groups.txt" ]]; then
+        grep -v '^$' "${PROXY_GROUPS_DIR}/groups.txt" | sort -t'-' -k2,2n 2>/dev/null || \
+        grep -v '^$' "${PROXY_GROUPS_DIR}/groups.txt" | sort -V 2>/dev/null || \
         grep -v '^$' "${PROXY_GROUPS_DIR}/groups.txt" || true
+    fi
 }
 
 # 检查代理分组是否存在
@@ -8705,22 +8932,123 @@ proxy_egress_menu() {
 
         purple "当前代理节点组 (共 ${#groups[@]} 个):"
         if [[ ${#groups[@]} -gt 0 ]]; then
-            for tag in "${groups[@]}"; do
-                local dir="${PROXY_GROUPS_DIR}/$tag"
-                local remark=$(cat "$dir/remark.txt"   2>/dev/null || echo "$tag")
-                local hy2_p=$(cat  "$dir/hy2_port.txt"  2>/dev/null)
-                local tuic_p=$(cat "$dir/tuic_port.txt" 2>/dev/null)
-                local ip_cnt=$(wc -l < "$dir/ip_protos.txt" 2>/dev/null || echo 0)
-                local ports=""
-                [[ -n "$hy2_p"  ]] && ports+="Hy2:${hy2_p} "
-                [[ -n "$tuic_p" ]] && ports+="TUIC:${tuic_p}"
-                local ptype pserver pport
-                ptype=$(python3 -c "import json; d=json.load(open('$dir/outbound.json')); print(d.get('type','?'))" 2>/dev/null)
-                pserver=$(python3 -c "import json; d=json.load(open('$dir/outbound.json')); print(d.get('server','?'))" 2>/dev/null)
-                pport=$(python3 -c "import json; d=json.load(open('$dir/outbound.json')); print(d.get('server_port','?'))" 2>/dev/null)
-                printf "  %-12s %-20s IP数:%-3s 端口: %s\n" "[$tag]" "$remark" "$ip_cnt" "$ports"
-                printf "              出站: %-10s → %s:%s\n" "$ptype" "$pserver" "$pport"
-            done
+            python3 - "$PROXY_GROUPS_DIR" <<'PYEOF'
+import os, sys, json, unicodedata
+
+groups_dir = sys.argv[1]
+groups_file = os.path.join(groups_dir, "groups.txt")
+
+if not os.path.isfile(groups_file):
+    sys.exit(0)
+
+with open(groups_file, 'r', encoding='utf-8') as f:
+    tags = [line.strip() for line in f if line.strip()]
+
+def sort_key(tag):
+    parts = tag.split('-')
+    if len(parts) == 2 and parts[1].isdigit():
+        return (parts[0], int(parts[1]))
+    return (tag, 0)
+
+tags.sort(key=sort_key)
+
+def char_width(ch):
+    if unicodedata.east_asian_width(ch) in ('F', 'W'):
+        return 2
+    return 1
+
+def str_width(s):
+    return sum(char_width(ch) for ch in str(s))
+
+def pad(s, width):
+    s = str(s)
+    w = str_width(s)
+    return s + ' ' * max(0, width - w)
+
+headers = ["标识 (Tag)", "备注名称", "IP数", "入站端口", "出站协议", "目标出站服务器 (IP:Port)"]
+col_widths = [12, 16, 6, 16, 11, 26]
+
+rows = []
+for tag in tags:
+    d = os.path.join(groups_dir, tag)
+    if not os.path.isdir(d):
+        continue
+    
+    remark = tag
+    rm_path = os.path.join(d, "remark.txt")
+    if os.path.isfile(rm_path):
+        try:
+            with open(rm_path, 'r', encoding='utf-8') as f:
+                remark = f.read().strip() or tag
+        except Exception:
+            pass
+
+    hy2_p = ""
+    hy2_path = os.path.join(d, "hy2_port.txt")
+    if os.path.isfile(hy2_path):
+        try:
+            with open(hy2_path, 'r', encoding='utf-8') as f:
+                hy2_p = f.read().strip()
+        except Exception:
+            pass
+
+    tuic_p = ""
+    tuic_path = os.path.join(d, "tuic_port.txt")
+    if os.path.isfile(tuic_path):
+        try:
+            with open(tuic_path, 'r', encoding='utf-8') as f:
+                tuic_p = f.read().strip()
+        except Exception:
+            pass
+
+    ip_cnt = 0
+    ip_path = os.path.join(d, "ip_protos.txt")
+    if os.path.isfile(ip_path):
+        try:
+            with open(ip_path, 'r', encoding='utf-8') as f:
+                ip_cnt = len([l for l in f if l.strip()])
+        except Exception:
+            pass
+
+    ports = []
+    if hy2_p: ports.append(f"Hy2:{hy2_p}")
+    if tuic_p: ports.append(f"TUIC:{tuic_p}")
+    ports_str = " ".join(ports) or "无"
+
+    ptype, pserver, pport = "?", "?", "?"
+    ob_path = os.path.join(d, "outbound.json")
+    if os.path.isfile(ob_path):
+        try:
+            with open(ob_path, 'r', encoding='utf-8') as f:
+                ob_data = json.load(f)
+                ptype = ob_data.get("type", "?")
+                pserver = str(ob_data.get("server", "?"))
+                pport = str(ob_data.get("server_port", "?"))
+        except Exception:
+            pass
+
+    dest_str = f"{pserver}:{pport}"
+    rows.append([tag, remark, str(ip_cnt), ports_str, ptype, dest_str])
+
+for row in rows:
+    for i in range(len(col_widths)):
+        col_widths[i] = max(col_widths[i], str_width(row[i]) + 2)
+
+line_sep = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+
+def render_row(cells):
+    out = "| "
+    for i, cell in enumerate(cells):
+        out += pad(cell, col_widths[i]) + " | "
+    return out.rstrip()
+
+print("\033[1;36m" + line_sep + "\033[0m")
+print("\033[1;32m" + render_row(headers) + "\033[0m")
+print("\033[1;36m" + line_sep + "\033[0m")
+for r in rows:
+    print(render_row(r))
+print("\033[1;36m" + line_sep + "\033[0m")
+PYEOF
         else
             yellow "  暂无代理节点组"
         fi
