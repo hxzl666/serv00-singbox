@@ -250,8 +250,49 @@ cleanup_garbage_and_logs() {
     done
 }
 
+# 清理老版本脚本遗留物 (自动覆盖指向旧仓库的 ~/bin/sb、清理残留 alias 等)
+cleanup_old_script_remnants() {
+    local sb_cmd="$HOME/bin/sb"
+    local need_overwrite=false
+
+    # 1. 检测 ~/bin/sb 是否存在且指向旧版本仓库地址，若是则强制覆盖为新版
+    if [ -f "$sb_cmd" ]; then
+        # 匹配老仓库 URL (hxzlplp7 等非当前仓库地址)
+        if grep -q 'hxzlplp7' "$sb_cmd" 2>/dev/null; then
+            need_overwrite=true
+        fi
+        # 匹配极老版本的简陋快捷脚本 (没有本地优先判断的单行 curl)
+        if ! grep -q 'HOME/serv00_nodes.sh' "$sb_cmd" 2>/dev/null; then
+            need_overwrite=true
+        fi
+    fi
+
+    if [ "$need_overwrite" = true ]; then
+        mkdir -p "$HOME/bin"
+        cat > "$sb_cmd" <<'SBEOF'
+#!/bin/bash
+if [ -f "$HOME/serv00_nodes.sh" ]; then
+    bash "$HOME/serv00_nodes.sh" "$@"
+else
+    bash <(curl -Lks "https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh?t=$(date +%s)") "$@"
+fi
+SBEOF
+        chmod +x "$sb_cmd"
+    fi
+
+    # 2. 清理 .bashrc / .profile 中可能残留的老版本 alias 行 (如 alias sb='bash <(curl ... hxzlplp7 ...')
+    for rc_file in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile"; do
+        if [ -f "$rc_file" ]; then
+            # 移除指向旧仓库的 alias sb 行
+            sed -i.bak '/alias sb=.*hxzlplp7/d' "$rc_file" 2>/dev/null || true
+            rm -f "${rc_file}.bak" 2>/dev/null
+        fi
+    done
+}
+
 # 综合自动系统自愈维护总函数
 auto_system_maintenance() {
+    cleanup_old_script_remnants
     cleanup_garbage_and_logs
 }
 
@@ -292,48 +333,60 @@ get_all_ips() {
     # 保存到文件
     printf '%s\n' "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
 }
-# 检测IP大陆可达性
+# 检测IP可达性 (优先亚太近邻与大陆监测节点)
 check_ip_availability() {
     local ip=$1
-    local req_id=""
+    [ -z "$ip" ] && { echo "Unknown"; return; }
+
+    # 选用多地域高可用节点 (香港/日本/新加坡)，兼容 check-host 平台节点池变动
+    local check_url="https://check-host.net/check-ping?host=${ip}&node=hk1.node.check-host.net&node=jp1.node.check-host.net&node=sg1.node.check-host.net"
     local response=""
-    response=$(curl -s -H "Accept: application/json" --max-time 4 "https://check-host.net/check-ping?host=${ip}&node=cn" 2>/dev/null)
-    if [ -z "$response" ]; then
-        echo "Unknown" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-        echo "Unknown"
-        return
+    response=$(curl -s -H "Accept: application/json" --max-time 5 "$check_url" 2>/dev/null)
+    
+    local req_id=""
+    if [ -n "$response" ]; then
+        req_id=$(echo "$response" | grep -o '"request_id":"[^"]*"' | head -n1 | cut -d'"' -f4)
     fi
-    req_id=$(echo "$response" | grep -o '"request_id":"[^"]*"' | head -n1 | cut -d'"' -f4)
+
     if [ -z "$req_id" ]; then
         echo "Unknown" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
         echo "Unknown"
         return
     fi
-    sleep 3
+
+    # 轮询获取异步检测结果 (最多 3 次，防止未完成时被误判)
     local result=""
-    result=$(curl -s --max-time 4 "https://check-host.net/check-result/${req_id}" 2>/dev/null)
-    if [ -n "$result" ]; then
-        if echo "$result" | grep -q '"OK"'; then
-            echo "Available" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-            echo "Available"
-        else
-            echo "Blocked" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-            echo "Blocked"
+    local status="Unknown"
+    for ((try=0; try<3; try++)); do
+        sleep 2
+        result=$(curl -s --max-time 4 "https://check-host.net/check-result/${req_id}" 2>/dev/null)
+        if [ -n "$result" ] && [ "$result" != "{}" ]; then
+            if echo "$result" | grep -q '"OK"'; then
+                status="Available"
+                break
+            elif echo "$result" | grep -q '"TIMEOUT"'; then
+                # 只有全节点均超时且未出现 OK 才判定阻断
+                if ! echo "$result" | grep -q '"OK"'; then
+                    status="Blocked"
+                fi
+                break
+            fi
         fi
-    else
-        echo "Unknown" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
-        echo "Unknown"
-    fi
+    done
+
+    echo "$status" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
+    echo "$status"
 }
 
-# 显示IP列表并批量检测大陆可达性
+# 显示IP列表并批量检测可达性 (消除空节点误报)
 display_ip_list() {
-    yellow "正在检测本机IP的大陆可达性 (API: check-host.net)..."
+    yellow "正在检测本机IP的大陆及亚太可达性 (API: check-host.net)..."
     
     local req_ids=()
     for ip in "${ALL_IPS[@]}"; do
+        local check_url="https://check-host.net/check-ping?host=${ip}&node=hk1.node.check-host.net&node=jp1.node.check-host.net&node=sg1.node.check-host.net"
         local response=""
-        response=$(curl -s -H "Accept: application/json" --max-time 4 "https://check-host.net/check-ping?host=${ip}&node=cn" 2>/dev/null)
+        response=$(curl -s -H "Accept: application/json" --max-time 4 "$check_url" 2>/dev/null)
         local req_id=""
         if [ -n "$response" ]; then
             req_id=$(echo "$response" | grep -o '"request_id":"[^"]*"' | head -n1 | cut -d'"' -f4)
@@ -354,10 +407,16 @@ display_ip_list() {
         if [ -n "$req_id" ]; then
             local result=""
             result=$(curl -s --max-time 4 "https://check-host.net/check-result/${req_id}" 2>/dev/null)
-            if [ -n "$result" ]; then
+            # 如果尚未返回，轻量重试一次
+            if [[ -z "$result" || "$result" == "{}" || "$result" == *":null"* ]]; then
+                sleep 2
+                result=$(curl -s --max-time 4 "https://check-host.net/check-result/${req_id}" 2>/dev/null)
+            fi
+
+            if [ -n "$result" ] && [ "$result" != "{}" ]; then
                 if echo "$result" | grep -q '"OK"'; then
                     status="Available"
-                else
+                elif echo "$result" | grep -q '"TIMEOUT"'; then
                     status="Blocked"
                 fi
             fi
@@ -367,11 +426,11 @@ display_ip_list() {
         echo "$status" > "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null
         
         if [[ "$status" == "Available" ]]; then
-            green "  [$idx] $ip  ->  [可用] (大陆未阻断)"
+            green "  [$idx] $ip  ->  [可用] (未发现阻断)"
         elif [[ "$status" == "Blocked" ]]; then
             red "  [$idx] $ip  ->  [被墙] (Argo与CDN回源节点、proxyip依旧有效)"
         else
-            yellow "  [$idx] $ip  ->  [未知] (检测超时)"
+            yellow "  [$idx] $ip  ->  [未知] (API检测超时或节点无响应)"
         fi
         ((idx++))
     done
@@ -6941,7 +7000,7 @@ create_quick_command() {
 if [ -f "$HOME/serv00_nodes.sh" ]; then
     bash "$HOME/serv00_nodes.sh" "$@"
 else
-    bash <(curl -Lks "https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh?t=$(date +%s)") "$@"
+    bash <(curl -Lks "https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh?t=$(date +%s)") "$@"
 fi
 EOF
     
