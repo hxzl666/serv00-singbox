@@ -1831,12 +1831,11 @@ EOF
 # 等待 Psiphon 就绪 (基于 notice 事件及底层系统套接字检测)
 psiphon_wait_ready() {
     local log="$WORKDIR/psiphon.log"
-
-    # FreeBSD 共享机冷启动可能需要较长时间，等待 60 秒
-    local timeout=60
+    local timeout=${1:-30}
+    local is_fast_test=${2:-false}
     local elapsed=0
     
-    yellow "[*] 等待 Psiphon 就绪 (最多 ${timeout} 秒)..."
+    [[ "$is_fast_test" != "true" ]] && yellow "[*] 等待 Psiphon 就绪 (最多 ${timeout} 秒)..."
 
     while (( elapsed < timeout )); do
         # 1) 检查底层系统 Socket 监听 (最快最可靠)
@@ -1844,68 +1843,64 @@ psiphon_wait_ready() {
         sys_port="$(detect_psiphon_port_from_system "$WORKDIR/psiphon.pid")"
         if [[ "$sys_port" =~ ^[0-9]+$ ]] && (( sys_port > 0 )); then
             echo "$sys_port" > "$WORKDIR/psiphon_socks_listen.txt"
-            green "\n[+] Psiphon SOCKS 端口已就绪 (端口: $sys_port)"
+            [[ "$is_fast_test" != "true" ]] && green "\n[+] Psiphon SOCKS 端口已就绪 (端口: $sys_port)"
             return 0
         fi
 
         # 2) 检查端口占用 notice
         if tail -n 200 "$log" 2>/dev/null | grep -q '"noticeType":"SocksProxyPortInUse"'; then
-            red "[!] Psiphon SOCKS 端口被占用"
-            yellow "    如果使用固定端口请换一个，或使用 0 (自动端口)"
+            [[ "$is_fast_test" != "true" ]] && red "[!] Psiphon SOCKS 端口被占用"
             return 2
         fi
 
         # 3) 检查已开始监听 notice (最可靠的就绪信号)
         if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"ListeningSocksProxyPort"'; then
-            # 解析实际端口
             psiphon_update_listen_ports_from_log
             local actual_port
             actual_port="$(get_psiphon_socks_port)"
-            green "\n[+] Psiphon SOCKS 已监听 (端口: $actual_port)"
+            [[ "$is_fast_test" != "true" ]] && green "\n[+] Psiphon SOCKS 已监听 (端口: $actual_port)"
             return 0
         fi
 
         # 4) 检查 Tunnels notice (已建立隧道)
         if tail -n 400 "$log" 2>/dev/null | grep -q '"noticeType":"Tunnels"'; then
             if tail -n 400 "$log" 2>/dev/null | grep '"noticeType":"Tunnels"' | grep -q '"count":[1-9]'; then
-                # 隧道建立，也解析端口
                 psiphon_update_listen_ports_from_log
                 local actual_port
                 actual_port="$(get_psiphon_socks_port)"
-                green "\n[+] Psiphon 隧道已建立 (SOCKS: $actual_port)"
+                [[ "$is_fast_test" != "true" ]] && green "\n[+] Psiphon 隧道已建立 (SOCKS: $actual_port)"
                 return 0
             fi
         fi
 
         # 5) 检查进程是否还活着
         if ! pgrep -x "psiphon-tunnel-core" >/dev/null 2>&1 && ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
-            red "[!] Psiphon 进程已退出"
-            tail -15 "$log" 2>/dev/null
+            [[ "$is_fast_test" != "true" ]] && red "[!] Psiphon 进程已退出"
             return 1
         fi
 
-        sleep 2
-        elapsed=$((elapsed + 2))
-        printf "\r[*] 等待 Psiphon 就绪... %ds/%ds" "$elapsed" "$timeout"
+        sleep 1
+        elapsed=$((elapsed + 1))
+        [[ "$is_fast_test" != "true" ]] && printf "\r[*] 等待 Psiphon 就绪... %ds/%ds" "$elapsed" "$timeout"
     done
 
-    echo
-    yellow "[!] 等待 Psiphon 就绪超时 (${timeout}s)"
-    yellow "    日志里没看到 ListeningSocksProxyPort，但进程可能仍在运行"
-    yellow "    建议稍后使用菜单 11 检测出口 IP"
     # 尝试解析端口
     psiphon_update_listen_ports_from_log
-    # 不返回 1，因为可能只是检测不到 notice 但实际已就绪
+    if [[ "$is_fast_test" == "true" ]]; then
+        return 1
+    fi
     return 0
 }
 
 # 启动 Psiphon (nohup 版本，带 notice 就绪检测)
 start_psiphon_userland() {
+    local custom_timeout=${1:-30}
+    local is_fast_test=${2:-false}
     local bin="$WORKDIR/psiphon-tunnel-core"
     
     # 检查二进制是否存在，不存在则安装
     if [[ ! -x "$bin" ]]; then
-        yellow "[*] Psiphon 二进制不存在，正在安装..."
+        [[ "$is_fast_test" != "true" ]] && yellow "[*] Psiphon 二进制不存在，正在安装..."
         install_psiphon_userland || return 1
     fi
     
@@ -1921,7 +1916,7 @@ start_psiphon_userland() {
     # 清空旧日志 (便于检测新 notice)
     > "$WORKDIR/psiphon.log" 2>/dev/null
 
-    yellow "[*] 启动 Psiphon (SOCKS: 自动端口 127.0.0.1:0)..."
+    [[ "$is_fast_test" != "true" ]] && yellow "[*] 启动 Psiphon (SOCKS: 自动端口 127.0.0.1:0)..."
     cd "$WORKDIR"
     run_detached "$WORKDIR/psiphon.pid" "$WORKDIR/psiphon.log" \
         "$bin" -config "$WORKDIR/psiphon.config"
@@ -1930,27 +1925,28 @@ start_psiphon_userland() {
     pid="$(cat "$WORKDIR/psiphon.pid" 2>/dev/null || echo 0)"
     
     # 给进程一点启动时间
-    sleep 2
+    sleep 1
 
     # 检查进程是否启动 (如果秒退，用前台模式抓错误)
     if ! kill -0 "$pid" 2>/dev/null && ! pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
-        red "[!] Psiphon 秒退，正在抓取前台错误信息..."
-        echo
-        yellow "========== 前台错误输出 (最重要) =========="
-        timeout 10 "$bin" -config "$WORKDIR/psiphon.config" 2>&1 | head -n 60 || true
-        echo
-        yellow "========== 日志文件最后 30 行 =========="
-        tail -30 "$WORKDIR/psiphon.log" 2>/dev/null || true
-        echo "==========================================="
+        if [[ "$is_fast_test" != "true" ]]; then
+            red "[!] Psiphon 秒退，正在抓取前台错误信息..."
+            echo
+            yellow "========== 前台错误输出 (最重要) =========="
+            timeout 10 "$bin" -config "$WORKDIR/psiphon.config" 2>&1 | head -n 60 || true
+            echo
+            yellow "========== 日志文件最后 30 行 =========="
+            tail -30 "$WORKDIR/psiphon.log" 2>/dev/null || true
+            echo "==========================================="
+        fi
         return 1
     fi
 
     # 等待就绪 (基于 notice 检测，并自动解析实际端口)
-    psiphon_wait_ready
+    psiphon_wait_ready "$custom_timeout" "$is_fast_test"
     local ready_status=$?
     
-    if [[ $ready_status -eq 2 ]]; then
-        # 端口被占用
+    if [[ $ready_status -ne 0 ]]; then
         return 1
     fi
 
@@ -1958,9 +1954,9 @@ start_psiphon_userland() {
     local actual_port
     actual_port="$(get_psiphon_socks_port)"
     if [[ "$actual_port" != "0" && -n "$actual_port" ]]; then
-        green "[+] Psiphon 已启动 (SOCKS: 127.0.0.1:${actual_port})"
+        [[ "$is_fast_test" != "true" ]] && green "[+] Psiphon 已启动 (SOCKS: 127.0.0.1:${actual_port})"
     else
-        yellow "[!] Psiphon 已启动，但未能获取实际端口"
+        [[ "$is_fast_test" != "true" ]] && yellow "[!] Psiphon 已启动，但未能获取实际端口"
     fi
     return 0
 }
@@ -2970,54 +2966,61 @@ psiphon_set_region() {
     fi
 }
 
-# 国家可用性检测
+# 国家可用性快速检测 (带极速超时与原出口自动恢复)
 psiphon_country_test() {
     local list=("$@")
     [[ ${#list[@]} -ge 1 ]] || { red "用法: psiphon_country_test US JP SG ..."; return 1; }
 
+    # 记录当前原本的出口国家，测试结束后自动恢复
+    local orig_cc
+    orig_cc="$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null || echo "GB")"
+    [[ -z "$orig_cc" ]] && orig_cc="GB"
+
     local ok=() fail=() mismatch=()
+    local total=${#list[@]}
+    local current=1
 
     for cc in "${list[@]}"; do
         cc="${cc^^}"
         if ! is_supported_psiphon_cc "$cc" || [[ "$cc" == "AUTO" ]]; then
-            red "==> 跳过 $cc (Psiphon 不支持或不能用于国家检测)"
+            red "[$current/$total] ==> 跳过 $cc (Psiphon 不支持或不能用于指定国家检测)"
             fail+=("$cc")
+            ((current++))
             continue
         fi
         local name=$(get_country_name "$cc")
-        yellow "==> 测试 $cc ($name)"
+        yellow "[$current/$total] ==> 正在测试 $cc ($name)..."
         
-        # 切换国家
+        # 切换到测试国家配置并以极速模式启动 (最多等待 6 秒握手)
         echo "$cc" > "$WORKDIR/psiphon_region.txt"
-        start_psiphon_userland >/dev/null 2>&1 || { 
-            red "  [-] FAIL (启动失败)"
+        if ! start_psiphon_userland 6 true >/dev/null 2>&1; then
+            red "  [-] FAIL (握手超时或无可用节点)"
             fail+=("$cc")
+            ((current++))
             continue
-        }
-        
-        # 等待连接
-        sleep 4
+        fi
         
         # 获取实际端口
         local socks
         socks="$(get_psiphon_socks_port)"
         if [[ "$socks" == "0" || -z "$socks" ]]; then
-            red "  [-] FAIL (无法获取端口)"
+            red "  [-] FAIL (无法获取 SOCKS 端口)"
             fail+=("$cc")
+            ((current++))
             continue
         fi
 
-        # 查出口 country
+        # 查出口 country (单次 4 秒超短超时)
         local json got
-        json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null || true)"
-        
+        json="$(curl -fsS --max-time 4 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null || true)"
         if [[ -z "$json" ]]; then
-            json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null || true)"
+            json="$(curl -fsS --max-time 4 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null || true)"
         fi
 
         if [[ -z "$json" ]]; then
-            red "  [-] FAIL (无响应)"
+            red "  [-] FAIL (出口连接超时)"
             fail+=("$cc")
+            ((current++))
             continue
         fi
 
@@ -3037,23 +3040,32 @@ PY
             yellow "  [~] MISMATCH (无 country 字段)"
             mismatch+=("$cc")
         elif [[ "$got" == "$cc" ]]; then
-            green "  [+] OK (出口=$got)"
+            green "  [+] OK (出口确认: $got)"
             ok+=("$cc")
         else
-            yellow "  [~] MISMATCH (期望=$cc 实际=$got)"
+            yellow "  [~] MISMATCH (期望=$cc 实际出口=$got)"
             mismatch+=("$cc")
         fi
+        ((current++))
     done
 
     echo
-    blue "========== 测试结果 =========="
-    green "OK:       ${ok[*]:-无}"
-    red "FAIL:     ${fail[*]:-无}"
-    yellow "MISMATCH: ${mismatch[*]:-无}"
-    echo "=============================="
+    blue "========== 测试结果统计 =========="
+    green "可用国家 (OK):       ${ok[*]:-无} (共 ${#ok[@]} 个)"
+    red   "不可用国家 (FAIL):   ${fail[*]:-无} (共 ${#fail[@]} 个)"
+    yellow "出口不符 (MISMATCH): ${mismatch[*]:-无}"
+    echo "=================================="
     
     # 保存 OK 列表供智能切换使用
     printf '%s\n' "${ok[@]}" > "$WORKDIR/psiphon_ok_countries.txt" 2>/dev/null
+
+    # 自动恢复测试前的出口国家，并重启服务
+    echo
+    yellow "[*] 测试完毕，正在自动恢复原出口国家 ($orig_cc)..."
+    echo "$orig_cc" > "$WORKDIR/psiphon_region.txt"
+    start_psiphon_userland >/dev/null 2>&1
+    sync_psiphon_port_to_singbox >/dev/null 2>&1 || true
+    green "[+] 原出口国家 ($orig_cc) 已恢复正常运行！"
 }
 
 # 测试所有支持国家
