@@ -123,6 +123,138 @@ run_detached() {
 }
 
 
+# ==================== 自动清理与系统自愈维护 ====================
+
+# 深度清理僵尸与孤儿进程 (释放 FreeBSD maxproc 与端口死锁)
+cleanup_zombie_processes() {
+    local me
+    me="$(whoami 2>/dev/null || echo "$USERNAME")"
+    [ -z "$me" ] && return 0
+
+    # 1. 基础已知进程特征清理 (按当前用户过滤)
+    pkill -9 -u "$me" -f "psiphon-tunnel-core" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -x "psiphon-tunnel-core" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -f "psiphon-tunnel" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -f "sing-box" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -x "sing-box" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -f "cloudflared" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -x "cloudflared" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -f "nezha-agent" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -x "nezha-agent" >/dev/null 2>&1 || true
+
+    # 2. 读取记录的随机伪装名精准清理
+    if [ -d "$WORKDIR" ]; then
+        local sb_bin cf_bin nz_bin
+        sb_bin=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+        cf_bin=$(cat "$WORKDIR/cf.txt" 2>/dev/null)
+        nz_bin=$(cat "$WORKDIR/nz.txt" 2>/dev/null)
+        [ -n "$sb_bin" ] && pkill -9 -u "$me" -x "$sb_bin" >/dev/null 2>&1 || true
+        [ -n "$sb_bin" ] && pkill -9 -u "$me" -f "$WORKDIR/$sb_bin" >/dev/null 2>&1 || true
+        [ -n "$cf_bin" ] && pkill -9 -u "$me" -x "$cf_bin" >/dev/null 2>&1 || true
+        [ -n "$cf_bin" ] && pkill -9 -u "$me" -f "$WORKDIR/$cf_bin" >/dev/null 2>&1 || true
+        [ -n "$nz_bin" ] && pkill -9 -u "$me" -x "$nz_bin" >/dev/null 2>&1 || true
+        [ -n "$nz_bin" ] && pkill -9 -u "$me" -f "$WORKDIR/$nz_bin" >/dev/null 2>&1 || true
+    fi
+
+    # 3. 清理 PID 文件中记录但可能已卡死/僵死的旧 PID
+    if [ -d "$WORKDIR" ]; then
+        for pid_file in "$WORKDIR"/*.pid "$WORKDIR"/instances/*/*.pid; do
+            if [ -f "$pid_file" ]; then
+                local old_pid
+                old_pid=$(cat "$pid_file" 2>/dev/null | tr -d ' \r\n')
+                if [[ "$old_pid" =~ ^[0-9]+$ ]]; then
+                    kill -9 "$old_pid" >/dev/null 2>&1 || true
+                fi
+                rm -f "$pid_file" 2>/dev/null
+            fi
+        done
+    fi
+
+    # 4. 端口占用释放 (针对主副节点端口，防止 address already in use)
+    if [ -f "$WORKDIR/ports.txt" ]; then
+        local ports_to_check=()
+        while IFS='=' read -r _ val; do
+            local p=$(echo "$val" | grep -oE '[0-9]+' | head -n1)
+            [ -n "$p" ] && ports_to_check+=("$p")
+        done < "$WORKDIR/ports.txt"
+        
+        for port in "${ports_to_check[@]}"; do
+            [ -z "$port" ] && continue
+            # FreeBSD sockstat
+            if command -v sockstat >/dev/null 2>&1; then
+                sockstat -4 -l -p "$port" 2>/dev/null | awk -v u="$me" '$1==u {print $3}' | while read -r p_id; do
+                    if [[ "$p_id" =~ ^[0-9]+$ ]]; then
+                        kill -9 "$p_id" >/dev/null 2>&1 || true
+                    fi
+                done
+            fi
+            # Linux fuser / lsof
+            if command -v fuser >/dev/null 2>&1; then
+                fuser -k -n tcp "$port" >/dev/null 2>&1 || true
+                fuser -k -n udp "$port" >/dev/null 2>&1 || true
+            elif command -v lsof >/dev/null 2>&1; then
+                lsof -ti :"$port" 2>/dev/null | xargs -r kill -9 >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+}
+
+# 自动清理历史垃圾、过期临时文件与日志安全截断 (防止 512MB 磁盘配额占满)
+cleanup_garbage_and_logs() {
+    [ -d "$WORKDIR" ] || return 0
+
+    # 1. 日志轮转与截断 (单日志超过 512KB 时保留最新 300 行)
+    find "$WORKDIR" -type f -name "*.log" 2>/dev/null | while read -r log_file; do
+        if [ -f "$log_file" ]; then
+            local file_size=0
+            if stat -f%z "$log_file" >/dev/null 2>&1; then
+                file_size=$(stat -f%z "$log_file" 2>/dev/null || echo 0)
+            elif stat -c%s "$log_file" >/dev/null 2>&1; then
+                file_size=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
+            else
+                file_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+            fi
+
+            # 超过 512KB (524288 字节) 自动截断
+            if [ "$file_size" -gt 524288 ] 2>/dev/null; then
+                tail -n 300 "$log_file" > "${log_file}.tmp" 2>/dev/null && mv -f "${log_file}.tmp" "$log_file" 2>/dev/null
+            fi
+        fi
+    done
+
+    # 2. 清理临时测速文件、临时 json/curl/wget 垃圾
+    rm -f "$WORKDIR"/*.tmp "$WORKDIR"/check_* "$WORKDIR"/tmp_* "$WORKDIR"/*.out "$WORKDIR"/test_* 2>/dev/null
+    find "$WORKDIR" -type f -name "ip_status_*.txt" -mtime +1 -delete 2>/dev/null || true
+
+    # 3. 清理废弃的旧版本随机二进制核心 (只保留当前活跃核心与标准系统组件)
+    local cur_sb cur_cf cur_nz
+    cur_sb=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+    cur_cf=$(cat "$WORKDIR/cf.txt" 2>/dev/null)
+    cur_nz=$(cat "$WORKDIR/nz.txt" 2>/dev/null)
+
+    for bin_file in "$WORKDIR"/*; do
+        [ -f "$bin_file" ] || continue
+        local b_name
+        b_name=$(basename "$bin_file")
+        case "$b_name" in
+            *.txt|*.json|*.log|*.pid|*.yaml|*.yml|*.sh|*.bak|instances|proxy_groups|tunnel.json|config.json|"$cur_sb"|"$cur_cf"|"$cur_nz"|"psiphon-tunnel-core"|"sing-box"|"cloudflared"|"nezha-agent"|"jq")
+                continue
+                ;;
+            *)
+                # 若为可执行文件且长度在 5-10 位随机名，判定为旧核心废弃文件并清理
+                if [ -x "$bin_file" ] && [[ ${#b_name} -ge 5 && ${#b_name} -le 10 ]]; then
+                    rm -f "$bin_file" 2>/dev/null
+                fi
+                ;;
+        esac
+    done
+}
+
+# 综合自动系统自愈维护总函数
+auto_system_maintenance() {
+    cleanup_garbage_and_logs
+}
+
 # 初始化目录
 init_directories() {
     devil www add ${USERNAME}.${DOMAIN} php > /dev/null 2>&1
@@ -130,6 +262,8 @@ init_directories() {
     [ -d "$WORKDIR" ] || (mkdir -p "$WORKDIR" && chmod 777 "$WORKDIR")
     [ -d "$KEEP_PATH" ] || mkdir -p "$KEEP_PATH"
     devil binexec on >/dev/null 2>&1
+    # 默认自动清理垃圾与截断大日志
+    auto_system_maintenance
     # 初始化 Psiphon 状态文件 (升级覆盖时自动补齐)
     init_psiphon_state_files
 }
@@ -5921,9 +6055,12 @@ EOF
 
 # 停止所有进程
 stop_all() {
-    yellow "正在停止所有进程..."
+    yellow "正在停止所有进程并深度清理系统资源..."
     
     cd "$WORKDIR" 2>/dev/null || true
+    
+    # 深度清理僵尸进程与孤儿进程 (包括 Psiphon, sing-box, cloudflared, nezha 及端口死锁)
+    cleanup_zombie_processes
     
     # 全量清理 Psiphon 主进程与所有多出口实例
     stop_psiphon_userland
@@ -5942,7 +6079,10 @@ stop_all() {
     [ -n "$CF_BINARY" ] && pkill -9 -f "$WORKDIR/$CF_BINARY" >/dev/null 2>&1 || true
     [ -n "$NZ_BINARY" ] && pkill -9 -f "$WORKDIR/$NZ_BINARY" >/dev/null 2>&1 || true
     
-    green "所有进程已停止并释放系统配额"
+    # 清理历史垃圾与大日志截断
+    cleanup_garbage_and_logs
+    
+    green "所有进程已停止，僵尸进程与残留垃圾已彻底清理并释放系统配额"
 }
 
 # ==================== 节点链接生成 ====================
@@ -6798,7 +6938,11 @@ create_quick_command() {
     
     cat > "$SCRIPT_PATH" <<'EOF'
 #!/bin/bash
-bash <(curl -Ls https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh)
+if [ -f "$HOME/serv00_nodes.sh" ]; then
+    bash "$HOME/serv00_nodes.sh" "$@"
+else
+    bash <(curl -Lks "https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh?t=$(date +%s)") "$@"
+fi
 EOF
     
     chmod +x "$SCRIPT_PATH"
@@ -6845,7 +6989,10 @@ install_nodes() {
         stop_all
     fi
     
-    # 初始化目录
+    # 深度清理旧僵尸进程与残留端口
+    cleanup_zombie_processes
+    
+    # 初始化目录并自动维护垃圾
     init_directories
     
     # 先选择协议 (Serv00需要先知道要几个端口)
@@ -6899,6 +7046,9 @@ EOF
     # 生成并显示链接
     sleep 3
     generate_links
+    
+    # 清理安装产生的临时垃圾
+    cleanup_garbage_and_logs
     
     # 创建快捷命令
     create_quick_command
@@ -9320,6 +9470,8 @@ PYEOF
 
 menu() {
     clear
+    # 默认静默执行自动清理与维护 (清理过期临时垃圾与日志截断)
+    auto_system_maintenance
     echo
     green "============================================================"
     green "  Serv00/Hostuno 多协议节点安装脚本 v${SCRIPT_VERSION}"
