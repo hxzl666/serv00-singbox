@@ -1,269 +1,118 @@
-# Serv00/Hostuno 多协议节点安装脚本
+# Sing-box 多协议极简一键部署脚本 (含 Argo 隧道穿透)
 
-<div align="center">
-
-![FreeBSD](https://img.shields.io/badge/FreeBSD-AB2B28?logo=freebsd&logoColor=white)
-![Shell](https://img.shields.io/badge/Shell_Script-121011?logo=gnu-bash&logoColor=white)
-![Cloudflare](https://img.shields.io/badge/Cloudflare-F38020?logo=cloudflare&logoColor=white)
-![Psiphon](https://img.shields.io/badge/Psiphon-1E90FF?logo=&logoColor=white)
-
-**一键在 Serv00/Hostuno 免费服务器上部署多协议代理节点**
-
-**支持 WARP + Psiphon 赛风出站，解锁流媒体**
-
-</div>
+本脚本参考并精简了社区中复杂的交互式脚本，实现了一键、快速、且可自定义的 Sing-box 节点搭建。通过搭配 Cloudflare Argo 临时隧道和 Nginx 本地反代，实现了在**不使用自有域名和公网开放端口**的情况下，通过 `80` (HTTP) 和 `443` (HTTPS) 端口完美穿透 VMess-WS 和 Trojan-WS。
 
 ---
 
-## 📋 项目简介
+## 🚀 支持协议一览
 
-这是一个专为 **Serv00** 和 **Hostuno** 免费服务器设计的多协议代理节点一键安装脚本。脚本风格参考了 [甬哥(yonggekkk)](https://github.com/yonggekkk/sing-box-yg) 和 [老王(eooce)](https://github.com/eooce/Sing-box) 的优秀项目，整合优化后支持更多协议。
-
----
-
-## ✨ 支持的协议
-
-| 协议 | 状态 | 说明 |
-|------|------|------|
-| **Argo Tunnel** | ✅ 默认启用 | Cloudflare 隧道，支持临时/固定域名 |
-| **VLESS-Reality** | ✅ 默认启用 | 最新 Reality 协议，安全性高 |
-| **VMess-WS** | ✅ 默认启用 | 支持 WebSocket，可配合 CDN |
-| **Trojan-WS** | ⚪ 可选 | Trojan over WebSocket |
-| **Hysteria2** | ✅ 默认启用 | 基于 QUIC 的高速协议 |
-| **TUIC v5** | ✅ 默认启用 | UDP 转发协议，延迟低 |
-| **Shadowsocks-2022** | ⚪ 可选 | 最新 Shadowsocks 协议 |
+| 协议名称                | 传输方式     | TLS 加密       | 直连端口 | 备注说明                             |
+| :---------------------- | :----------- | :------------- | :------- | :----------------------------------- |
+| **VLESS-Reality** | TCP (Vision) | Reality (安全) | 随机分配 | 默认伪装域名为`apple.com`          |
+| **VMess-WS**      | WebSocket    | 无 TLS         | 随机分配 | 支持直连及 Argo 80/443 穿透          |
+| **Trojan-WS-TLS** | WebSocket    | TLS (自签证书) | 随机分配 | 使用`www.bing.com` 自签证书直连    |
+| **Trojan-WS**     | WebSocket    | 无 TLS         | 随机分配 | 仅限本地配合 Argo 隧道使用           |
+| **Hysteria2**     | QUIC         | TLS (自签证书) | 随机分配 | 适合高丢包网络，ALPN 为`h3`        |
+| **TUIC v5**       | QUIC         | TLS (自签证书) | 随机分配 | 默认启用 BBR 拥塞控制，ALPN 为`h3` |
+| **AnyTLS**        | TCP          | TLS (自签证书) | 随机分配 | Sing-box 新内核特色加密协议          |
 
 ---
 
-## 🚀 一键安装 (Serv00 / Hostuno / CT8)
+## 🛠️ Argo 隧道穿透原理
+
+由于 Cloudflare 免费临时隧道（无需注册账号/无需绑定域名）每次仅能启动一个并分配一个随机域名（`*.trycloudflare.com`），本脚本通过在服务器上自动部署轻量级的 **Nginx** 作为本地反向代理：
+
+1. **Nginx** 监听本地的 `8401` 端口。
+2. **Argo 隧道** 将域名的流量全部映射转发至 `127.0.0.1:8401`。
+3. Nginx 根据访问路径分流：
+   - 访问 `/${UUID}-vm` 时：转发给 **VMess-WS**。
+   - 访问 `/${UUID}-tr-argo` 时：转发给 **Trojan-WS**。
+4. **80/443 端口自适应**：
+   - 在客户端通过 HTTP (80 端口) 连接时，Argo 隧道中转普通 WebSocket。
+   - 在客户端通过 HTTPS (443 端口) 连接时，由 Cloudflare 边缘节点终结 TLS，保障了安全性与免除配置证书的便利性。
+
+---
+
+## 📥 安装与运行
+
+在你的 Linux 服务器（支持 Ubuntu, Debian, CentOS 以及 Alpine Linux）上，使用 root 权限执行以下一键部署命令：
 
 ```bash
-bash <(curl -Lks https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh)
 ```
 
-或者使用 wget:
+### 节点选择交互
+
+运行后，终端会进入两步交互：
+
+#### 步骤 1：选择协议节点组合
+
+```text
+==================================================
+          请选择要安装的节点组合
+==================================================
+1. 默认安装全部节点协议 (直接回车)
+2. 自定义选择需要安装的节点协议
+==================================================
+```
+
+- **选择 1**：一键部署全部 6 种协议及 Argo 隧道穿透。
+- **选择 2**：交互式询问，可根据输入 `y/n` 精确开启或关闭特定的网络协议，以减少系统资源占用。
+
+#### 步骤 2：选择端口配置方式
+
+```text
+==================================================
+          请选择端口配置方式
+==================================================
+1. 自动随机端口分配 (20000-60000 范围，直接回车)
+2. 手动为每个选定协议指定固定端口
+3. 指定自定义端口范围并在此范围内随机分配
+==================================================
+```
+
+- **选项 1**：全自动在 `20000-60000` 范围内自动随机分配并确保无冲突。
+- **选项 2**：允许你手动一一为选定的各协议指定具体的网络端口。
+- **选项 3**：你可以指定自定义的端口区间（如 `10000-20000`），脚本会自动在这一范围内为各节点随机分配端口。
+
+---
+
+## 📋 快捷管理工具 sb
+
+安装成功后，系统会默认生成一个快捷管理脚本。在终端的任何路径下，你可以直接输入：
 
 ```bash
-bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh)
+sb
 ```
 
-**安装完成后，使用快捷命令 `sb` 即可快速进入菜单**
+这会弹出一个包含以下选项的快捷管理菜单：
 
----
+1. **查看已配置的节点分享链接**：随时调取并展示 `info.log` 中的所有已选节点链接。
+2. **重启 Sing-box 和 Argo 隧道服务**：一键重启后台进程。
+3. **停止 Sing-box 和 Argo 隧道服务**：关闭当前运行的后台网络协议。
+4. **查看 Argo 隧道实时域名与连接状态**：直接展示并追踪 cloudflared 临时域名的输出与日志。
+5. **修改已搭建节点参数**：允许手动修改已安装协议的监听端口、UUID 等设置。
+6. **配置 Argo 隧道参数**：切换临时/固定隧道，并同步固定域名配置。
+7. **彻底卸载脚本环境**：自动执行卸载逻辑并完全清理残留。
+8. **开启/关闭服务自愈守护任务**：控制定时检查和自动拉起服务。
+9. **查看运行日志**：查看 Sing-box 与 cloudflared 最近运行日志。
+10. **诊断并修复监听/Argo 同步**：修复监听地址，按 cloudflared 远端 ingress 配置同步域名到端口的映射，并重新生成分享链接。
+11. **退出**。
 
-
-
-## 📦 支持平台
-
-- **Serv00** - 波兰免费服务器 (serv00.net)
-- **Hostuno** - Serv00 付费版 (useruno.com)
-- **CT8** - 另一个免费服务器 (ct8.pl)
-
----
-
-## 🔧 功能特性
-
-| 功能 | 说明 |
-|------|------|
-| 多协议支持 | 一键安装多达 7 种代理协议 |
-| Argo 隧道 | 支持临时隧道和固定隧道切换 |
-| **WARP 出站** | 支持 Cloudflare WARP 代理出站，解锁流媒体 |
-| **Psiphon 赛风出站** | 支持 Psiphon 代理出站，32 个国家智能切换 |
-| 自动端口管理 | 自动配置 TCP/UDP 端口 |
-| Reality 支持 | 自动生成 Reality 密钥对 |
-| 订阅链接 | 自动生成 Base64 订阅链接 |
-| 多 IP 支持 | 自动检测可用 IP |
-| 哪吒探针 | 支持 v0 和 v1 版本 |
-| ProxyIP 功能 | Reality 节点可作为 CF Workers 的 ProxyIP |
-| 快捷命令 | 使用 `sb` 快速启动脚本 |
-
----
-
-## 📝 使用说明
-
-### 安装前准备
-
-1. 注册 Serv00/Hostuno 账号
-2. 通过 SSH 连接到服务器
-3. 确保 `devil binexec on` 已开启
-
-### 环境变量配置（可选）
-
-可以在运行脚本前设置以下环境变量实现无交互安装：
+已安装环境也可以直接执行下面的命令刷新 `sb` 工具并运行修复：
 
 ```bash
-# UUID 密码
-export UUID="你的UUID"
-
-# Argo 固定隧道
-export ARGO_DOMAIN="your-tunnel.example.com"
-export ARGO_AUTH="你的Token或JSON"
-
-# 哪吒探针 v0
-export NEZHA_SERVER="nezha.example.com"
-export NEZHA_PORT="5555"
-export NEZHA_KEY="你的密钥"
-
-# 哪吒探针 v1
-export NEZHA_SERVER="nezha.example.com:8008"
-export NEZHA_KEY="你的NZ_CLIENT_SECRET"
-
-# CDN 优选
-export CFIP="www.visa.com.hk"
-export CFPORT="443"
+bash install.sh repair
 ```
 
-### 带环境变量运行示例
+---
+
+## ❌ 卸载环境
+
+如果你需要彻底删除安装的组件、清理所有的服务和配置文件，只需在 `sb` 快捷菜单中选择对应项，或者在服务器上执行以下一键卸载命令：
 
 ```bash
-UUID=你的UUID ARGO_DOMAIN=your.domain.com ARGO_AUTH=你的Token bash <(curl -Ls https://raw.githubusercontent.com/hxzlplp7/serv00-singbox/main/serv00_nodes.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/hxzl666/singbox/main/uninstall.sh)
 ```
 
----
-
-## 📋 菜单选项
-
-| 选项 | 功能 |
-|------|------|
-| 1 | 一键安装多协议节点 |
-| 2 | 卸载删除 |
-| 3 | 重启所有进程 |
-| 4 | 重置 Argo 隧道 |
-| 5 | 查看节点信息 |
-| 6 | 自定义节点组合推送 |
-| 7 | 重置端口 |
-| 8 | 查看运行日志 |
-| 9 | **配置 WARP/Psiphon 出站** |
-| 10 | 系统初始化清理 |
-| 11 | **Psiphon 管理 (国家切换/出口检测)** |
-| 0 | 退出 |
-
----
-
-
-## 📱 客户端配置
-
-### 注意事项
-
-- Hysteria2 和 TUIC 节点需要客户端**跳过证书验证**（设置 `insecure=true`）
-- VMess-WS-Argo 节点可使用 CDN 优选 IP
-- VLESS-Reality 节点不走 CDN
-
-### 推荐客户端
-
-| 平台 | 推荐客户端 |
-|------|-----------|
-| Windows | v2rayN, Clash Verge, Nekoray |
-| macOS | ClashX Meta, Surge, V2rayU |
-| iOS | Shadowrocket, Stash, Loon, Quantumult X |
-| Android | v2rayNG, Clash Meta for Android, NekoBox |
-| Linux | Clash Meta, sing-box |
-
----
-
-## 🔗 节点格式示例
-
-### VLESS-Reality
-```
-vless://uuid@ip:port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=domain&fp=chrome&pbk=publickey&type=tcp#name
-```
-
-### VMess-WS-Argo
-```
-vmess://base64编码的配置
-```
-
-### Hysteria2
-```
-hysteria2://password@ip:port?security=tls&sni=www.bing.com&alpn=h3&insecure=1#name
-```
-
-### TUIC v5
-```
-tuic://uuid:password@ip:port?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#name
-```
-
-### Shadowsocks-2022
-```
-ss://method:password@ip:port#name
-```
-
----
-
-## ⚠️ 注意事项
-
-1. **Serv00 风险提示**: 免费版 Serv00 使用代理脚本有被封号风险，收费版 Hostuno 无此问题
-2. **端口限制**: 每个账号只能开放有限端口（通常 3-4 个）
-3. **不要混用脚本**: 请勿与其他 Serv00 脚本混用
-4. **证书验证**: UDP 协议（Hy2/TUIC）需关闭证书验证
-
----
-
-## 💡 常见问题
-
-### Q: 节点不通怎么办？
-
-1. 检查端口是否正确开放 (`devil port list`)
-2. 尝试重启进程（菜单选项 3）
-3. 尝试重置端口（菜单选项 6）
-4. 检查 IP 是否被墙
-5. 确认客户端已开启跳过证书验证
-
-### Q: Argo 临时域名无法获取？
-
-1. 等待10-15秒后再查看节点信息
-2. 使用菜单选项 4 重置 Argo 隧道
-
-### Q: 如何切换临时/固定隧道？
-
-使用菜单选项 4 进行切换，可以在临时隧道和固定隧道之间自由切换
-
-### Q: 进程自动停止怎么办？
-
-1. 确保安装了保活服务
-2. 检查保活页面是否正常运行
-
-### Q: 什么是 WARP 出站？
-
-WARP 是 Cloudflare 提供的免费 VPN 服务。启用 WARP 出站后，节点的出口流量会通过 Cloudflare 网络，可以：
-- 解锁 Netflix、YouTube 等流媒体
-- 隐藏服务器真实 IP
-- 访问需要非服务器 IP 的服务（如 OpenAI）
-
-脚本支持两种 WARP 模式：
-1. **全部流量** - 所有出站流量都走 WARP
-2. **分流模式** - 仅 Google/YouTube/Netflix/OpenAI 走 WARP，其他直连
-
-### Q: 什么是 Psiphon 赛风出站？
-
-Psiphon 是一个免费的网络穿透工具，支持 32 个国家出口。启用 Psiphon 出站后，节点的出口流量会通过 Psiphon 网络，可以：
-- 选择不同国家的出口 IP（美国、日本、新加坡等）
-- 解锁特定地区的流媒体内容
-- 智能检测可用国家并一键切换
-
-Psiphon 管理菜单（选项 11）提供：
-1. **出口 IP 检测** - 查看当前出口 IP/国家/运营商
-2. **智能切换** - 自动测试可用国家并选择
-3. **国家可用性测试** - 批量测试 OK/FAIL/MISMATCH
-
----
-
-## 🙏 致谢
-
-- [yonggekkk/sing-box-yg](https://github.com/yonggekkk/sing-box-yg) - 甬哥 Sing-box 脚本
-- [eooce/Sing-box](https://github.com/eooce/Sing-box) - 老王 Sing-box 脚本
-- [SagerNet/sing-box](https://github.com/SagerNet/sing-box) - Sing-box 核心
-
----
-
-## 📄 免责声明
-
-本项目仅供学习交流使用，请遵守当地法律法规。使用本脚本所产生的一切后果由使用者自行承担。
-
----
-
-<div align="center">
-
-**如果这个项目对你有帮助，请给一个 Star ⭐**
-
-</div>
+脚本将彻底清理 `/etc/s-box` 目录、卸载 `cloudflared` 隧道客户端、删除 Nginx 对应的反代配置、移除 `sb` 快捷命令，恢复系统守护进程配置（支持 Systemd 与 OpenRC 服务自动清理）。
