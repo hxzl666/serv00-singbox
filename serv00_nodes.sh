@@ -1161,7 +1161,7 @@ optimize_warp_endpoint() {
     return 0
 }
 
-# 更新WARP配置文件中的Endpoint
+# 更新 WARP 配置文件中的 Endpoint 及全套节点属性
 # 参数: $1=IP, $2=端口, $3=restart(可选，传入restart则自动重启)
 update_warp_config() {
     local new_ip="$1"
@@ -1183,61 +1183,107 @@ update_warp_config() {
         fi
     fi
     
-    cd "$WORKDIR"
+    cd "$WORKDIR" 2>/dev/null || return 1
     
     # 备份配置
     cp config.json config.json.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null
     
-    if command -v jq >/dev/null 2>&1; then
-        # 使用 jq 更新
-        local tmp_file=$(mktemp)
-        jq --arg ip "$new_ip" --argjson port "$new_port" '
-            (.outbounds[] | select(.type == "wireguard") | .server) = $ip |
-            (.outbounds[] | select(.type == "wireguard") | .server_port) = $port
-        ' config.json > "$tmp_file" 2>/dev/null
-        
-        if [ -s "$tmp_file" ]; then
-            cat "$tmp_file" > config.json
-            rm -f "$tmp_file"
-            green "配置文件已更新"
-        else
-            rm -f "$tmp_file"
-            yellow "jq更新失败，尝试sed..."
-            sed -i '' 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json 2>/dev/null || \
-            sed -i 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json
-            sed -i '' 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json 2>/dev/null || \
-            sed -i 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json
-            green "配置文件已更新 (sed)"
-        fi
-    else
-        # 使用 sed 替换 (兼容 BSD/GNU)
-        sed -i '' 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json 2>/dev/null || \
-        sed -i 's/"server": "[^"]*"/"server": "'"$new_ip"'"/g' config.json
-        sed -i '' 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json 2>/dev/null || \
-        sed -i 's/"server_port": [0-9]*/"server_port": '"$new_port"'/g' config.json
-        green "配置文件已更新"
+    local warp_ipv6="${WARP_IPV6:-$(cat "$WORKDIR/warp_ipv6.txt" 2>/dev/null || echo "2606:4700:110:8d8d:1845:c39f:2dd5:a03a")}"
+    local warp_private_key="${WARP_PRIVATE_KEY:-$(cat "$WORKDIR/warp_private_key.txt" 2>/dev/null || echo "52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=")}"
+    local warp_reserved="${WARP_RESERVED:-$(cat "$WORKDIR/warp_reserved.txt" 2>/dev/null || echo "[215, 69, 233]")}"
+    
+    yellow "[*] 正在更新 sing-box 配置文件中的 WARP 出站..."
+
+    python3 - <<PY
+import json
+import sys
+
+cfg_path = "config.json"
+new_ip = r"$new_ip"
+new_port = int(r"${new_port:-2408}")
+warp_ipv6 = r"$warp_ipv6"
+warp_private_key = r"$warp_private_key"
+warp_reserved_str = r"$warp_reserved"
+
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[!] 读取 config.json 失败: {e}")
+    sys.exit(1)
+
+outbounds = data.setdefault("outbounds", [])
+route = data.setdefault("route", {})
+rules = route.setdefault("rules", [])
+
+try:
+    warp_reserved = json.loads(warp_reserved_str)
+except Exception:
+    warp_reserved = [215, 69, 233]
+
+warp_tag = "warp-out"
+warp_found = False
+
+for o in outbounds:
+    if o.get("tag") == warp_tag or o.get("type") == "wireguard":
+        o.clear()
+        o.update({
+            "type": "wireguard",
+            "tag": warp_tag,
+            "server": new_ip,
+            "server_port": new_port,
+            "local_address": [
+                "172.16.0.2/32",
+                warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
+            ],
+            "private_key": warp_private_key,
+            "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "reserved": warp_reserved,
+            "mtu": 1280
+        })
+        warp_found = True
+        break
+
+if not warp_found:
+    outbounds.append({
+        "type": "wireguard",
+        "tag": warp_tag,
+        "server": new_ip,
+        "server_port": new_port,
+        "local_address": [
+            "172.16.0.2/32",
+            warp_ipv6 if "/" in warp_ipv6 else f"{warp_ipv6}/128"
+        ],
+        "private_key": warp_private_key,
+        "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+        "reserved": warp_reserved,
+        "mtu": 1280
+    })
+
+# 清理未定义的悬挂 outbound 路由规则并保持副节点规则置顶
+existing_tags = {o.get("tag") for o in outbounds if o.get("tag")}
+rules[:] = [r for r in rules if not r.get("outbound") or r.get("outbound") in existing_tags]
+proxy_rules = [r for r in rules if r.get("outbound", "").endswith("-out") and r.get("outbound") != warp_tag]
+psi_rules = [r for r in rules if r.get("outbound", "").startswith("psiphon-")]
+other_rules = [r for r in rules if r not in proxy_rules and r not in psi_rules]
+rules[:] = proxy_rules + psi_rules + other_rules
+
+try:
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("[+] 配置文件更新完成 (WARP 出站已完整写入)")
+except Exception as e:
+    print(f"[!] 写入配置文件失败: {e}")
+    sys.exit(1)
+PY
+
+    if [ $? -ne 0 ]; then
+        red "[!] 配置文件更新失败"
+        return 1
     fi
     
-    # 重启 sing-box 服务
-    local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
-    if [ -n "$sb_binary" ]; then
-        echo
-        yellow "正在重启 sing-box 服务..."
-        
-        # 停止现有服务
-        pkill -x "$sb_binary" >/dev/null 2>&1
-        sleep 1
-        
-        # 启动服务
-        nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-        sleep 2
-        
-        if pgrep -x "$sb_binary" >/dev/null 2>&1; then
-            green "sing-box 服务重启成功"
-        else
-            red "sing-box 服务启动失败，请检查日志"
-        fi
-    fi
+    # 统一使用 safe 重启函数
+    start_singbox_safe
 }
 
 # 询问是否启用 WARP 出站
@@ -1736,6 +1782,55 @@ start_singbox_safe() {
         return 1
     fi
 
+    # 自动修补悬挂路由规则与缺失的 outbound
+    local warp_ipv6="${WARP_IPV6:-$(cat "$WORKDIR/warp_ipv6.txt" 2>/dev/null || echo "2606:4700:110:8d8d:1845:c39f:2dd5:a03a")}"
+    local warp_pk="${WARP_PRIVATE_KEY:-$(cat "$WORKDIR/warp_private_key.txt" 2>/dev/null || echo "52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=")}"
+    local warp_res="${WARP_RESERVED:-$(cat "$WORKDIR/warp_reserved.txt" 2>/dev/null || echo "[215, 69, 233]")}"
+    local warp_ep="$(get_warp_endpoint 2>/dev/null || echo "162.159.192.1")"
+    local warp_pt="$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null || echo "2408")"
+
+    python3 - <<PY 2>/dev/null
+import json
+cfg = r"$WORKDIR/config.json"
+try:
+    with open(cfg, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    obs = data.setdefault('outbounds', [])
+    route = data.setdefault('route', {})
+    rules = route.setdefault('rules', [])
+    tags = {o.get('tag') for o in obs if o.get('tag')}
+    
+    # 检查是否有规则引用了 warp-out 但 outbounds 缺失该节点
+    need_warp = any(r.get('outbound') == 'warp-out' for r in rules) or route.get('final') == 'warp-out'
+    if need_warp and 'warp-out' not in tags:
+        try: res_arr = json.loads(r'$warp_res')
+        except Exception: res_arr = [215, 69, 233]
+        obs.append({
+            'type': 'wireguard',
+            'tag': 'warp-out',
+            'server': r'$warp_ep',
+            'server_port': int(r'$warp_pt'),
+            'local_address': [
+                '172.16.0.2/32',
+                r'$warp_ipv6' if '/' in r'$warp_ipv6' else f"{r'$warp_ipv6'}/128"
+            ],
+            'private_key': r'$warp_pk',
+            'peer_public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+            'reserved': res_arr,
+            'mtu': 1280
+        })
+        tags.add('warp-out')
+
+    # 清理指向不存在 outbound 的悬挂 rules
+    new_rules = [r for r in rules if not r.get('outbound') or r.get('outbound') in tags]
+    if len(new_rules) != len(rules) or need_warp:
+        route['rules'] = new_rules
+        with open(cfg, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+except Exception:
+    pass
+PY
+
     # 校验配置
     local out
     out="$(cd "$WORKDIR" && "./$SB_BINARY" check -c "$WORKDIR/config.json" 2>&1)" || {
@@ -1954,30 +2049,31 @@ PY
     fi
 }
 
-# 停止 Psiphon
+# 强力清空当前用户所有 psiphon-tunnel 僵尸孤儿进程 (释放 FreeBSD maxproc 限制)
+kill_all_user_psiphon_processes() {
+    local me
+    me="$(whoami 2>/dev/null || echo "$USERNAME")"
+    
+    # 彻底 kill 属于当前用户的所有 psiphon 僵尸进程
+    pkill -9 -u "$me" -f "psiphon-tunnel-core" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -x "psiphon-tunnel-core" >/dev/null 2>&1 || true
+    pkill -9 -u "$me" -f "psiphon-tunnel" >/dev/null 2>&1 || true
+}
+
+# 停止 Psiphon 主进程
 stop_psiphon_userland() {
-    # 优先使用 PID 安全停止 (避免误杀自己目录或多出口实例里的其他进程)
     local pid_file="$WORKDIR/psiphon.pid"
     if [[ -f "$pid_file" ]]; then
         local pid=$(cat "$pid_file" 2>/dev/null)
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
             sleep 1
         fi
+        rm -f "$pid_file" 2>/dev/null
     fi
     
-    # 兜底清理：使用 pgrep 查找所有名为 psiphon-tunnel-core 的进程，并通过 ps 精确检定其参数
-    # 适配 FreeBSD 等对 pkill/pgrep 参数长度有 15 字符截断限制的系统
-    if command -v pgrep >/dev/null 2>&1; then
-        for pid in $(pgrep -x "psiphon-tunnel-core" 2>/dev/null || pgrep "psiphon-tunnel"); do
-            # 获取该 PID 的完整启动命令
-            local cmd
-            cmd=$(ps -o args= -p "$pid" 2>/dev/null)
-            if echo "$cmd" | grep -q "/psiphon.config"; then
-                kill -9 "$pid" 2>/dev/null || true
-            fi
-        done
-    fi
+    # 强力清理属于主目录 psiphon.config 的孤儿进程
+    kill_all_user_psiphon_processes
     sleep 1
 }
 
@@ -2573,9 +2669,21 @@ psiphon_egress_test() {
     yellow "[*] 正在检测 Psiphon 出口 IP..."
     
     # 检查 Psiphon 是否在运行
-    local psi_pid
-    psi_pid="$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)"
-    if [[ -z "$psi_pid" ]] || ! kill -0 "$psi_pid" 2>/dev/null; then
+    local is_running=false
+    if [[ -f "$WORKDIR/psiphon.pid" ]]; then
+        local psi_pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
+        if [[ -n "$psi_pid" ]] && kill -0 "$psi_pid" 2>/dev/null; then
+            is_running=true
+        fi
+    fi
+    if [[ "$is_running" == "false" ]]; then
+        if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1 || pgrep -x "psiphon-tunnel-core" >/dev/null 2>&1; then
+            is_running=true
+        elif [[ -n "$(detect_psiphon_port_from_system "$WORKDIR/psiphon.pid")" ]]; then
+            is_running=true
+        fi
+    fi
+    if [[ "$is_running" == "false" ]]; then
         red "[!] 全局 Psiphon 进程未运行"
         return 1
     fi
@@ -2921,6 +3029,9 @@ route = data.setdefault("route", {})
 rules = route.setdefault("rules", [])
 
 gb_out_tag = "psiphon-gb-out"
+gb_in_tag = "hy2-psiphon-gb-in"
+
+# 1. 配置赛风 GB SOCKS5 出站
 outbound_found = False
 for o in outbounds:
     if o.get("tag") == gb_out_tag:
@@ -2930,7 +3041,8 @@ for o in outbounds:
             "tag": gb_out_tag,
             "server": "127.0.0.1",
             "server_port": socks_port,
-            "version": "5"
+            "version": "5",
+            "network": "tcp"
         })
         outbound_found = True
         break
@@ -2940,37 +3052,21 @@ if not outbound_found:
         "tag": gb_out_tag,
         "server": "127.0.0.1",
         "server_port": socks_port,
-        "version": "5"
+        "version": "5",
+        "network": "tcp"
     })
 
 hy2_port = 0
 main_uuid = "secret"
 
-# 移除历史残留的不合规 inbound (如果有)
-inbounds[:] = [ib for ib in inbounds if ib.get("tag") != "hy2-psiphon-gb-in"]
-
-# 在现有的 Hysteria2 入站中加入 gb_user 实现端口全复用
+# 找到主 Hysteria2 入站的端口与 UUID
 for ib in inbounds:
     if ib.get("type") == "hysteria2":
         if not hy2_port and ib.get("listen_port"):
             hy2_port = ib["listen_port"]
-        users = ib.setdefault("users", [])
+        users = ib.get("users", [])
         if users:
             main_uuid = users[0].get("password", "secret")
-            users[0]["name"] = "main_user"
-            gb_pwd = f"{main_uuid}-gb"
-            has_gb_user = False
-            for u in users:
-                if u.get("name") == "gb_user" or u.get("password") == gb_pwd:
-                    u["name"] = "gb_user"
-                    u["password"] = gb_pwd
-                    has_gb_user = True
-                    break
-            if not has_gb_user:
-                users.append({
-                    "name": "gb_user",
-                    "password": gb_pwd
-                })
 
 if hy2_port == 0:
     print("[!] 未找到主 Hysteria2 入站配置")
@@ -2978,17 +3074,33 @@ if hy2_port == 0:
 
 gb_uuid = f"{main_uuid}-gb"
 
-# 在 rules 顶部添加用户路由规则 (gb_user -> psiphon-gb-out)
-rules[:] = [r for r in rules if not (isinstance(r.get("user"), list) and "gb_user" in r["user"])]
+# 2. 为 GB 英国节点建立专属独立 Inbound (确保端口与路由 100% 绑定匹配)
+inbounds[:] = [ib for ib in inbounds if ib.get("tag") != gb_in_tag]
+inbounds.append({
+    "type": "hysteria2",
+    "tag": gb_in_tag,
+    "listen": "::",
+    "listen_port": hy2_port,
+    "users": [{"password": gb_uuid}],
+    "tls": {
+        "enabled": True,
+        "alpn": ["h3"],
+        "certificate_path": "cert.pem",
+        "key_path": "private.key"
+    }
+})
+
+# 3. 在 rules 顶部添加极其可靠的 inbound 专属路由规则 (hy2-psiphon-gb-in -> psiphon-gb-out)
+rules[:] = [r for r in rules if r.get("outbound") != gb_out_tag]
 rules.insert(0, {
-    "user": ["gb_user"],
+    "inbound": [gb_in_tag],
     "outbound": gb_out_tag
 })
 
 try:
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print("[+] 英国 Psiphon 端口复用 Hy2 节点 JSON 修改成功")
+    print("[+] 英国 Psiphon 复用 Hy2 节点 JSON 路由修改成功 (inbound->outbound 已精准挂载)")
 except Exception as e:
     print(f"[!] 写入配置失败: {e}")
     sys.exit(1)
@@ -3034,7 +3146,10 @@ psiphon_management_menu() {
         clear
         echo
         green "============================================================"
-        green "  Psiphon 出站管理"
+        green "  【副节点】Psiphon 赛风出站多出口管理"
+        green "============================================================"
+        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站走赛风对应国家"
+        yellow "        与主节点完全平行独立，互不干扰"
         green "============================================================"
         echo
         
@@ -3320,6 +3435,10 @@ start_psiphon_instance() {
     
     # 停止旧进程
     stop_psiphon_instance "$cc"
+    
+    # 清理历史数据锁目录 (防止 datastore open timeout 死锁)
+    rm -rf "$instance_dir/psiphon-data" 2>/dev/null
+    mkdir -p "$instance_dir/psiphon-data" 2>/dev/null
     
     # 清空旧日志
     > "$instance_dir/psiphon.log" 2>/dev/null
@@ -5014,7 +5133,40 @@ EOF
     # 保存SS密码
     echo "$SS_PASSWORD" > "$WORKDIR/ss_password.txt"
     
-    green "配置文件已生成"
+    # 自动恢复挂载所有已配置的副节点 (赛风多出口组与自定义代理组，确保主副节点互不丢失)
+    sync_all_secondary_nodes
+    
+    green "主节点基础配置已生成，已完成副节点平行合并"
+}
+
+# ==================== 副节点平行合并同步函数 ====================
+# 同步所有副节点 (赛风多出口组 + 自定义代理组) 到 sing-box 配置
+sync_all_secondary_nodes() {
+    local cfg="$WORKDIR/config.json"
+    [[ -f "$cfg" ]] || return 0
+
+    # 1. 恢复赛风多出口副节点
+    if [[ -f "$WORKDIR/egress_node_groups.txt" ]] && [[ -s "$WORKDIR/egress_node_groups.txt" ]]; then
+        local psi_groups
+        psi_groups="$(cat "$WORKDIR/egress_node_groups.txt" 2>/dev/null)"
+        IFS=',' read -ra cc_arr <<< "$psi_groups"
+        for cc in "${cc_arr[@]}"; do
+            cc="$(echo "$cc" | tr '[:upper:]' '[:lower:]' | xargs)"
+            [[ -z "$cc" ]] && continue
+            local vless_p=$(cat "$PSI_INSTANCES_DIR/${cc^^}/vless_port.txt" 2>/dev/null || echo "0")
+            local hy2_p=$(cat "$PSI_INSTANCES_DIR/${cc^^}/hy2_port.txt" 2>/dev/null || echo "0")
+            local tuic_p=$(cat "$PSI_INSTANCES_DIR/${cc^^}/tuic_port.txt" 2>/dev/null || echo "0")
+            local psi_p=$(get_instance_socks_port "${cc^^}")
+            if [[ -n "$psi_p" && "$psi_p" != "0" ]]; then
+                sync_egress_group_to_singbox "${cc^^}" "$vless_p" "$hy2_p" "$tuic_p" "$psi_p" >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+
+    # 2. 恢复自定义代理副节点
+    if [[ -d "$PROXY_GROUPS_DIR" ]]; then
+        sync_all_proxy_groups >/dev/null 2>&1 || true
+    fi
 }
 
 # ==================== 全量端口重置 (核武器级回退) ====================
@@ -5771,21 +5923,26 @@ EOF
 stop_all() {
     yellow "正在停止所有进程..."
     
-    cd "$WORKDIR"
+    cd "$WORKDIR" 2>/dev/null || true
+    
+    # 全量清理 Psiphon 主进程与所有多出口实例
+    stop_psiphon_userland
+    stop_all_psiphon_instances 2>/dev/null || true
+    kill_all_user_psiphon_processes
+
     SB_BINARY=$(cat sb.txt 2>/dev/null)
     CF_BINARY=$(cat cf.txt 2>/dev/null)
     NZ_BINARY=$(cat nz.txt 2>/dev/null)
     
-    [ -n "$SB_BINARY" ] && pkill -x "$SB_BINARY" >/dev/null 2>&1
-    [ -n "$CF_BINARY" ] && pkill -x "$CF_BINARY" >/dev/null 2>&1
-    [ -n "$NZ_BINARY" ] && pkill -x "$NZ_BINARY" >/dev/null 2>&1
+    [ -n "$SB_BINARY" ] && pkill -9 -x "$SB_BINARY" >/dev/null 2>&1
+    [ -n "$CF_BINARY" ] && pkill -9 -x "$CF_BINARY" >/dev/null 2>&1
+    [ -n "$NZ_BINARY" ] && pkill -9 -x "$NZ_BINARY" >/dev/null 2>&1
     
-    # 精确兜底: 用工作目录路径匹配，避免误杀其他用户的同名进程
-    [ -n "$SB_BINARY" ] && pkill -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || true
-    [ -n "$CF_BINARY" ] && pkill -f "$WORKDIR/$CF_BINARY" >/dev/null 2>&1 || true
-    [ -n "$NZ_BINARY" ] && pkill -f "$WORKDIR/$NZ_BINARY" >/dev/null 2>&1 || true
+    [ -n "$SB_BINARY" ] && pkill -9 -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || true
+    [ -n "$CF_BINARY" ] && pkill -9 -f "$WORKDIR/$CF_BINARY" >/dev/null 2>&1 || true
+    [ -n "$NZ_BINARY" ] && pkill -9 -f "$WORKDIR/$NZ_BINARY" >/dev/null 2>&1 || true
     
-    green "所有进程已停止"
+    green "所有进程已停止并释放系统配额"
 }
 
 # ==================== 节点链接生成 ====================
@@ -6118,7 +6275,7 @@ generate_links() {
 }
 
 
-# 显示链接
+# 显示主节点链接
 show_links() {
     if [ -f "$WORKDIR/list.txt" ]; then
         # 显示WARP状态
@@ -6128,23 +6285,65 @@ show_links() {
         if [[ "$warp_status" == "true" ]]; then
             if [[ "$warp_mode" == "all" ]]; then
                 blue "╔════════════════════════════════════════════╗"
-                blue "║  WARP 出站: ✓ 已启用 (全部流量)            ║"
+                blue "║  主节点出站: ✓ WARP 全局出站 (全部流量)     ║"
                 blue "╚════════════════════════════════════════════╝"
             else
                 blue "╔════════════════════════════════════════════╗"
-                blue "║  WARP 出站: ✓ 已启用 (Google/YouTube/Netflix/OpenAI) ║"
+                blue "║  主节点出站: ✓ WARP 分流出站 (流媒体/指定域名)║"
                 blue "╚════════════════════════════════════════════╝"
             fi
         else
-            purple "╔════════════════════════════════════════════╗"
-            purple "║  WARP 出站: ✗ 未启用 (直连)               ║"
-            purple "╚════════════════════════════════════════════╝"
+            green "╔════════════════════════════════════════════╗"
+            green "║  主节点出站: ✓ 直连出站 (Direct 原生直连)   ║"
+            green "╚════════════════════════════════════════════╝"
         fi
         echo
         cat "$WORKDIR/list.txt"
     else
-        red "未找到节点信息，请先安装"
+        red "未找到主节点信息，请先安装"
     fi
+}
+
+# 查看全部节点信息总览 (主节点 + 副节点分类汇总)
+show_all_nodes_summary() {
+    clear
+    echo
+    green "============================================================"
+    green "  全部节点信息总览 (主节点与副节点分类汇总)"
+    green "============================================================"
+    echo
+    
+    # 1. 主节点信息
+    purple "【一、主节点列表 (多协议主节点群)】"
+    show_links
+    echo
+    
+    # 2. 副节点 - 赛风出站节点组
+    purple "【二、副节点 - 赛风出站多出口节点组】"
+    local psi_groups=($(get_egress_node_groups 2>/dev/null))
+    if [[ ${#psi_groups[@]} -gt 0 ]]; then
+        for cc in "${psi_groups[@]}"; do
+            generate_egress_node_links "$cc"
+        done
+    else
+        yellow "  (当前未配置赛风副节点出口组)"
+    fi
+    echo
+    
+    # 3. 副节点 - 自定义代理出站节点组
+    purple "【三、副节点 - 自定义代理出站多出口节点组】"
+    init_proxy_groups_dir
+    local proxy_tags
+    mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
+    if [[ ${#proxy_tags[@]} -gt 0 ]]; then
+        for tag in "${proxy_tags[@]}"; do
+            generate_proxy_group_links "$tag"
+        done
+    else
+        yellow "  (当前未配置自定义代理副节点组)"
+    fi
+    echo
+    green "============================================================"
 }
 
 # ==================== 自定义节点推送 ====================
@@ -6152,7 +6351,7 @@ show_links() {
 # 自定义选择节点组合推送
 custom_push_nodes() {
     if [ ! -f "$WORKDIR/links.txt" ]; then
-        red "未找到节点信息，请先安装"
+        red "未找到节点信息，请先安装主节点"
         return 1
     fi
     
@@ -6732,71 +6931,75 @@ uninstall_nodes() {
     green "卸载完成！"
 }
 
-# 重启进程
+# 重启所有服务 (主节点 + 赛风多实例 + 自定义代理)
 restart_processes() {
     # 加载已保存的配置 (确保端口/UUID/协议等变量可用)
     load_saved_config
-    yellow "正在重启所有进程..."
+    yellow "正在重启所有服务 (主节点 + 副节点)..."
     
     stop_all
     sleep 2
     
     cd "$WORKDIR"
     
-    # 主动检测所有端口在 3 个 IP 上的可用性，提前修复不可用端口
-    # 原理：同一个端口在主 IP 上可用不代表在其他 IP 上也可用；
-    #       如果重启前不检查，sing-box 可能因为另两个 IP 的端口被占用而启动失败
-    yellow "检测所有端口在多IP上的可用性..."
+    # 1. 主节点端口检测与修复
+    yellow "[1/5] 检测所有端口在多IP上的可用性..."
     auto_repair_conflicting_ports
     local repair_rc=$?
     if [[ $repair_rc -eq 0 ]]; then
-        yellow "已修复端口冲突 (旧端口已删除，新端口在对应 IP 上均可绑定)，配置已重新生成"
+        yellow "已修复端口冲突，主节点与副节点配置已重新同步"
     elif [[ $repair_rc -eq 1 ]]; then
-        green "所有端口在对应 IP 上均可用，无需修复"
-        # 强制重新生成干净的基础 config.json (擦除历史损坏文件)
+        green "所有端口在对应 IP 上均可用"
         generate_singbox_config 2>/dev/null || true
     else
-        red "[!] 端口修复/重置失败 (exit=$repair_rc)，配置可能已损坏，请手动检查后重试"
-        return 1
+        red "[!] 端口检测异常，尝试重新生成基础配置"
+        generate_singbox_config 2>/dev/null || true
     fi
     
-    # 重启 Psiphon 实例 (如果启用)
-    local psi_enabled
-    psi_enabled="$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null || echo "false")"
-    if [[ "$psi_enabled" == "true" ]]; then
-        yellow "重启 Psiphon 实例..."
-        start_psiphon_userland 2>/dev/null || true
-        # 重启各出口实例
-        if [[ -f "$WORKDIR/egress_node_groups.txt" ]]; then
-            local groups
-            groups="$(cat "$WORKDIR/egress_node_groups.txt" 2>/dev/null)"
-            IFS=',' read -ra cc_arr <<< "$groups"
-            for cc in "${cc_arr[@]}"; do
-                cc="$(echo "$cc" | xargs)"
-                [[ -z "$cc" ]] && continue
-                start_psiphon_instance "$cc" 2>/dev/null || true
-            done
-        fi
-        sleep 3
-        # 同步 Psiphon 端口到 sing-box 配置
+    # 2. 重启副节点 - 赛风多出口实例 (如果有配置)
+    if [[ -f "$WORKDIR/egress_node_groups.txt" && -s "$WORKDIR/egress_node_groups.txt" ]]; then
+        yellow "[2/5] 重启副节点: 赛风多出口后台实例..."
+        local groups
+        groups="$(cat "$WORKDIR/egress_node_groups.txt" 2>/dev/null)"
+        IFS=',' read -ra cc_arr <<< "$groups"
+        local inst_count=0
+        for cc in "${cc_arr[@]}"; do
+            cc="$(echo "$cc" | xargs)"
+            [[ -z "$cc" ]] && continue
+            if (( inst_count >= 3 )); then
+                yellow "[!] 提示: 已限制并发 Psiphon 后台实例数 (最多 3 个)"
+                break
+            fi
+            start_psiphon_instance "$cc" 2>/dev/null || true
+            ((inst_count++))
+        done
+        sleep 2
         sync_all_psiphon_ports
+    else
+        yellow "[2/5] 未检测到赛风多出口副节点，跳过"
     fi
     
+    # 3. 同步副节点 - 自定义代理分组配置到 sing-box
+    yellow "[3/5] 同步副节点: 自定义代理出站多出口配置..."
+    sync_all_proxy_groups
+    
+    # 4. 启动 sing-box 主服务
+    yellow "[4/5] 启动 sing-box 核心服务..."
     start_singbox
     
+    # 5. 启动主节点 Argo 隧道与 Nezha 探针
+    yellow "[5/5] 启动 Argo 隧道与监控探针..."
     ARGO_AUTH=$(cat ARGO_AUTH.log 2>/dev/null)
     ARGO_DOMAIN=$(cat ARGO_DOMAIN.log 2>/dev/null)
-    
     if [[ "$ENABLE_ARGO" == "true" ]]; then
         start_argo
     fi
-    
     start_nezha
     
     sleep 3
     generate_links
     
-    green "重启完成！"
+    green "所有服务重启完成！(主节点与副节点均已就绪)"
 }
 
 # 重置Argo
@@ -7101,85 +7304,71 @@ view_logs_menu() {
 }
 
 # 配置WARP出站 (安装后修改 - 保留现有节点)
+# ==================== 主节点出站管理 ====================
+# 仅控制【主节点】流量的出站方式 (直连出站 / WARP全局出站 / WARP分流出站)
+# 副节点 (赛风多出口、自定义代理出站) 为独立平行系统，拥有独立入站端口与专属路由，绝不受此设置影响
 configure_warp_outbound() {
     clear
     echo
     green "============================================================"
-    green "  WARP / Psiphon 出站配置"
+    green "  主节点出站管理 (直连出站 / WARP 出站)"
     green "============================================================"
+    yellow "  说明: 本设置仅作用于【主节点】入站流量"
+    yellow "        副节点(赛风出站、自定义代理出站)为独立平行系统，不受影响"
+    echo "============================================================"
     
     if [ ! -f "$WORKDIR/config.json" ]; then
-        red "未检测到安装，请先安装节点"
+        red "未检测到安装，请先安装主节点"
         return 1
     fi
     
     cd "$WORKDIR"
     
-    # 显示当前状态
+    # 显示当前主节点出站状态
     local current_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
     local current_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
     local current_endpoint=$(cat "$WORKDIR/warp_best_endpoint.txt" 2>/dev/null)
     local current_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
     
     echo
-    purple "当前状态:"
+    purple "当前主节点出站状态:"
     if [[ "$current_status" == "true" ]]; then
         if [[ "$current_mode" == "all" ]]; then
-            blue "  WARP: 已启用 (全部流量)"
+            blue "  主节点出站模式: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
         else
-            blue "  WARP: 已启用 (Google/YouTube 分流)"
+            blue "  主节点出站模式: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI 走 WARP)"
         fi
         
         # 显示当前 Endpoint
         if [ -n "$current_endpoint" ]; then
-            green "  Endpoint: ${current_endpoint}:${current_port:-2408}"
+            green "  WARP Endpoint: ${current_endpoint}:${current_port:-2408}"
         else
-            yellow "  Endpoint: 默认 (未优选)"
+            yellow "  WARP Endpoint: 默认 (未优选)"
         fi
     else
-        yellow "  WARP: 未启用 (直连)"
-    fi
-    
-    # 显示 Psiphon 状态
-    local psi_status=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
-    local psi_mode=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null)
-    if [[ "$psi_status" == "true" ]]; then
-        if [[ "$psi_mode" == "all" ]]; then
-            purple "  Psiphon: 已启用 (全部流量)"
-        elif [[ "$psi_mode" == "google_warp" ]]; then
-            purple "  Psiphon: 已启用 (赛风分流 + 普通流量走 WARP)"
-        else
-            purple "  Psiphon: 已启用 (分流模式)"
-        fi
-    else
-        purple "  Psiphon: 未启用"
+        green "  主节点出站模式: ✓ 直连出站 (Direct 原生直连)"
     fi
     
     echo
     echo "------------------------------------------------------------"
-    yellow "  0. 不使用 WARP (直连)"
-    yellow "  1. 全部流量走 WARP"
-    yellow "  2. 仅 Google/YouTube 走 WARP (分流)"
+    yellow "  0. 主节点 - 直连出站 (Direct, 恢复原生出站)"
+    yellow "  1. 主节点 - WARP 全局出站 (全部主节点流量走 WARP)"
+    yellow "  2. 主节点 - WARP 分流出站 (仅 Google/YouTube/Netflix/OpenAI)"
     echo "------------------------------------------------------------"
-    green "  3. 优选 Endpoint IP (优化连接质量)"
-    blue "  4. 恢复 Cloudflare 默认 Endpoint"
-    blue "  5. 重新获取勇哥API配置"
+    green  "  3. 优选 WARP Endpoint IP (优化连接质量与延迟)"
+    blue   "  4. 恢复 Cloudflare 默认 Endpoint"
+    blue   "  5. 重新获取勇哥 WARP API 配置"
+    green  "  6. 检测主节点 WARP 出口 IP"
     echo "------------------------------------------------------------"
-    purple "  6. Psiphon 全局出站"
-    purple "  7. Psiphon 分流出站 (Google/OpenAI/Netflix)"
-    purple "  8. 赛风出站 + 普通流量走 WARP (混合分流)"
-    purple "  9. 关闭 Psiphon"
-    echo "------------------------------------------------------------"
-    green " 10. 检测 WARP 出口 IP"
-    yellow " 11. 返回主菜单"
+    red    "  7. 返回主菜单"
     echo "============================================================"
-    reading "请选择 [0-11]: " new_choice
+    reading "请选择 [0-7]: " new_choice
     
-    if [[ "$new_choice" == "11" ]]; then
+    if [[ "$new_choice" == "7" || "$new_choice" == "" ]]; then
         return 0
     fi
     
-    if [[ "$new_choice" == "10" ]]; then
+    if [[ "$new_choice" == "6" ]]; then
         warp_egress_test
         echo
         reading "按回车键继续..." temp
@@ -7228,12 +7417,15 @@ configure_warp_outbound() {
             green "  IPv6: $WARP_IPV6"
             green "  Reserved: $WARP_RESERVED"
             
+            # 落盘保存最新获取的凭据，防止后方读到旧文件
+            echo "$WARP_PRIVATE_KEY" > "$WORKDIR/warp_private_key.txt"
+            echo "$WARP_IPV6" > "$WORKDIR/warp_ipv6.txt"
+            echo "$WARP_RESERVED" > "$WORKDIR/warp_reserved.txt"
+            
             # 重新生成配置
             reading "是否重新生成配置文件? [Y/n]: " regen
             if [[ ! "$regen" =~ ^[Nn]$ ]]; then
-                # 需要重新生成整个outbounds部分
                 yellow "正在更新配置文件..."
-                # 这里调用configure函数重新生成
                 local warp_endpoint=$(get_warp_endpoint)
                 local warp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
                 warp_port=${warp_port:-2408}
@@ -7307,7 +7499,7 @@ configure_warp_outbound() {
                 WARP_MODE="all"
                 echo "true" > "$WORKDIR/warp_enabled.txt"
                 echo "all" > "$WORKDIR/warp_mode.txt"
-                green "已选择: 全部流量通过 WARP"
+                green "已选择: 主节点全部流量通过 WARP 出站"
             else
                 red "WARP 配置获取失败"
                 return 1
@@ -7319,7 +7511,7 @@ configure_warp_outbound() {
                 WARP_MODE="google"
                 echo "true" > "$WORKDIR/warp_enabled.txt"
                 echo "google" > "$WORKDIR/warp_mode.txt"
-                green "已选择: Google/YouTube 通过 WARP"
+                green "已选择: 主节点 Google/YouTube/Netflix/OpenAI 通过 WARP 出站"
             else
                 red "WARP 配置获取失败"
                 return 1
@@ -7330,135 +7522,7 @@ configure_warp_outbound() {
             WARP_MODE=""
             echo "false" > "$WORKDIR/warp_enabled.txt"
             echo "" > "$WORKDIR/warp_mode.txt"
-            # 同时关闭 Psiphon
-            stop_psiphon_userland
-            echo "false" > "$WORKDIR/psiphon_enabled.txt"
-            green "已选择: 直连 (不使用 WARP/Psiphon)"
-            ;;
-        6)
-            # Psiphon 全局出站
-            yellow "正在配置 Psiphon 全局出站..."
-            # 关闭 WARP
-            WARP_ENABLED=false
-            echo "false" > "$WORKDIR/warp_enabled.txt"
-            echo "" > "$WORKDIR/warp_mode.txt"
-            
-            if apply_egress_mode_psiphon "all"; then
-                echo "true" > "$WORKDIR/psiphon_enabled.txt"
-                echo "all" > "$WORKDIR/psiphon_mode.txt"
-                
-                # 重启 sing-box
-                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
-                if [ -n "$sb_binary" ]; then
-                    yellow "正在重启 sing-box..."
-                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
-                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
-                    sleep 1
-                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-                    sleep 2
-                    if pgrep -x "$sb_binary" > /dev/null; then
-                        green "✓ Psiphon 全局出站已启用"
-                    else
-                        red "sing-box 重启失败"
-                    fi
-                fi
-            else
-                red "Psiphon 配置失败"
-            fi
-            return 0
-            ;;
-        7)
-            # Psiphon 分流出站
-            yellow "正在配置 Psiphon 分流出站..."
-            # 关闭 WARP
-            WARP_ENABLED=false
-            echo "false" > "$WORKDIR/warp_enabled.txt"
-            echo "" > "$WORKDIR/warp_mode.txt"
-            
-            if apply_egress_mode_psiphon "google"; then
-                echo "true" > "$WORKDIR/psiphon_enabled.txt"
-                echo "google" > "$WORKDIR/psiphon_mode.txt"
-                
-                # 重启 sing-box
-                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
-                if [ -n "$sb_binary" ]; then
-                    yellow "正在重启 sing-box..."
-                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
-                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
-                    sleep 1
-                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-                    sleep 2
-                    if pgrep -x "$sb_binary" > /dev/null; then
-                        green "✓ Psiphon 分流出站已启用 (Google/OpenAI/Netflix)"
-                    else
-                        red "sing-box 重启失败"
-                    fi
-                fi
-            else
-                red "Psiphon 配置失败"
-            fi
-            return 0
-            ;;
-        8)
-            # Psiphon + WARP 混合分流出站
-            yellow "正在配置 Psiphon 分流 + 普通流量走 WARP 模式..."
-            # 开启并初始化 WARP 变量以供后续脚本使用
-            if init_warp_config; then
-                WARP_ENABLED=true
-                WARP_MODE="all"
-                echo "true" > "$WORKDIR/warp_enabled.txt"
-                echo "all" > "$WORKDIR/warp_mode.txt"
-            else
-                red "WARP 配置失败，但将继续配置赛风..."
-            fi
-            
-            if apply_egress_mode_psiphon "google_warp"; then
-                echo "true" > "$WORKDIR/psiphon_enabled.txt"
-                echo "google_warp" > "$WORKDIR/psiphon_mode.txt"
-                
-                # 重启 sing-box
-                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
-                if [ -n "$sb_binary" ]; then
-                    yellow "正在重启 sing-box..."
-                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
-                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
-                    sleep 1
-                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-                    sleep 2
-                    if pgrep -x "$sb_binary" > /dev/null; then
-                        green "✓ 混合分流模式已启用 (赛风出站 + 普通流量走 WARP)"
-                    else
-                        red "sing-box 重启失败"
-                    fi
-                fi
-            else
-                red "配置 Psiphon 混合出站失败"
-            fi
-            return 0
-            ;;
-        9)
-            # 关闭 Psiphon
-            yellow "正在关闭 Psiphon..."
-            if disable_psiphon_egress; then
-                # 重启 sing-box
-                local sb_binary=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
-                if [ -n "$sb_binary" ]; then
-                    yellow "正在重启 sing-box..."
-                    pkill -x "$sb_binary" >/dev/null 2>&1 || true
-                    pkill -f "$WORKDIR/$sb_binary" >/dev/null 2>&1 || true
-                    sleep 1
-                    nohup ./"$sb_binary" run -c config.json >>"$WORKDIR/singbox.log" 2>&1 &
-                    sleep 2
-                    if pgrep -x "$sb_binary" > /dev/null; then
-                        green "✓ Psiphon 已关闭，恢复直连"
-                    else
-                        red "sing-box 重启失败"
-                    fi
-                fi
-            else
-                red "关闭 Psiphon 失败"
-            fi
-            return 0
+            green "已选择: 主节点直连出站 (Direct)"
             ;;
         *)
             red "无效选项"
@@ -7467,7 +7531,7 @@ configure_warp_outbound() {
     esac
     
     echo
-    yellow "正在修改配置文件 (保留现有节点)..."
+    yellow "正在修改配置文件 (严格保持副节点配置与路由隔离)..."
     
     # 备份原配置
     cp config.json config.json.bak.$(date +%Y%m%d%H%M%S)
@@ -7513,11 +7577,17 @@ inbounds = data.setdefault("inbounds", [])
 warp_tag = "warp-out"
 inbound_tag = "socks-loopback"
 
-# 1. 移除旧的 loopback 规则和 warp 规则（保持幂等）
-rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
-rules[:] = [r for r in rules if r.get("outbound") == warp_tag]
+# 1. 严格保护副节点规则：仅移除旧的主节点 WARP 相关规则 (loopback 规则和 WARP 分流域名规则)
+def is_warp_or_loopback_rule(r):
+    if r.get("inbound") and inbound_tag in r["inbound"]:
+        return True
+    if r.get("outbound") == warp_tag and ("domain_suffix" in r or "rule_set" in r):
+        return True
+    return False
 
-# 2. 如果启用 WARP，则追加并更新 warp outbound 以及 socks-loopback inbound，并插入路由规则
+rules[:] = [r for r in rules if not is_warp_or_loopback_rule(r)]
+
+# 2. 如果启用 WARP，则追加并更新 warp outbound 以及 socks-loopback inbound
 if warp_enabled == "true":
     try:
         warp_reserved = json.loads(warp_reserved_str)
@@ -7582,7 +7652,7 @@ if warp_enabled == "true":
             "listen_port": loopback_port
         })
 
-    # 在 rules 开时插入强制分流规则
+    # 插入 loopback 专用路由规则
     rules.insert(0, {
         "inbound": [inbound_tag],
         "outbound": warp_tag
@@ -7593,7 +7663,7 @@ if warp_enabled == "true":
     elif warp_mode == "google":
         route["final"] = "direct"
         
-        # 使用 domain_suffix (与 psiphon 分流一致)
+        # 仅针对 Google/YouTube/OpenAI/Netflix 分流走 WARP
         rules.append({
             "domain_suffix": [
                 "google.com", "google.co.jp", "google.com.hk",
@@ -7609,7 +7679,6 @@ else:
     outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
     inbounds[:] = [ib for ib in inbounds if ib.get("tag") != inbound_tag]
     
-    # 恢复 final
     def first_tag_by_type(t, fallback):
         for o in outbounds:
             if o.get("type") == t and o.get("tag"):
@@ -7617,10 +7686,16 @@ else:
         return fallback
     route["final"] = first_tag_by_type("direct", "direct")
 
+# 3. 规范化 rules 顺序：副节点(自定义代理 / 赛风)规则置顶，确保精准匹配互不干扰
+proxy_rules = [r for r in rules if r.get("outbound", "").endswith("-out") and r.get("outbound") != warp_tag]
+psi_rules = [r for r in rules if r.get("outbound", "").startswith("psiphon-")]
+other_rules = [r for r in rules if r not in proxy_rules and r not in psi_rules]
+rules[:] = proxy_rules + psi_rules + other_rules
+
 try:
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print("[+] sing-box 配置文件修改成功")
+    print("[+] sing-box 配置文件修改成功 (主节点出站已更新，副节点配置完好保留)")
 except Exception as e:
     print(f"[!] 写入配置失败: {e}")
     sys.exit(1)
@@ -7667,15 +7742,15 @@ PY
             
             if [[ "$WARP_ENABLED" == "true" ]]; then
                 if [[ "$WARP_MODE" == "all" ]]; then
-                    blue "✓ WARP 出站已启用 (全部流量)"
+                    blue "✓ 主节点 WARP 出站已启用 (全部主节点流量走 WARP)"
                 else
-                    blue "✓ WARP 出站已启用 (Google/YouTube/Netflix/OpenAI)"
+                    blue "✓ 主节点 WARP 出站已启用 (Google/YouTube/Netflix/OpenAI)"
                 fi
                 # 等待 sing-box 建立连接，然后检测出口 IP
                 sleep 2
                 warp_egress_test || true
             else
-                green "✓ 已切换为直连出站"
+                green "✓ 主节点已切换为直连出站 (Direct)"
             fi
         else
             red "服务重启失败"
@@ -7684,10 +7759,9 @@ PY
         fi
     else
         yellow "配置已保存，请手动重启服务使其生效"
-        yellow "使用菜单选项 3 重启所有进程"
     fi
     
-    green "操作完成！现有节点配置未被改动"
+    green "操作完成！副节点与现有配置未受任何干扰"
 }
 
 # ==================== 自定义代理出站节点组 ====================
@@ -9009,14 +9083,16 @@ PY
     return 0
 }
 
-# ==== 自定义代理出站节点组管理菜单 ====
+# ==== 【副节点】自定义代理出站节点组管理菜单 ====
 proxy_egress_menu() {
     while true; do
         clear
         echo
         green "============================================================"
-        green "  自定义代理出站节点组管理"
-        green "  原理: 本机不同IP同一端口(Hy2/TUIC入站) → 路由 → 代理出站"
+        green "  【副节点】自定义代理出站多出口路由管理"
+        green "============================================================"
+        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站直接转发至外部代理"
+        yellow "        与主节点完全平行独立，互不干扰"
         green "============================================================"
         echo
 
@@ -9240,6 +9316,8 @@ PYEOF
 
 # ==================== 菜单 ====================
 
+# ==================== 主菜单 ====================
+
 menu() {
     clear
     echo
@@ -9289,79 +9367,77 @@ menu() {
     echo "============================================================"
     echo
     
-    # 显示当前状态
-    purple "平台: ${PLATFORM^^}"
-    purple "用户: $USERNAME"
-    purple "服务器: $HOSTNAME"
+    # 显示当前主机基本信息
+    purple "平台: ${PLATFORM^^} | 用户: $USERNAME | 主机: $HOSTNAME"
     echo
     
-    # 检查安装状态
+    # 检查安装状态与各平行模块状态
     if [ -f "$WORKDIR/config.json" ]; then
         SB_BINARY=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
         if pgrep -x "$SB_BINARY" > /dev/null 2>&1; then
-            green "状态: ✓ 已安装并运行中"
+            green "【主节点状态】: ✓ 已安装并运行中"
         else
-            yellow "状态: ⚠ 已安装但未运行"
+            yellow "【主节点状态】: ⚠ 已安装但未运行"
         fi
         
-        # 显示WARP状态
+        # 显示主节点出站模式
         local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
         local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
         if [[ "$warp_status" == "true" ]]; then
             if [[ "$warp_mode" == "all" ]]; then
-                blue "WARP: ✓ 已启用 (全部流量)"
+                blue "【主节点出站】: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
             else
-                blue "WARP: ✓ 已启用 (Google/YouTube)"
+                blue "【主节点出站】: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI)"
             fi
         else
-            purple "WARP: ✗ 未启用"
+            green "【主节点出站】: ✓ 直连出站 (Direct 原生网络直连)"
         fi
         
-        # 显示 Psiphon 状态
-        local psi_status=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
-        local psi_mode=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null)
-        if [[ "$psi_status" == "true" ]]; then
-            if [[ "$psi_mode" == "all" ]]; then
-                purple "Psiphon: ✓ 已启用 (全部流量)"
-            elif [[ "$psi_mode" == "google_warp" ]]; then
-                purple "Psiphon: ✓ 已启用 (赛风分流 + 普通流量走 WARP)"
-            else
-                purple "Psiphon: ✓ 已启用 (分流模式)"
-            fi
+        # 显示副节点 - 赛风出站状态
+        local psi_groups=($(get_egress_node_groups 2>/dev/null))
+        if [[ ${#psi_groups[@]} -gt 0 ]]; then
+            purple "【副节点-赛风】: ✓ 已配置 ${#psi_groups[@]} 个国家出口组 (${psi_groups[*]})"
+        else
+            purple "【副节点-赛风】: ✗ 未配置"
+        fi
+
+        # 显示副节点 - 自定义代理出站状态
+        init_proxy_groups_dir
+        local proxy_tags=($(get_all_proxy_groups 2>/dev/null))
+        if [[ ${#proxy_tags[@]} -gt 0 ]]; then
+            purple "【副节点-代理】: ✓ 已配置 ${#proxy_tags[@]} 个代理出口组 (${proxy_tags[*]})"
+        else
+            purple "【副节点-代理】: ✗ 未配置"
         fi
     else
-        yellow "状态: ✗ 未安装"
+        yellow "【主节点状态】: ✗ 未安装"
     fi
     
     echo
+    echo "============================================================"
+    blue   "  【主节点管理】"
     echo "------------------------------------------------------------"
-    green  "  1. 一键安装多协议节点"
+    green  "  1. 一键安装主节点 (多协议: Argo/Reality/VMess/Trojan/Hy2/TUIC/SS)"
+    green  "  2. 主节点出站管理 (直连出站 / WARP 全局出站 / WARP 分流出站)"
+    green  "  3. 主节点 Argo 隧道管理 (开关/重置/固定与临时隧道)"
+    green  "  4. 查看主节点信息与订阅 (含各协议链接及主节点出站状态)"
     echo "------------------------------------------------------------"
-    yellow "  2. 卸载删除"
+    purple "  【副节点管理 (平行独立)】"
     echo "------------------------------------------------------------"
-    green  "  3. 重启所有进程"
+    purple "  5. 【副节点】赛风出站多出口管理 (添加/删除出口组、延迟测试、状态)"
+    purple "  6. 【副节点】自定义代理出站多出口管理 (添加/修改/删除外部代理出站、测速)"
     echo "------------------------------------------------------------"
-    green  "  4. Argo 隧道管理 (开关/重置)"
+    white  "  【综合功能与系统运维】"
     echo "------------------------------------------------------------"
-    green  "  5. 查看节点信息"
+    blue   "  7. 自定义节点组合推送 (自由勾选主/副节点生成专属订阅)"
+    blue   "  8. 查看全部节点信息总览 (主节点 + 副节点分类汇总)"
+    green  "  9. 重启所有服务 (主节点 + 赛风多实例 + 自定义代理完整同步)"
+    yellow " 10. 重置端口 / 端口冲突检测与修复"
+    blue   " 11. 查看运行日志 (sing-box / Argo / Psiphon 日志)"
+    yellow " 12. 卸载删除主节点与服务"
+    red    " 13. 系统初始化清理 (清理全部进程及配置)"
     echo "------------------------------------------------------------"
-    blue   "  6. 自定义节点组合推送"
-    echo "------------------------------------------------------------"
-    yellow "  7. 重置端口"
-    echo "------------------------------------------------------------"
-    blue   "  8. 查看运行日志"
-    echo "------------------------------------------------------------"
-    blue   "  9. 配置 WARP / Psiphon 出站"
-    echo "------------------------------------------------------------"
-    purple " 10. Psiphon 出站管理"
-    echo "------------------------------------------------------------"
-    purple " 11. 自定义代理出站多出口路由管理"
-    echo "------------------------------------------------------------"
-    green  " 12. 批量测试外部代理节点延迟"
-    echo "------------------------------------------------------------"
-    red    " 13. 系统初始化清理"
-    echo "------------------------------------------------------------"
-    red    "  0. 退出"
+    red    "  0. 退出脚本"
     echo "============================================================"
     
     reading "请选择 [0-13]: " choice
@@ -9369,22 +9445,22 @@ menu() {
     
     case "$choice" in
         1) install_nodes ;;
-        2) uninstall_nodes ;;
-        3) restart_processes ;;
-        4) argo_management_menu ;;
-        5) show_links ;;
-        6) custom_push_nodes ;;
-        7) reset_all_ports ;;
-        8) view_logs_menu ;;
-        9) configure_warp_outbound ;;
-        10) psiphon_management_menu ;;
-        11) proxy_egress_menu ;;
-        12) test_external_nodes_latency ;;
+        2) configure_warp_outbound ;;
+        3) argo_management_menu ;;
+        4) show_links ;;
+        5) psiphon_management_menu ;;
+        6) proxy_egress_menu ;;
+        7) custom_push_nodes ;;
+        8) show_all_nodes_summary ;;
+        9) restart_processes ;;
+        10) reset_all_ports ;;
+        11) view_logs_menu ;;
+        12) uninstall_nodes ;;
         13)
             reading "确定清理所有内容? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 # 停止所有服务
-                stop_psiphon_userland
+                stop_all
                 SB_BINARY=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
                 [ -n "$SB_BINARY" ] && pkill -x "$SB_BINARY" 2>/dev/null
                 CF_BINARY=$(cat "$WORKDIR/cf.txt" 2>/dev/null)
