@@ -1787,25 +1787,60 @@ install_psiphon_userland() {
     chmod +x "$WORKDIR/psiphon-tunnel-core"
     echo "psiphon-tunnel-core" > "$WORKDIR/psi.txt"
     rm -rf "$tmpd"
+    
+    # 预载 Psiphon 种子服务器列表 (多镜像源自动 fallback)
+    if [[ ! -f "$WORKDIR/server_list_compressed" ]]; then
+        yellow "[*] 正在预载 Psiphon 全球种子服务器列表..."
+        local s_urls=(
+            "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
+            "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+            "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+        )
+        for surl in "${s_urls[@]}"; do
+            echo -e "${blue}--> 尝试下载种子服务器列表: ${surl}${re}"
+            curl -# -fSL --connect-timeout 10 --max-time 60 "$surl" -o "$WORKDIR/server_list_compressed" 2>/dev/null && break
+        done
+    fi
+
     green "[+] Psiphon 已安装到 $WORKDIR/psiphon-tunnel-core"
 }
 
 # 生成 Psiphon 配置文件
 write_psiphon_config() {
-    local socks region datadir
+    local socks region datadir reg_key
     socks="$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null)"
     region="$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)"
     
     # FreeBSD mac_portacl 限制固定端口 bind，必须用 0 (自动端口)
     if [[ -f "$WORKDIR/ports.txt" ]] || [[ "$(detect_os_slim)" == "freebsd" ]]; then socks="0"; else socks="${socks:-0}"; fi
     region="${region:-US}"
+    reg_key="${region^^}"
     
     # AUTO 时写空字符串
     [[ "${region^^}" == "AUTO" ]] && region=""
     
-    # 创建数据目录 (关键！否则可能因权限问题秒退)
-    datadir="$WORKDIR/psiphon-data"
+    # 创建分国家独立数据目录 (避免跨国家历史失效节点污染导致死循环)
+    datadir="$WORKDIR/psiphon-data/${reg_key:-AUTO}"
     mkdir -p "$datadir" 2>/dev/null
+
+    # 部署种子服务器列表至主数据目录
+    if [[ -f "$WORKDIR/server_list_compressed" ]]; then
+        cp -f "$WORKDIR/server_list_compressed" "$datadir/server_list_compressed" 2>/dev/null
+        cp -f "$WORKDIR/server_list_compressed" "$datadir/remote_server_list" 2>/dev/null
+    else
+        local s_urls=(
+            "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
+            "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+            "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+        )
+        for surl in "${s_urls[@]}"; do
+            if curl -fsSL --connect-timeout 5 --max-time 15 "$surl" -o "$datadir/server_list_compressed" 2>/dev/null; then
+                cp -f "$datadir/server_list_compressed" "$datadir/remote_server_list" 2>/dev/null
+                cp -f "$datadir/server_list_compressed" "$WORKDIR/server_list_compressed" 2>/dev/null
+                break
+            fi
+        done
+    fi
 
     cat > "$WORKDIR/psiphon.config" <<EOF
 {
@@ -1821,7 +1856,7 @@ write_psiphon_config() {
   
   "PropagationChannelId": "FFFFFFFFFFFFFFFF",
   "SponsorId": "FFFFFFFFFFFFFFFF",
-  "RemoteServerListDownloadFilename": "${WORKDIR}/remote_server_list",
+  "RemoteServerListDownloadFilename": "remote_server_list",
   "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
   "RemoteServerListUrl": "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
   "UseIndistinguishableTLS": true
@@ -2637,69 +2672,46 @@ PY
 
 # ==================== Psiphon 国家管理 (psictl 等价功能) ====================
 
-# Psiphon 支持的出口国家码列表
+# Psiphon 官方真实支持的出口国家码列表 (共 28 国 + AUTO)
 PSI_ALL_CC=(
-    AE HK IN ID JP KR MY SG TW
-    AT BE BG CH CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LT LV NL NO PL PT RO RS SE SK UA
-    AR BR CA CL CO MX US
-    AU NZ
-    KE ZA
+    US JP SG HK KR TW GB DE CA NL FR IN AU
+    CH SE IT ES PL AT BE DK NO RO CZ HU BG IE FI
+    AUTO
 )
 
 # 国家码到中文名映射
 get_country_name() {
     local cc="${1^^}"
     case "$cc" in
-        AE) echo "阿联酋" ;;
-        HK) echo "香港" ;;
-        IN) echo "印度" ;;
-        ID) echo "印度尼西亚" ;;
-        JP) echo "日本" ;;
-        KR) echo "韩国" ;;
-        MY) echo "马来西亚" ;;
-        SG) echo "新加坡" ;;
-        TW) echo "台湾地区" ;;
-        AT) echo "奥地利" ;;
-        BE) echo "比利时" ;;
-        BG) echo "保加利亚" ;;
-        CH) echo "瑞士" ;;
-        CZ) echo "捷克" ;;
-        DE) echo "德国" ;;
-        DK) echo "丹麦" ;;
-        EE) echo "爱沙尼亚" ;;
-        ES) echo "西班牙" ;;
-        FI) echo "芬兰" ;;
-        FR) echo "法国" ;;
-        GB) echo "英国" ;;
-        GR) echo "希腊" ;;
-        HR) echo "克罗地亚" ;;
-        HU) echo "匈牙利" ;;
-        IE) echo "爱尔兰" ;;
-        IS) echo "冰岛" ;;
-        IT) echo "意大利" ;;
-        LT) echo "立陶宛" ;;
-        LV) echo "拉脱维亚" ;;
-        NL) echo "荷兰" ;;
-        NO) echo "挪威" ;;
-        PL) echo "波兰" ;;
-        PT) echo "葡萄牙" ;;
-        RO) echo "罗马尼亚" ;;
-        RS) echo "塞尔维亚" ;;
-        SE) echo "瑞典" ;;
-        SK) echo "斯洛伐克" ;;
-        UA) echo "乌克兰" ;;
-        AR) echo "阿根廷" ;;
-        BR) echo "巴西" ;;
-        CA) echo "加拿大" ;;
-        CL) echo "智利" ;;
-        CO) echo "哥伦比亚" ;;
-        MX) echo "墨西哥" ;;
-        US) echo "美国" ;;
-        AU) echo "澳大利亚" ;;
-        NZ) echo "新西兰" ;;
-        KE) echo "肯尼亚" ;;
-        ZA) echo "南非" ;;
-        AUTO) echo "自动" ;;
+        US) echo "美国 (United States)" ;;
+        JP) echo "日本 (Japan)" ;;
+        SG) echo "新加坡 (Singapore)" ;;
+        HK) echo "中国香港 (Hong Kong)" ;;
+        KR) echo "韩国 (South Korea)" ;;
+        TW) echo "中国台湾 (Taiwan)" ;;
+        GB) echo "英国 (United Kingdom)" ;;
+        DE) echo "德国 (Germany)" ;;
+        CA) echo "加拿大 (Canada)" ;;
+        NL) echo "荷兰 (Netherlands)" ;;
+        FR) echo "法国 (France)" ;;
+        IN) echo "印度 (India)" ;;
+        AU) echo "澳大利亚 (Australia)" ;;
+        CH) echo "瑞士 (Switzerland)" ;;
+        SE) echo "瑞典 (Sweden)" ;;
+        IT) echo "意大利 (Italy)" ;;
+        ES) echo "西班牙 (Spain)" ;;
+        PL) echo "波兰 (Poland)" ;;
+        AT) echo "奥地利 (Austria)" ;;
+        BE) echo "比利时 (Belgium)" ;;
+        DK) echo "丹麦 (Denmark)" ;;
+        NO) echo "挪威 (Norway)" ;;
+        RO) echo "罗马尼亚 (Romania)" ;;
+        CZ) echo "捷克 (Czech Republic)" ;;
+        HU) echo "匈牙利 (Hungary)" ;;
+        BG) echo "保加利亚 (Bulgaria)" ;;
+        IE) echo "爱尔兰 (Ireland)" ;;
+        FI) echo "芬兰 (Finland)" ;;
+        AUTO) echo "自动优选 (Auto)" ;;
         *) echo "$cc" ;;
     esac
 }
@@ -2715,14 +2727,17 @@ is_supported_psiphon_cc() {
 }
 
 show_supported_psiphon_codes() {
-    yellow "支持国家码:"
-    yellow "  亚洲/中东: AE=阿联酋 HK=香港 IN=印度 ID=印度尼西亚 JP=日本 KR=韩国 MY=马来西亚 SG=新加坡 TW=台湾地区"
-    yellow "  欧洲: AT=奥地利 BE=比利时 BG=保加利亚 CH=瑞士 CZ=捷克 DE=德国 DK=丹麦 EE=爱沙尼亚 ES=西班牙 FI=芬兰 FR=法国"
-    yellow "        GB=英国 GR=希腊 HR=克罗地亚 HU=匈牙利 IE=爱尔兰 IS=冰岛 IT=意大利 LT=立陶宛 LV=拉脱维亚 NL=荷兰"
-    yellow "        NO=挪威 PL=波兰 PT=葡萄牙 RO=罗马尼亚 RS=塞尔维亚 SE=瑞典 SK=斯洛伐克 UA=乌克兰"
-    yellow "  美洲: AR=阿根廷 BR=巴西 CA=加拿大 CL=智利 CO=哥伦比亚 MX=墨西哥 US=美国"
-    yellow "  大洋洲: AU=澳大利亚 NZ=新西兰"
-    yellow "  非洲: KE=肯尼亚 ZA=南非 AUTO=自动"
+    yellow "Psiphon 赛风支持的出口国家代码列表:"
+    echo "  [热门国家]:"
+    echo "    US - 美国      JP - 日本      SG - 新加坡    HK - 中国香港"
+    echo "    KR - 韩国      TW - 中国台湾  GB - 英国      DE - 德国"
+    echo "    CA - 加拿大    NL - 荷兰      FR - 法国      IN - 印度      AU - 澳大利亚"
+    echo "  [欧洲及其他国家]:"
+    echo "    CH - 瑞士      SE - 瑞典      IT - 意大利    ES - 西班牙    PL - 波兰"
+    echo "    AT - 奥地利    BE - 比利时    DK - 丹麦      NO - 挪威      RO - 罗马尼亚"
+    echo "    CZ - 捷克      HU - 匈牙利    BG - 保加利亚  IE - 爱尔兰    FI - 芬兰"
+    echo "  [自动策略]:"
+    echo "    AUTO - 智能自动优选最佳出口"
 }
 
 # 获取空闲本地回环端口以防冲突 (默认 31092)
@@ -2847,18 +2862,16 @@ except Exception as e:
     return 0
 }
 
-# 出口 IP 检测 (等价 psictl egress-test) - 优化版，减少 fork 压力
+# 出口 IP 检测 (带 1~10s 动态轮询平滑握手探测)
 psiphon_egress_test() {
     local socks
     socks="$(get_psiphon_socks_port)"
     
     if [[ "$socks" == "0" || -z "$socks" ]]; then
-        red "[!] 未获取到 Psiphon 实际端口"
+        red "[!] 未获取到 Psiphon 实际 Socks5 端口"
         return 1
     fi
 
-    yellow "[*] 正在检测 Psiphon 出口 IP..."
-    
     # 检查 Psiphon 是否在运行
     local is_running=false
     if [[ -f "$WORKDIR/psiphon.pid" ]]; then
@@ -2875,60 +2888,54 @@ psiphon_egress_test() {
         fi
     fi
     if [[ "$is_running" == "false" ]]; then
-        red "[!] 全局 Psiphon 进程未运行"
+        red "[!] Psiphon 主服务进程未运行"
         return 1
     fi
 
-    local json=""
-    # 尝试 ipinfo.io (可能限流/403)
-    json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json 2>/dev/null)" || true
-    
-    # fallback 到 ip-api.com (免费无 key，但只有 HTTP)
-    if [[ -z "$json" ]]; then
-        yellow "[*] ipinfo.io 无响应，尝试 ip-api.com..."
-        json="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" http://ip-api.com/json 2>/dev/null)" || true
-    fi
-    
-    # fallback 到 ifconfig.me (只返回 IP)
-    if [[ -z "$json" ]]; then
-        yellow "[*] ip-api.com 无响应，尝试 ifconfig.me..."
-        local raw_ip
-        raw_ip="$(curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${socks}" https://ifconfig.me 2>/dev/null)" || true
-        if [[ -n "$raw_ip" ]]; then
-            green "  IP: $raw_ip"
-            yellow "  (其他信息无法获取，但 SOCKS 隧道正常)"
-            return 0
+    local out_ip=""
+    local max_wait=10
+    local elapsed=0
+
+    for ((i=1; i<=max_wait; i++)); do
+        printf "\r[*] 正在建立加密隧道并探测出口 IP (%ds/%ds)..." "$i" "$max_wait"
+        local res=""
+        res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks}" -s4 --connect-timeout 2 -m 2 "http://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks}" -s4 --connect-timeout 2 -m 2 "http://ipv4.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks}" -s4 --connect-timeout 2 -m 2 "https://api.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+
+        if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            out_ip="$res"
+            elapsed=$i
+            break
         fi
-    fi
+        sleep 1
+    done
+    printf "\r\033[K"
 
-    if [[ -z "$json" ]]; then
-        yellow "[!] 出口 IP 检测未成功"
-        yellow "    这不一定表示 Psiphon 未工作，可能是检测接口被墙/限流"
-        yellow "    建议稍后重试，或手动测试: curl --socks5-hostname 127.0.0.1:${socks} https://ipinfo.io/ip"
+    echo
+    if [[ -n "$out_ip" ]]; then
+        local ip_info=$(curl -s4m 4 "http://ip-api.com/json/${out_ip}?lang=zh-CN" 2>/dev/null)
+        local ip_country=$(echo "$ip_info" | jq -r '.country // empty' 2>/dev/null)
+        local ip_region=$(echo "$ip_info" | jq -r '.regionName // empty' 2>/dev/null)
+        local ip_city=$(echo "$ip_info" | jq -r '.city // empty' 2>/dev/null)
+        local ip_isp=$(echo "$ip_info" | jq -r '.isp // empty' 2>/dev/null)
+        
+        green "============================================================"
+        green "  [✓] Psiphon 赛风出口网络状态正常！(耗时约 ${elapsed}s)"
+        green "============================================================"
+        blue   "  出口公网 IP : ${out_ip}"
+        purple "  地理位置归属: ${ip_country} ${ip_region} ${ip_city}"
+        purple "  网络运营商  : ${ip_isp:-未知}"
+        green "============================================================"
+        return 0
+    else
+        yellow "============================================================"
+        yellow "  [!] 检测超时：Psiphon 远端加密隧道握手耗时较长或目标地区无可用节点。"
+        yellow "      提示: 部分地区 (如 HK 香港 / TW 台湾 / KR 韩国) 官方服务器池常年无节点。"
+        yellow "      建议切换到 JP (日本)、US (美国)、SG (新加坡)、DE (德国) 等热门出口。"
+        yellow "============================================================"
         return 1
     fi
-
-    # 解析 JSON - 使用 python3 -c 代替 heredoc (减少 /tmp 临时文件，减少 fork)
-    python3 -c '
-import json, sys
-try:
-    j = json.load(sys.stdin)
-    ip = j.get("ip") or j.get("query") or ""
-    country = j.get("country") or j.get("countryCode") or ""
-    city = j.get("city") or ""
-    region = j.get("region") or j.get("regionName") or ""
-    org = j.get("org") or j.get("isp") or ""
-    print(f"  IP:      {ip}")
-    print(f"  国家:    {country}")
-    print(f"  城市:    {city}")
-    print(f"  地区:    {region}")
-    print(f"  运营商:  {org}")
-except Exception as e:
-    print(f"[!] 解析失败: {e}")
-    sys.exit(1)
-' <<<"$json"
-    
-    return 0
 }
 
 # 设置出口国家
@@ -3505,6 +3512,25 @@ write_instance_config() {
     local region="$cc"
     [[ "$region" == "AUTO" ]] && region=""
     
+    # 部署种子服务器列表至副节点实例数据目录
+    if [[ -f "$WORKDIR/server_list_compressed" ]]; then
+        cp -f "$WORKDIR/server_list_compressed" "$datadir/server_list_compressed" 2>/dev/null
+        cp -f "$WORKDIR/server_list_compressed" "$datadir/remote_server_list" 2>/dev/null
+    else
+        local s_urls=(
+            "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
+            "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+            "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+        )
+        for surl in "${s_urls[@]}"; do
+            if curl -fsSL --connect-timeout 5 --max-time 15 "$surl" -o "$datadir/server_list_compressed" 2>/dev/null; then
+                cp -f "$datadir/server_list_compressed" "$datadir/remote_server_list" 2>/dev/null
+                cp -f "$datadir/server_list_compressed" "$WORKDIR/server_list_compressed" 2>/dev/null
+                break
+            fi
+        done
+    fi
+
     cat > "$instance_dir/psiphon.config" <<EOF
 {
   "DataRootDirectory": "${datadir}",
@@ -3519,7 +3545,7 @@ write_instance_config() {
   
   "PropagationChannelId": "FFFFFFFFFFFFFFFF",
   "SponsorId": "FFFFFFFFFFFFFFFF",
-  "RemoteServerListDownloadFilename": "${instance_dir}/remote_server_list",
+  "RemoteServerListDownloadFilename": "remote_server_list",
   "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
   "RemoteServerListUrl": "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
   "UseIndistinguishableTLS": true
@@ -9699,5 +9725,106 @@ menu() {
     menu
 }
 
-# ==================== 主入口 ====================
-menu
+# 强制热更新脚本自身至 GitHub 最新版
+update_script_self() {
+    yellow "正在强制更新 Serv00 Sing-box 脚本至最新版本..."
+    local urls=(
+        "https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh"
+        "https://ghproxy.net/https://raw.githubusercontent.com/hxzl666/serv00-singbox/main/serv00_nodes.sh"
+        "https://fastly.jsdelivr.net/gh/hxzl666/serv00-singbox@main/serv00_nodes.sh"
+    )
+    local done_u=false
+    local tmp_f="$WORKDIR/serv00_nodes.sh.tmp"
+    mkdir -p "$WORKDIR" 2>/dev/null
+    
+    for u in "${urls[@]}"; do
+        if curl -fsSL --connect-timeout 8 --max-time 30 "$u" -o "$tmp_f" 2>/dev/null && [[ -s "$tmp_f" ]] && bash -n "$tmp_f" 2>/dev/null; then
+            cp -f "$tmp_f" "$HOME/serv00_nodes.sh" 2>/dev/null || true
+            local cur_script
+            cur_script=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+            if [[ -n "$cur_script" && "$cur_script" != "$HOME/serv00_nodes.sh" && -w "$cur_script" ]]; then
+                cp -f "$tmp_f" "$cur_script" 2>/dev/null || true
+            fi
+            chmod +x "$HOME/serv00_nodes.sh" 2>/dev/null || true
+            done_u=true
+            break
+        fi
+    done
+    rm -f "$tmp_f" 2>/dev/null || true
+    
+    if $done_u; then
+        create_quick_command
+        green "脚本已成功强制更新至最新版本！"
+    else
+        red "更新失败，请检查网络连通性！"
+    fi
+}
+
+# 后台定时健康检查与自愈守护
+run_cron_check() {
+    auto_system_maintenance
+    if [[ ! -f "$WORKDIR/config.json" ]]; then
+        return 0
+    fi
+    local sb_bin
+    sb_bin=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
+    local need_restart=false
+    
+    if [[ -n "$sb_bin" ]] && ! pgrep -x "$sb_bin" >/dev/null 2>&1; then
+        yellow "[!] 定时检测发现 Sing-box 核心离线，正在拉起..."
+        need_restart=true
+    fi
+    
+    # 检查 Psiphon 多实例
+    local groups=($(get_egress_node_groups 2>/dev/null))
+    if [[ ${#groups[@]} -gt 0 ]]; then
+        for cc in "${groups[@]}"; do
+            [[ -z "$cc" ]] && continue
+            local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
+            if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                yellow "[!] 定时检测发现 Psiphon [$cc] 离线，正在拉起..."
+                start_psiphon_instance "$cc" 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    if [[ "$need_restart" == "true" ]]; then
+        start_singbox_safe
+        green "[✓] 服务已自愈恢复"
+    fi
+}
+
+# ==================== 入口调度与 CLI 支持 ====================
+case "$1" in
+    cron)
+        run_cron_check
+        exit 0
+        ;;
+    show|links|info)
+        show_links
+        exit 0
+        ;;
+    all)
+        show_all_nodes_summary
+        exit 0
+        ;;
+    restart)
+        restart_processes
+        exit 0
+        ;;
+    reconfig)
+        install_nodes
+        exit 0
+        ;;
+    update)
+        update_script_self
+        exit 0
+        ;;
+    *)
+        if [[ ! -f "$WORKDIR/config.json" ]]; then
+            install_nodes
+        else
+            menu
+        fi
+        ;;
+esac
