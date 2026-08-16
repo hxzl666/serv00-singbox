@@ -3347,18 +3347,14 @@ PY
     return 0
 }
 
-# Psiphon 管理菜单 (psictl 等价)
+# Psiphon 管理菜单
 psiphon_management_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  【副节点】Psiphon 赛风出站多出口管理"
+        green "  Psiphon 赛风综合管理"
         green "============================================================"
-        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站走赛风对应国家"
-        yellow "        与主节点完全平行独立，互不干扰"
-        green "============================================================"
-        echo
         
         # 检查运行状态
         local psi_pid_file="$WORKDIR/psiphon.pid"
@@ -3377,57 +3373,39 @@ psiphon_management_menu() {
             fi
         fi
         
-        # 显示当前状态
-        local psi_enabled=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
-        local psi_region=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null)
-        local psi_socks=$(get_psiphon_socks_port)
-        psi_region="${psi_region:-AUTO}"
-        local region_name=$(get_country_name "$psi_region")
-        
-        purple "当前状态:"
+        local cur_reg=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null || echo "AUTO")
+        cur_reg="${cur_reg:-AUTO}"
+        local cur_sport=$(get_psiphon_socks_port)
+
         if [[ "$is_running" == "true" ]]; then
-            if [[ "$psi_enabled" == "true" ]]; then
-                green "  运行状态: ✓ 运行中 (已接入 sing-box)"
-            else
-                yellow "  运行状态: ⚠ 运行中 (未接入 sing-box)"
-            fi
-            blue "  出口国家: $psi_region ($region_name)"
-            blue "  SOCKS端口: 127.0.0.1:$psi_socks"
+            green  "  主进程状态 : ✓ 运行中"
         else
-            if [[ "$psi_enabled" == "true" ]]; then
-                red "  运行状态: ⚠ 异常 (已配置出站，但进程未运行)"
-            else
-                yellow "  运行状态: ✗ 未启用"
-            fi
+            yellow "  主进程状态 : ✗ 未运行"
         fi
-        
+        blue   "  主出口国家 : $cur_reg - $(get_country_name "$cur_reg")"
+        purple "  Socks5端口 : ${cur_sport:-自动分配}"
+        green "============================================================"
         echo
+        echo "  1. 查看当前出口 IP"
+        echo "  2. 智能优选出口国家"
+        echo "  3. 手动切换出口国家"
         echo "------------------------------------------------------------"
-        green  "  1. 查看当前出口 IP"
-        green  "  2. 智能切换出口国家"
-        green  "  3. 手动切换出口国家"
+        echo "  4. 快速测试常用国家"
+        echo "  5. 测试全部支持国家"
+        echo "  6. 自定义测试国家"
         echo "------------------------------------------------------------"
-        yellow "  4. 快速测试国家 (US/JP/SG/HK)"
-        yellow "  5. 测试所有支持国家"
-        yellow "  6. 自定义测试国家"
+        echo "  7. 查看 Psiphon 日志"
+        echo "  8. 重启 Psiphon 主服务"
+        echo "  9. 副节点赛风出口组管理"
         echo "------------------------------------------------------------"
-        blue   "  7. 查看 Psiphon 日志"
-        blue   "  8. 重启 Psiphon"
-        purple "  9. 多出口节点组管理"
-        green  " 10. 搭建/更新 英国 (GB) 出口 Hy2 节点 (单IP+端口复用)"
-        echo "------------------------------------------------------------"
-        red    "  0. 返回主菜单"
+        red  "  0. 返回主菜单"
         echo "============================================================"
-        reading "请选择 [0-10]: " choice
+        reading "请选择 [0-9]: " choice
         echo
         
         case "$choice" in
-            1)
-                psiphon_egress_test
-                ;;
-            2)
-                psiphon_smart_country
-                ;;
+            1) psiphon_egress_test ;;
+            2) psiphon_smart_country ;;
             3)
                 echo
                 show_supported_psiphon_codes
@@ -3435,12 +3413,8 @@ psiphon_management_menu() {
                 reading "请输入国家码 (如 US): " new_cc
                 [[ -n "$new_cc" ]] && psiphon_set_region "$new_cc"
                 ;;
-            4)
-                psiphon_country_test US JP SG HK
-                ;;
-            5)
-                psiphon_country_test_all
-                ;;
+            4) psiphon_country_test US JP SG HK ;;
+            5) psiphon_country_test_all ;;
             6)
                 echo
                 yellow "请输入要测试的国家码 (空格分隔):"
@@ -3458,20 +3432,18 @@ psiphon_management_menu() {
                 echo "================================================"
                 ;;
             8)
-                yellow "正在重启 Psiphon..."
+                yellow "正在深度重启与重置 Psiphon 主服务..."
+                rm -rf "$WORKDIR/psiphon-data" 2>/dev/null || true
+                mkdir -p "$WORKDIR/psiphon-data" 2>/dev/null
                 if start_psiphon_userland; then
-                    green "Psiphon 重启成功"
-                    # 同步新端口到 sing-box (因为随机端口可能变化)
+                    green "Psiphon 主服务重启成功！"
                     sync_psiphon_port_to_singbox || yellow "[!] 端口同步失败"
                 else
-                    red "Psiphon 重启失败"
+                    red "Psiphon 主服务重启失败"
                 fi
                 ;;
             9)
                 multi_egress_menu
-                ;;
-            10)
-                setup_psiphon_gb_hy2_node
                 ;;
             0)
                 return 0
@@ -9457,15 +9429,15 @@ PY
     return 0
 }
 
-# ==== 【副节点】自定义代理出站节点组管理菜单 ====
+# ==== 【副节点】自定义代理出站管理菜单 ====
 proxy_egress_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  【副节点】自定义代理出站多出口路由管理"
+        green "  自定义代理出站管理"
         green "============================================================"
-        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站直接转发至外部代理"
+        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站转发至外部代理"
         yellow "        与主节点完全平行独立，互不干扰"
         green "============================================================"
         echo
@@ -9474,142 +9446,38 @@ proxy_egress_menu() {
         local groups
         mapfile -t groups < <(get_all_proxy_groups)
 
-        purple "当前代理节点组 (共 ${#groups[@]} 个):"
+        purple "【当前已配置代理组】 (共 ${#groups[@]} 组):"
         if [[ ${#groups[@]} -gt 0 ]]; then
-            python3 - "$PROXY_GROUPS_DIR" <<'PYEOF'
-import os, sys, json, unicodedata
-
-groups_dir = sys.argv[1]
-groups_file = os.path.join(groups_dir, "groups.txt")
-
-if not os.path.isfile(groups_file):
-    sys.exit(0)
-
-with open(groups_file, 'r', encoding='utf-8') as f:
-    tags = [line.strip() for line in f if line.strip()]
-
-def sort_key(tag):
-    parts = tag.split('-')
-    if len(parts) == 2 and parts[1].isdigit():
-        return (parts[0], int(parts[1]))
-    return (tag, 0)
-
-tags.sort(key=sort_key)
-
-def char_width(ch):
-    if unicodedata.east_asian_width(ch) in ('F', 'W'):
-        return 2
-    return 1
-
-def str_width(s):
-    return sum(char_width(ch) for ch in str(s))
-
-def pad(s, width):
-    s = str(s)
-    w = str_width(s)
-    return s + ' ' * max(0, width - w)
-
-headers = ["标识 (Tag)", "备注名称", "IP数", "入站端口", "出站协议", "目标出站服务器 (IP:Port)"]
-col_widths = [12, 16, 6, 16, 11, 26]
-
-rows = []
-for tag in tags:
-    d = os.path.join(groups_dir, tag)
-    if not os.path.isdir(d):
-        continue
-    
-    remark = tag
-    rm_path = os.path.join(d, "remark.txt")
-    if os.path.isfile(rm_path):
-        try:
-            with open(rm_path, 'r', encoding='utf-8') as f:
-                remark = f.read().strip() or tag
-        except Exception:
-            pass
-
-    hy2_p = ""
-    hy2_path = os.path.join(d, "hy2_port.txt")
-    if os.path.isfile(hy2_path):
-        try:
-            with open(hy2_path, 'r', encoding='utf-8') as f:
-                hy2_p = f.read().strip()
-        except Exception:
-            pass
-
-    tuic_p = ""
-    tuic_path = os.path.join(d, "tuic_port.txt")
-    if os.path.isfile(tuic_path):
-        try:
-            with open(tuic_path, 'r', encoding='utf-8') as f:
-                tuic_p = f.read().strip()
-        except Exception:
-            pass
-
-    ip_cnt = 0
-    ip_path = os.path.join(d, "ip_protos.txt")
-    if os.path.isfile(ip_path):
-        try:
-            with open(ip_path, 'r', encoding='utf-8') as f:
-                ip_cnt = len([l for l in f if l.strip()])
-        except Exception:
-            pass
-
-    ports = []
-    if hy2_p: ports.append(f"Hy2:{hy2_p}")
-    if tuic_p: ports.append(f"TUIC:{tuic_p}")
-    ports_str = " ".join(ports) or "无"
-
-    ptype, pserver, pport = "?", "?", "?"
-    ob_path = os.path.join(d, "outbound.json")
-    if os.path.isfile(ob_path):
-        try:
-            with open(ob_path, 'r', encoding='utf-8') as f:
-                ob_data = json.load(f)
-                ptype = ob_data.get("type", "?")
-                pserver = str(ob_data.get("server", "?"))
-                pport = str(ob_data.get("server_port", "?"))
-        except Exception:
-            pass
-
-    dest_str = f"{pserver}:{pport}"
-    rows.append([tag, remark, str(ip_cnt), ports_str, ptype, dest_str])
-
-for row in rows:
-    for i in range(len(col_widths)):
-        col_widths[i] = max(col_widths[i], str_width(row[i]) + 2)
-
-line_sep = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
-
-def render_row(cells):
-    out = "| "
-    for i, cell in enumerate(cells):
-        out += pad(cell, col_widths[i]) + " | "
-    return out.rstrip()
-
-print("\033[1;36m" + line_sep + "\033[0m")
-print("\033[1;32m" + render_row(headers) + "\033[0m")
-print("\033[1;36m" + line_sep + "\033[0m")
-for r in rows:
-    print(render_row(r))
-print("\033[1;36m" + line_sep + "\033[0m")
-PYEOF
+            local idx=1
+            for t in "${groups[@]}"; do
+                [[ -z "$t" ]] && continue
+                local r=$(cat "${PROXY_GROUPS_DIR}/$t/remark.txt" 2>/dev/null || echo "$t")
+                local hp=$(cat "${PROXY_GROUPS_DIR}/$t/hy2_port.txt" 2>/dev/null || echo "0")
+                local tp=$(cat "${PROXY_GROUPS_DIR}/$t/tuic_port.txt" 2>/dev/null || echo "0")
+                local vp=$(cat "${PROXY_GROUPS_DIR}/$t/vless_port.txt" 2>/dev/null || echo "0")
+                local p_info=""
+                [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
+                [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
+                [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
+                green "  [$idx] $t - $r"
+                blue  "      入站端口: [ ${p_info:-无} ]"
+                ((idx++))
+            done
         else
             yellow "  暂无代理节点组"
         fi
 
         echo
         echo "------------------------------------------------------------"
-        green  "  1. 添加新代理节点组"
-        green  "  2. 修改代理组出站链接 (保持入站不变)"
-        green  "  3. 删除代理节点组"
-        green  "  4. 查看所有节点链接"
+        green  "  1. 添加代理节点组"
+        green  "  2. 查看代理节点链接"
+        yellow "  3. 修改代理出站链接"
+        red    "  4. 删除代理节点组"
+        blue   "  5. 重新同步全部代理配置并重启"
         echo "------------------------------------------------------------"
-        yellow "  5. 查看出站代理详细配置"
-        yellow "  6. 重新同步全部配置并重启"
-        echo "------------------------------------------------------------"
-        red    "  0. 返回上级菜单"
+        red    "  0. 返回上一级菜单"
         echo "============================================================"
-        reading "请选择 [0-6]: " choice
+        reading "请选择 [0-5]: " choice
         echo
 
         case "$choice" in
@@ -9617,9 +9485,18 @@ PYEOF
                 add_proxy_egress_group
                 ;;
             2)
-                edit_proxy_egress_backend
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无代理节点组"
+                else
+                    for tag in "${groups[@]}"; do
+                        generate_proxy_group_links "$tag"
+                    done
+                fi
                 ;;
             3)
+                edit_proxy_egress_backend
+                ;;
+            4)
                 if [[ ${#groups[@]} -eq 0 ]]; then
                     yellow "暂无代理节点组可删除"
                 else
@@ -9634,36 +9511,7 @@ PYEOF
                     [[ -n "$del_tag" ]] && remove_proxy_egress_group "$del_tag"
                 fi
                 ;;
-            4)
-                if [[ ${#groups[@]} -eq 0 ]]; then
-                    yellow "暂无代理节点组"
-                else
-                    for tag in "${groups[@]}"; do
-                        generate_proxy_group_links "$tag"
-                    done
-                fi
-                ;;
             5)
-                if [[ ${#groups[@]} -eq 0 ]]; then
-                    yellow "暂无代理节点组"
-                else
-                    for tag in "${groups[@]}"; do
-                        local dir="${PROXY_GROUPS_DIR}/$tag"
-                        local r=$(cat "$dir/remark.txt" 2>/dev/null || echo "$tag")
-                        echo
-                        blue "=== [$tag] $r ==="
-                        echo "出站配置 (sing-box outbound JSON):"
-                        python3 -m json.tool "$dir/outbound.json" 2>/dev/null || \
-                            cat "$dir/outbound.json" 2>/dev/null
-                        echo
-                        echo "IP-协议 绑定关系:"
-                        while IFS='|' read -r ip proto; do
-                            printf "  %-22s → %s 入站\n" "$ip" "$proto"
-                        done < "$dir/ip_protos.txt" 2>/dev/null
-                    done
-                fi
-                ;;
-            6)
                 if [[ ${#groups[@]} -eq 0 ]]; then
                     yellow "暂无代理节点组"
                 else
@@ -9673,6 +9521,7 @@ PYEOF
                     done
                     yellow "[*] 重启 sing-box..."
                     start_singbox
+                    green "全部代理出站配置已同步并重启！"
                 fi
                 ;;
             0)
@@ -9713,7 +9562,8 @@ menu() {
     fi
     
     # 检测并显示IP状态（优先读取缓存）
-    purple "  本机IP及大陆可达性检测 (API: check-host.net):"
+    purple "【本机网络环境】"
+    echo -e "  平台环境: ${green}${PLATFORM^^}${re} | 用户: ${green}$USERNAME${re} | 主机: ${green}$HOSTNAME${re}"
     local all_cached=true
     for ip in "${ALL_IPS[@]}"; do
         if [ ! -f "$WORKDIR/ip_status_${ip}.txt" ]; then
@@ -9722,96 +9572,88 @@ menu() {
         fi
     done
     
-    # 如果没有全部缓存，则进行一次实时检测
     if [ "$all_cached" = "false" ]; then
         display_ip_list >/dev/null 2>&1
     fi
     
-    # 从缓存显示状态
     local idx=1
     for ip in "${ALL_IPS[@]}"; do
         local status=$(cat "$WORKDIR/ip_status_${ip}.txt" 2>/dev/null)
         if [[ "$status" == "Available" ]]; then
-            green "    [$idx] $ip  ->  [可用] (大陆未阻断)"
+            echo -e "  IP 地址 [$idx]  : ${green}$ip${re}  ->  ${green}[可用] (大陆未阻断)${re}"
         elif [[ "$status" == "Blocked" ]]; then
-            red "    [$idx] $ip  ->  [被墙] (Argo与CDN回源节点、proxyip依旧有效)"
+            echo -e "  IP 地址 [$idx]  : ${red}$ip${re}  ->  ${red}[被墙] (Argo/CDN回源依旧有效)${re}"
         else
-            yellow "    [$idx] $ip  ->  [未知] (检测超时)"
+            echo -e "  IP 地址 [$idx]  : ${yellow}$ip${re}  ->  ${yellow}[未知] (检测超时)${re}"
         fi
         ((idx++))
     done
-    echo "============================================================"
-    echo
+    echo "------------------------------------------------------------"
     
-    # 显示当前主机基本信息
-    purple "平台: ${PLATFORM^^} | 用户: $USERNAME | 主机: $HOSTNAME"
-    echo
-    
-    # 检查安装状态与各平行模块状态
+    purple "【核心服务状态】"
     if [ -f "$WORKDIR/config.json" ]; then
         SB_BINARY=$(cat "$WORKDIR/sb.txt" 2>/dev/null)
         if pgrep -x "$SB_BINARY" > /dev/null 2>&1; then
-            green "【主节点状态】: ✓ 已安装并运行中"
+            echo -e "  Sing-box 核心 : ${green}✓ 运行中${re}"
         else
-            yellow "【主节点状态】: ⚠ 已安装但未运行"
+            echo -e "  Sing-box 核心 : ${yellow}⚠ 已安装但未运行${re}"
         fi
         
-        # 显示主节点出站模式
         local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
         local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
         if [[ "$warp_status" == "true" ]]; then
             if [[ "$warp_mode" == "all" ]]; then
-                blue "【主节点出站】: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
+                echo -e "  主节点出站模式: ${blue}WARP 全局出站${re}"
             else
-                blue "【主节点出站】: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI)"
+                echo -e "  主节点出站模式: ${blue}WARP 规则分流${re}"
             fi
         else
-            green "【主节点出站】: ✓ 直连出站 (Direct 原生网络直连)"
-        fi
-        
-        # 显示副节点 - 赛风出站状态
-        local psi_groups=($(get_egress_node_groups 2>/dev/null))
-        if [[ ${#psi_groups[@]} -gt 0 ]]; then
-            purple "【副节点-赛风】: ✓ 已配置 ${#psi_groups[@]} 个国家出口组 (${psi_groups[*]})"
-        else
-            purple "【副节点-赛风】: ✗ 未配置"
-        fi
-
-        # 显示副节点 - 自定义代理出站状态
-        init_proxy_groups_dir
-        local proxy_tags=($(get_all_proxy_groups 2>/dev/null))
-        if [[ ${#proxy_tags[@]} -gt 0 ]]; then
-            purple "【副节点-代理】: ✓ 已配置 ${#proxy_tags[@]} 个代理出口组 (${proxy_tags[*]})"
-        else
-            purple "【副节点-代理】: ✗ 未配置"
+            echo -e "  主节点出站模式: ${green}原生直连出站${re}"
         fi
     else
-        yellow "【主节点状态】: ✗ 未安装"
+        echo -e "  Sing-box 核心 : ${red}✗ 未安装${re}"
     fi
-    
-    echo
+    echo "------------------------------------------------------------"
+
+    purple "【副节点出口状态】"
+    local psi_groups=($(get_egress_node_groups 2>/dev/null))
+    if [[ ${#psi_groups[@]} -gt 0 ]]; then
+        echo -e "  赛风出口副节点: ${green}✓ 已配置 ${#psi_groups[@]} 组${re} [ ${psi_groups[*]} ]"
+    else
+        echo -e "  赛风出口副节点: ${yellow}✗ 未配置${re}"
+    fi
+
+    init_proxy_groups_dir
+    local proxy_tags=($(get_all_proxy_groups 2>/dev/null))
+    if [[ ${#proxy_tags[@]} -gt 0 ]]; then
+        echo -e "  代理出口副节点: ${green}✓ 已配置 ${#proxy_tags[@]} 组${re} [ ${proxy_tags[*]} ]"
+    else
+        echo -e "  代理出口副节点: ${yellow}✗ 未配置${re}"
+    fi
     echo "============================================================"
+
+    echo
     blue   "  【主节点管理】"
     echo "------------------------------------------------------------"
-    green  "  1. 一键安装主节点 (多协议: Argo/Reality/VMess/Trojan/Hy2/TUIC/SS)"
-    green  "  2. 主节点出站管理 (直连出站 / WARP 全局出站 / WARP 分流出站)"
-    green  "  3. 主节点 Argo 隧道管理 (开关/重置/固定与临时隧道)"
-    green  "  4. 查看主节点信息与订阅 (含各协议链接及主节点出站状态)"
+    green  "  1. 重新配置主节点协议"
+    green  "  2. 主节点出站管理"
+    green  "  3. 主节点 Argo 隧道管理"
+    green  "  4. 查看主节点信息与链接"
     echo "------------------------------------------------------------"
-    purple "  【副节点管理 (平行独立)】"
+    purple "  【副节点管理】"
     echo "------------------------------------------------------------"
-    purple "  5. 【副节点】赛风出站多出口管理 (添加/删除出口组、延迟测试、状态)"
-    purple "  6. 【副节点】自定义代理出站多出口管理 (添加/修改/删除外部代理出站、测速)"
+    purple "  5. 赛风综合管理"
+    purple "  6. 自定义代理出站管理"
     echo "------------------------------------------------------------"
     white  "  【综合功能与系统运维】"
     echo "------------------------------------------------------------"
-    blue   "  7. 自定义节点组合推送 (自由勾选主/副节点生成专属订阅)"
-    blue   "  8. 查看全部节点信息总览 (主节点 + 副节点分类汇总)"
-    green  "  9. 重启所有服务 (主节点 + 赛风多实例 + 自定义代理完整同步)"
-    yellow " 10. 重置端口 / 端口冲突检测与修复"
-    blue   " 11. 查看运行日志 (sing-box / Argo / Psiphon 日志)"
-    yellow " 12. 卸载删除主节点与服务"
-    red    " 13. 系统初始化清理 (清理全部进程及配置)"
+    blue   "  7. 自定义节点组合推送"
+    blue   "  8. 查看全部节点信息总览"
+    green  "  9. 重启所有服务"
+    yellow " 10. 端口冲突检测与重置"
+    blue   " 11. 查看运行日志"
+    yellow " 12. 卸载删除主节点服务"
+    red    " 13. 系统初始化与环境重置"
     echo "------------------------------------------------------------"
     red    "  0. 退出脚本"
     echo "============================================================"
