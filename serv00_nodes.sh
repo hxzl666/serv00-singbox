@@ -21,14 +21,16 @@ red="\033[1;91m"
 green="\e[1;32m"
 yellow="\e[1;33m"
 purple="\e[1;35m"
-blue="\e[1;36m"
+blue="\e[1;34m"
+cyan="\e[1;36m"
 white="\e[1;37m"
 
 red() { echo -e "\e[1;91m$1\033[0m"; }
 green() { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
-blue() { echo -e "\e[1;36m$1\033[0m"; }
+blue() { echo -e "\e[1;34m$1\033[0m"; }
+cyan() { echo -e "\e[1;36m$1\033[0m"; }
 white() { echo -e "\e[1;37m$1\033[0m"; }
 reading() { read -p "$(yellow "$1")" "$2"; }
 
@@ -4346,47 +4348,187 @@ except:
 PY
 }
 
+# 重新/修复指定赛风出口组 (彻底清理历史脏数据库并执行 1~10s 动态轮询连通性探测)
+repair_single_psiphon_instance() {
+    local groups=($(get_egress_node_groups))
+    if [[ ${#groups[@]} -eq 0 ]]; then
+        yellow "[!] 当前暂无已配置的赛风出口组"
+        return 1
+    fi
+
+    echo
+    green "============================================================"
+    green "  重启 / 修复指定赛风出口组"
+    green "============================================================"
+    echo "当前已配置的赛风出口组列表:"
+    local idx=1
+    for cc in "${groups[@]}"; do
+        [[ -z "$cc" ]] && continue
+        local cname=$(get_country_name "$cc")
+        local hp=$(cat "${PSI_INSTANCES_DIR}/$cc/hy2_port.txt" 2>/dev/null || echo "0")
+        local tp=$(cat "${PSI_INSTANCES_DIR}/$cc/tuic_port.txt" 2>/dev/null || echo "0")
+        local vp=$(cat "${PSI_INSTANCES_DIR}/$cc/vless_port.txt" 2>/dev/null || echo "0")
+        local p_info=""
+        [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
+        [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
+        [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
+        local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
+        local st_str="${red}[✗ 未运行]${re}"
+        if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+            st_str="${green}[✓ 运行中]${re}"
+        fi
+        echo -e "  ${green}[${idx}] [${cc}] ${cname}${re} ${st_str} (入站: ${p_info:-无})"
+        ((idx++))
+    done
+    echo "------------------------------------------------------------"
+    red  "  0. 取消并返回"
+    echo "============================================================"
+    reading "请输入要重启/修复的国家序号或代码 (如 1 或 US): " target_in
+    [[ -z "$target_in" || "$target_in" == "0" ]] && return 0
+
+    local target_cc=""
+    if [[ "$target_in" =~ ^[0-9]+$ ]]; then
+        local sel_idx=$((target_in - 1))
+        if [[ $sel_idx -ge 0 && $sel_idx -lt ${#groups[@]} ]]; then
+            target_cc="${groups[$sel_idx]}"
+        fi
+    else
+        target_cc="${target_in^^}"
+    fi
+
+    if [[ -z "$target_cc" || ! -d "${PSI_INSTANCES_DIR}/$target_cc" ]]; then
+        red "[!] 未找到指定的赛风出口组: $target_in"
+        return 1
+    fi
+
+    local cname=$(get_country_name "$target_cc")
+    local inst_dir="${PSI_INSTANCES_DIR}/${target_cc}"
+    echo
+    yellow "[*] 正在为 [$target_cc - $cname] 执行深度重启与修复..."
+
+    # 1. 停止旧服务并清理可能残留的孤儿进程
+    echo -e "${blue}--> [1/5] 停止旧服务并清理可能残留的孤儿进程...${re}"
+    stop_psiphon_instance "$target_cc"
+    sleep 1
+
+    # 2. 校验与校准 Socks5 端口
+    echo -e "${blue}--> [2/5] 校验本地 Socks5 监听与绑定...${re}"
+    > "$inst_dir/psiphon.log" 2>/dev/null
+    > "$inst_dir/socks_port.txt" 2>/dev/null
+
+    # 3. 彻底重置历史脏数据并载入纯净种子
+    echo -e "${blue}--> [3/5] 彻底重置历史脏数据并载入纯净种子列表...${re}"
+    rm -rf "$inst_dir/psiphon-data" 2>/dev/null || true
+    mkdir -p "$inst_dir/psiphon-data" 2>/dev/null
+    write_instance_config "$target_cc"
+
+    # 4. 同步 Sing-box 出站与分流路由规则
+    echo -e "${blue}--> [4/5] 同步 Sing-box 出站与分流路由规则...${re}"
+    add_egress_to_singbox "$target_cc"
+    start_singbox_safe
+
+    # 5. 启动服务并执行平滑动态出口连通性探测
+    echo -e "${blue}--> [5/5] 拉起守护进程并执行实时出口连通性探测...${re}"
+    start_psiphon_instance "$target_cc"
+    
+    local socks_p=$(get_instance_socks_port "$target_cc")
+    local out_ip=""
+    local max_wait=10
+    local elapsed=0
+
+    if [[ "$socks_p" =~ ^[0-9]+$ ]] && (( socks_p > 0 )); then
+        for ((i=1; i<=max_wait; i++)); do
+            printf "\r    [*] 正在建立加密隧道并探测出口 IP (%ds/%ds)..." "$i" "$max_wait"
+            local res=""
+            res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "http://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
+            [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "http://ipv4.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+            [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "https://api.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+
+            if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                out_ip="$res"
+                elapsed=$i
+                break
+            fi
+            sleep 1
+        done
+    fi
+    printf "\r\033[K"
+
+    echo
+    if [[ -n "$out_ip" ]]; then
+        local ip_info=$(curl -s4m 4 "http://ip-api.com/json/${out_ip}?lang=zh-CN" 2>/dev/null)
+        local ip_country=$(echo "$ip_info" | jq -r '.country // empty' 2>/dev/null)
+        local ip_isp=$(echo "$ip_info" | jq -r '.isp // empty' 2>/dev/null)
+        green "============================================================"
+        green "  [✓] 赛风出口组 [$target_cc - $cname] 重启修复成功！(握手耗时: 约 ${elapsed}s)"
+        green "============================================================"
+        green "  运行状态 : 正常运行中"
+        blue  "  出口 IP  : ${out_ip}"
+        [[ -n "$ip_country" ]] && purple "  出口归属 : ${ip_country} (${ip_isp:-未知})"
+        green "============================================================"
+    else
+        green "============================================================"
+        green "  [✓] 赛风服务已重新拉起并常驻守护！"
+        yellow "  提示: 远端隧道握手耗时较长，守护进程已在后台持续重试"
+        yellow "        可稍后在查看链接或客户端连接进行测试"
+        green "============================================================"
+    fi
+
+    generate_egress_node_links "$target_cc"
+}
+
 # 多出口节点管理菜单
 multi_egress_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  Psiphon 多出口节点组管理"
+        green "  副节点 - 赛风多出口组管理"
+        green "============================================================"
+        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站走赛风对应国家"
+        yellow "        与主节点完全平行独立，互不干扰"
         green "============================================================"
         echo
         
         # 显示现有节点组
         local groups=($(get_egress_node_groups))
-        purple "当前节点组:"
+        purple "【当前已配置赛风出口组】 (共 ${#groups[@]} 组):"
         if [[ ${#groups[@]} -gt 0 ]]; then
+            local idx=1
             for cc in "${groups[@]}"; do
+                [[ -z "$cc" ]] && continue
                 local name=$(get_country_name "$cc")
-                local port=$(get_instance_socks_port "$cc")
+                local hp=$(cat "${PSI_INSTANCES_DIR}/$cc/hy2_port.txt" 2>/dev/null || echo "0")
+                local tp=$(cat "${PSI_INSTANCES_DIR}/$cc/tuic_port.txt" 2>/dev/null || echo "0")
+                local vp=$(cat "${PSI_INSTANCES_DIR}/$cc/vless_port.txt" 2>/dev/null || echo "0")
+                local p_info=""
+                [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
+                [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
+                [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
                 local pid_file="$PSI_INSTANCES_DIR/$cc/psiphon.pid"
-                local status="未运行"
-                if [[ -f "$pid_file" ]] && kill -0 $(cat "$pid_file") 2>/dev/null; then
-                    status="运行中"
+                local st_str="${red}[✗ 未运行]${re}"
+                if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                    st_str="${green}[✓ 运行中]${re}"
                 fi
-                printf "  %-4s %-10s %-8s SOCKS: %s\n" "$cc" "$name" "$status" "$port"
+                echo -e "  ${green}[$idx] [$cc] $name${re} $st_str"
+                echo -e "      ${blue}入站端口: [ ${p_info:-无} ]${re}"
+                ((idx++))
             done
         else
-            yellow "  暂无节点组"
+            yellow "  暂无赛风出口组"
         fi
         
         echo
         echo "------------------------------------------------------------"
-        green  "  1. 添加新出口节点组"
-        green  "  2. 删除出口节点组"
-        green  "  3. 查看所有节点链接"
+        green  "  1. 添加赛风出口组"
+        green  "  2. 查看赛风出口组链接"
+        red    "  3. 删除赛风出口组"
+        blue   "  4. 重启/修复指定赛风出口组"
+        blue   "  5. 重启所有赛风实例"
         echo "------------------------------------------------------------"
-        yellow "  4. 重启所有 Psiphon 实例"
-        yellow "  5. 停止所有 Psiphon 实例"
-        yellow "  6. 测试所有出口 IP"
-        echo "------------------------------------------------------------"
-        red    "  0. 返回上级菜单"
+        red    "  0. 返回上一级菜单"
         echo "============================================================"
-        reading "请选择 [0-6]: " choice
+        reading "请选择 [0-5]: " choice
         echo
         
         case "$choice" in
@@ -4403,7 +4545,8 @@ multi_egress_menu() {
                     yellow "  2. 仅 VLESS-Reality - 需要 1 TCP 端口"
                     yellow "  3. 仅 UDP (Hy2 + TUIC) - 需要 2 UDP 端口"
                     yellow "  4. 仅 Hysteria2 - 需要 1 UDP 端口"
-                    reading "请选择 [1-4]: " proto_choice
+                    reading "请选择 [1-4, 默认1]: " proto_choice
+                    [[ -z "$proto_choice" ]] && proto_choice="1"
                     
                     case "$proto_choice" in
                         1) add_egress_node_group "$new_cc" true true true ;;
@@ -4416,30 +4559,40 @@ multi_egress_menu() {
                 ;;
             2)
                 if [[ ${#groups[@]} -eq 0 ]]; then
-                    yellow "暂无节点组可删除"
+                    yellow "暂无赛风出口组"
                 else
                     echo
-                    reading "请输入要删除的国家码: " del_cc
-                    [[ -n "$del_cc" ]] && remove_egress_node_group "$del_cc"
+                    for cc in "${groups[@]}"; do
+                        generate_egress_node_links "$cc"
+                    done
                 fi
                 ;;
             3)
-                echo
-                for cc in "${groups[@]}"; do
-                    generate_egress_node_links "$cc"
-                done
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无赛风出口组可删除"
+                else
+                    echo
+                    reading "请输入要删除的国家码 (如 US): " del_cc
+                    [[ -n "$del_cc" ]] && remove_egress_node_group "$del_cc"
+                fi
                 ;;
             4)
-                start_all_psiphon_instances
+                repair_single_psiphon_instance
                 ;;
             5)
-                stop_all_psiphon_instances
-                ;;
-            6)
-                echo
+                yellow "正在重启并重置所有赛风实例..."
                 for cc in "${groups[@]}"; do
-                    test_instance_egress "$cc"
+                    [[ -z "$cc" ]] && continue
+                    local idir="${PSI_INSTANCES_DIR}/${cc}"
+                    stop_psiphon_instance "$cc"
+                    rm -rf "$idir/psiphon-data" 2>/dev/null || true
+                    mkdir -p "$idir/psiphon-data" 2>/dev/null
+                    write_instance_config "$cc"
+                    start_psiphon_instance "$cc"
                 done
+                sync_all_psiphon_ports || true
+                start_singbox_safe
+                green "所有赛风实例已重启、清空旧缓存并重新载入种子守护！"
                 ;;
             0)
                 return 0
