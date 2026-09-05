@@ -8463,9 +8463,30 @@ add_proxy_egress_group() {
             echo "  2. 申请新的 Hysteria2 端口"
             reading "  请选择 [1-2]: " port_choice
             if [[ "$port_choice" == "1" ]]; then
-                echo "已有端口列表:"
+                echo "已有端口列表 (括号内为占用情况):"
                 for i in "${!used_hy2_ports[@]}"; do
-                    echo "  $((i+1)). ${used_hy2_ports[$i]}"
+                    local hp="${used_hy2_ports[$i]}"
+                    local occ=()
+                    local g2
+                    for g2 in $(get_all_proxy_groups); do
+                        local gd2="${PROXY_GROUPS_DIR}/$g2"
+                        [[ -d "$gd2" ]] || continue
+                        local gh2=$(cat "$gd2/hy2_port.txt" 2>/dev/null)
+                        [[ -n "$gh2" && "$gh2" == "$hp" ]] || continue
+                        while IFS='|' read -r bip bproto; do
+                            [[ -z "$bip" ]] && continue
+                            if [[ "$bproto" == "hy2" || "$bproto" == "both" ]]; then
+                                occ+=("$bip($g2)")
+                            fi
+                        done < "$gd2/ip_protos.txt"
+                    done
+                    if [[ ${#occ[@]} -eq 0 ]]; then
+                        green "  $((i+1)). $hp  [全部 ${#ALL_IPS[@]} 个IP可用]"
+                    elif [[ ${#occ[@]} -ge ${#ALL_IPS[@]} ]]; then
+                        red "  $((i+1)). $hp  [!! 所有IP已被占用: ${occ[*]}]"
+                    else
+                        yellow "  $((i+1)). $hp  [可用 $(( ${#ALL_IPS[@]} - ${#occ[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${occ[*]}]"
+                    fi
                 done
                 reading "  请选择复用的端口序号: " p_idx
                 p_idx=$((p_idx-1))
@@ -8509,9 +8530,30 @@ add_proxy_egress_group() {
             echo "  2. 申请新的 TUIC 端口"
             reading "  请选择 [1-2]: " port_choice
             if [[ "$port_choice" == "1" ]]; then
-                echo "已有端口列表:"
+                echo "已有端口列表 (括号内为占用情况):"
                 for i in "${!used_tuic_ports[@]}"; do
-                    echo "  $((i+1)). ${used_tuic_ports[$i]}"
+                    local tp="${used_tuic_ports[$i]}"
+                    local tocc=()
+                    local g3
+                    for g3 in $(get_all_proxy_groups); do
+                        local gd3="${PROXY_GROUPS_DIR}/$g3"
+                        [[ -d "$gd3" ]] || continue
+                        local gt3=$(cat "$gd3/tuic_port.txt" 2>/dev/null)
+                        [[ -n "$gt3" && "$gt3" == "$tp" ]] || continue
+                        while IFS='|' read -r bip bproto; do
+                            [[ -z "$bip" ]] && continue
+                            if [[ "$bproto" == "tuic" || "$bproto" == "both" ]]; then
+                                tocc+=("$bip($g3)")
+                            fi
+                        done < "$gd3/ip_protos.txt"
+                    done
+                    if [[ ${#tocc[@]} -eq 0 ]]; then
+                        green "  $((i+1)). $tp  [全部 ${#ALL_IPS[@]} 个IP可用]"
+                    elif [[ ${#tocc[@]} -ge ${#ALL_IPS[@]} ]]; then
+                        red "  $((i+1)). $tp  [!! 所有IP已被占用: ${tocc[*]}]"
+                    else
+                        yellow "  $((i+1)). $tp  [可用 $(( ${#ALL_IPS[@]} - ${#tocc[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${tocc[*]}]"
+                    fi
                 done
                 reading "  请选择复用的端口序号: " p_idx
                 p_idx=$((p_idx-1))
