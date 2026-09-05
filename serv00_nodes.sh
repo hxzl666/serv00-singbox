@@ -8493,6 +8493,26 @@ add_proxy_egress_group() {
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_hy2_ports[@]} ]]; then
                     hy2_port="${used_hy2_ports[$p_idx]}"
                     green "  → 选择复用 Hysteria2 端口: $hy2_port"
+                    # 预告该端口在各 IP 上的可用性
+                    local free_ips=() occ_ips=()
+                    for ip2 in "${ALL_IPS[@]}"; do
+                        local ip_occ=false
+                        for g4 in $(get_all_proxy_groups); do
+                            local gd4="${PROXY_GROUPS_DIR}/$g4"
+                            [[ -d "$gd4" ]] || continue
+                            local gh4=$(cat "$gd4/hy2_port.txt" 2>/dev/null)
+                            [[ -n "$gh4" && "$gh4" == "$hy2_port" ]] || continue
+                            while IFS='|' read -r bip bproto; do
+                                if [[ "$bip" == "$ip2" && ( "$bproto" == "hy2" || "$bproto" == "both" ) ]]; then
+                                    ip_occ=true; occ_ips+=("$ip2($g4)"); break
+                                fi
+                            done < "$gd4/ip_protos.txt"
+                            [[ "$ip_occ" == "true" ]] && break
+                        done
+                        [[ "$ip_occ" == "false" ]] && free_ips+=("$ip2")
+                    done
+                    yellow "    可用IP: ${free_ips[*]:-无}"
+                    [[ ${#occ_ips[@]} -gt 0 ]] && red "    已被占用(将自动跳过): ${occ_ips[*]}"
                 else
                     red "  [!] 无效选择，将申请新端口"
                 fi
@@ -8560,6 +8580,26 @@ add_proxy_egress_group() {
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_tuic_ports[@]} ]]; then
                     tuic_port="${used_tuic_ports[$p_idx]}"
                     green "  → 选择复用 TUIC 端口: $tuic_port"
+                    # 预告该端口在各 IP 上的可用性
+                    local tfree_ips=() tocc_ips=()
+                    for ip2 in "${ALL_IPS[@]}"; do
+                        local tip_occ=false
+                        for g5 in $(get_all_proxy_groups); do
+                            local gd5="${PROXY_GROUPS_DIR}/$g5"
+                            [[ -d "$gd5" ]] || continue
+                            local gt5=$(cat "$gd5/tuic_port.txt" 2>/dev/null)
+                            [[ -n "$gt5" && "$gt5" == "$tuic_port" ]] || continue
+                            while IFS='|' read -r bip bproto; do
+                                if [[ "$bip" == "$ip2" && ( "$bproto" == "tuic" || "$bproto" == "both" ) ]]; then
+                                    tip_occ=true; tocc_ips+=("$ip2($g5)"); break
+                                fi
+                            done < "$gd5/ip_protos.txt"
+                            [[ "$tip_occ" == "true" ]] && break
+                        done
+                        [[ "$tip_occ" == "false" ]] && tfree_ips+=("$ip2")
+                    done
+                    yellow "    可用IP: ${tfree_ips[*]:-无}"
+                    [[ ${#tocc_ips[@]} -gt 0 ]] && red "    已被占用(将自动跳过): ${tocc_ips[*]}"
                 else
                     red "  [!] 无效选择，将申请新端口"
                 fi
@@ -8640,14 +8680,12 @@ add_proxy_egress_group() {
 
         if [[ "$can_hy2" == "false" && "$can_tuic" == "false" ]]; then
             if [[ "$need_hy2" == "true" && "$need_tuic" == "true" ]]; then
-                red "    [!] 该 IP 的 Hysteria2(端口 ${hy2_port}) 和 TUIC(端口 ${tuic_port}) 均已被其它节点组占用，无法在此 IP 上绑定双入站。"
+                yellow "    [自动跳过] 该 IP 的 Hysteria2(端口 ${hy2_port}) 和 TUIC(端口 ${tuic_port}) 均已被其它节点组占用，无法在此 IP 上绑定双入站。"
             elif [[ "$need_hy2" == "true" ]]; then
-                red "    [!] 该 IP 的 Hysteria2(端口 ${hy2_port}) 已被其它节点组占用，无法绑定。"
+                yellow "    [自动跳过] 该 IP 的 Hysteria2(端口 ${hy2_port}) 已被其它节点组占用，无需选择。"
             else
-                red "    [!] 该 IP 的 TUIC(端口 ${tuic_port}) 已被其它节点组占用，无法绑定。"
+                yellow "    [自动跳过] 该 IP 的 TUIC(端口 ${tuic_port}) 已被其它节点组占用，无需选择。"
             fi
-            yellow "    0. 跳过此 IP"
-            reading "    选择 [0]: " pc
             continue
         fi
 
