@@ -2050,6 +2050,8 @@ start_psiphon_userland() {
 
 # 可靠启动 sing-box（使用绝对路径，不依赖当前目录）
 start_singbox_safe() {
+    local retry_count=${1:-0}
+    local max_retries=3
     local SB_BINARY
     SB_BINARY="$(cat "$WORKDIR/sb.txt" 2>/dev/null)"
     
@@ -2120,6 +2122,9 @@ PY
     pkill -x "$SB_BINARY" >/dev/null 2>&1 || true
     sleep 1
 
+    # 清空旧日志，确保端口冲突检测的日志只反映本次启动
+    > "$WORKDIR/singbox.log" 2>/dev/null || true
+
     # 启动（使用绝对路径）
     cd "$WORKDIR"
     run_detached "$WORKDIR/singbox.pid" "$WORKDIR/singbox.log" \
@@ -2132,6 +2137,19 @@ PY
     else
         red "[!] sing-box 启动失败，查看日志：$WORKDIR/singbox.log"
         tail -20 "$WORKDIR/singbox.log" 2>/dev/null
+
+        # 自愈：检测到端口冲突 (address already in use / bind 错误) 时，
+        # 自动调用 auto_repair_conflicting_ports 修复端口并重试 (最多 max_retries 次)
+        if grep -qE "address already in use|bind:" "$WORKDIR/singbox.log" 2>/dev/null; then
+            if [ "$retry_count" -lt "$max_retries" ]; then
+                yellow "[!] 检测到端口冲突 (address already in use)，正在自动修复端口并重试 (尝试 $((retry_count + 1))/$max_retries)..."
+                if auto_repair_conflicting_ports; then
+                    start_singbox_safe $((retry_count + 1))
+                    return $?
+                fi
+                yellow "[!] 端口修复未完成，启动失败 (已尝试 $((retry_count + 1)) 次)"
+            fi
+        fi
         return 1
     fi
 }
@@ -5573,6 +5591,63 @@ sync_all_secondary_nodes() {
     if [[ -d "$PROXY_GROUPS_DIR" ]]; then
         sync_all_proxy_groups >/dev/null 2>&1 || true
     fi
+
+    # 3. 去重防御: 全部副节点合并完成后，清理 config.json 中重复的 inbound
+    #    (同 tag 或同 (listen, listen_port, type))，防止 sing-box 启动时
+    #    bind 冲突报 "address already in use"
+    dedup_inbounds_in_config
+}
+
+# ==================== inbounds 去重防御 ====================
+# 防止 config.json 内出现重复 inbound (同 tag 或同 listen+listen_port+type)，
+# 该问题会导致 sing-box 按序绑定时第二个 inbound 报 "address already in use"。
+# 与 upstream apply_changes 的 jq unique_by(.tag) 对齐，serv00 版用 python3
+# (保留原始顺序，仅按 key 去重，不影响订阅生成时的节点顺序)
+dedup_inbounds_in_config() {
+    [ -f "$WORKDIR/config.json" ] || return 0
+
+    python3 - <<PY 2>/dev/null
+import json
+
+cfg = r"$WORKDIR/config.json"
+try:
+    with open(cfg, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    ibs = data.get("inbounds", [])
+    if not isinstance(ibs, list) or len(ibs) <= 1:
+        raise SystemExit(0)
+
+    seen_addr = set()   # (listen, listen_port, type) 唯一，防端口冲突
+    seen_tag = set()    # tag 唯一，对齐 upstream unique_by(.tag)
+    out = []
+    removed = 0
+    for ib in ibs:
+        if not isinstance(ib, dict):
+            out.append(ib)
+            continue
+        tag = ib.get("tag") or ""
+        addr_key = (ib.get("listen") or "::", ib.get("listen_port"), ib.get("type"))
+        if addr_key in seen_addr:
+            removed += 1
+            continue
+        if tag and tag in seen_tag:
+            removed += 1
+            continue
+        seen_addr.add(addr_key)
+        if tag:
+            seen_tag.add(tag)
+        out.append(ib)
+
+    if removed:
+        data["inbounds"] = out
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print("[i] inbounds 去重: 移除 %d 个重复 inbound (同 tag 或同 listen+port+type)" % removed)
+except SystemExit:
+    pass
+except Exception as e:
+    print("[!] inbounds 去重跳过: %s" % e)
+PY
 }
 
 # ==================== 全量端口重置 (核武器级回退) ====================
