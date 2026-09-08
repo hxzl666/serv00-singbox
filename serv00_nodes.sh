@@ -78,6 +78,7 @@ export ENABLE_TROJAN_WS=${ENABLE_TROJAN_WS:-false}
 export ENABLE_HYSTERIA2=${ENABLE_HYSTERIA2:-true}
 export ENABLE_TUIC=${ENABLE_TUIC:-true}
 export ENABLE_SHADOWSOCKS=${ENABLE_SHADOWSOCKS:-false}
+export ENABLE_ANYTLS=${ENABLE_ANYTLS:-false}
 
 # ==================== WARP 出站配置 ====================
 # 是否启用 WARP 出站 (默认关闭)
@@ -789,11 +790,23 @@ check_port() {
             red "TUIC端口添加失败 (可能UDP端口数量已达上限)"
         fi
         
+        # AnyTLS端口 (TCP, 可选)
+        local anytls_port=""
+        if [[ "$ENABLE_ANYTLS" == "true" ]]; then
+            anytls_port=$(add_port_with_desc "tcp" "singbox-anytls")
+            if [ -n "$anytls_port" ]; then
+                green "已添加端口: $anytls_port (TCP) - singbox-anytls"
+            else
+                red "AnyTLS端口添加失败"
+            fi
+        fi
+        
         # 分配端口
         export VMESS_PORT=$vmess_port
         export VLESS_PORT=$vless_port
         export HY2_PORT=$hy2_port
         export TUIC_PORT=$tuic_port
+        export ANYTLS_PORT=$anytls_port
         
         echo
         purple "端口分配:"
@@ -801,6 +814,7 @@ check_port() {
         purple "  VLESS-Reality:   ${VLESS_PORT:-未分配} (TCP)"
         purple "  Hysteria2:       ${HY2_PORT:-未分配} (UDP)"
         purple "  TUIC v5:         ${TUIC_PORT:-未分配} (UDP)"
+        purple "  AnyTLS:          ${ANYTLS_PORT:-未分配} (TCP)"
         
         # 检查是否有端口添加失败
         if [ -z "$vmess_port" ] || [ -z "$vless_port" ]; then
@@ -840,6 +854,9 @@ check_port() {
     
     # TUIC 需要 1 UDP (独立端口，不共用)
     [[ "$ENABLE_TUIC" == "true" ]] && ((required_udp++))
+    
+    # AnyTLS 需要 1 TCP
+    [[ "$ENABLE_ANYTLS" == "true" ]] && ((required_tcp++))
     
     yellow "根据协议选择，需要: ${required_tcp} TCP + ${required_udp} UDP = $((required_tcp + required_udp)) 端口"
     
@@ -937,6 +954,18 @@ check_port() {
             export VLESS_PORT=$TCP_PORT1
         else
             export VLESS_PORT=$TCP_PORT2
+        fi
+        ((tcp_idx++))
+    fi
+    
+    # AnyTLS 分配下一个TCP (若第三个TCP存在)
+    if [[ "$ENABLE_ANYTLS" == "true" ]]; then
+        if [[ $tcp_idx -eq 1 ]]; then
+            export ANYTLS_PORT=$TCP_PORT1
+        elif [[ $tcp_idx -eq 2 ]]; then
+            export ANYTLS_PORT=$TCP_PORT2
+        else
+            export ANYTLS_PORT=$(echo "$tcp_ports_list" | sed -n '3p')
         fi
         ((tcp_idx++))
     fi
@@ -4920,6 +4949,9 @@ calculate_port_usage() {
         # SS 共用 VMess 端口 +1，不额外计算
     fi
     
+    # AnyTLS 需要 1 TCP (v1.12+)
+    [[ "$ENABLE_ANYTLS" == "true" ]] && ((tcp_count++))
+    
     # Argo 不占端口
     # Trojan-WS 共用 VMess 端口，不额外计算
     
@@ -4945,6 +4977,7 @@ select_protocols() {
         blue "  • Hysteria2: 1 UDP"
         blue "  • TUIC v5: 1 UDP"
         blue "  • Shadowsocks: 使用VMess端口"
+        blue "  • AnyTLS: 1 TCP (v1.12+)"
         echo
         green "推荐组合 (3端口): Argo + VLESS + Hy2 + TUIC"
         echo
@@ -4958,6 +4991,7 @@ select_protocols() {
     ENABLE_HYSTERIA2=false
     ENABLE_TUIC=false
     ENABLE_SHADOWSOCKS=false
+    ENABLE_ANYTLS=false
     
     yellow "选择安装方式:"
     yellow "  1. 使用推荐组合 (Argo + VLESS + Hy2 + TUIC)"
@@ -5042,6 +5076,13 @@ select_protocols() {
                 yellow "  [7] [✗] Shadowsocks-2022 - 使用VMess端口"
             fi
             
+            # 8. AnyTLS (1 TCP)
+            if [[ "$ENABLE_ANYTLS" == "true" ]]; then
+                green "  [8] [✓] AnyTLS - 1 TCP (v1.12+)"
+            else
+                yellow "  [8] [✗] AnyTLS - 1 TCP (v1.12+)"
+            fi
+            
             echo
             echo "------------------------------------------------------------"
             blue "  a. 全选推荐组合 (Argo+VLESS+Hy2+TUIC)"
@@ -5049,7 +5090,7 @@ select_protocols() {
             green "  d. 完成选择，继续安装"
             echo "============================================================"
             echo
-            reading "输入数字切换选择 [1-7/a/n/d]: " choice
+            reading "输入数字切换选择 [1-8/a/n/d]: " choice
             
             case "$choice" in
                 1)
@@ -5122,6 +5163,18 @@ select_protocols() {
                         [[ "$ENABLE_SHADOWSOCKS" == "true" ]] && ENABLE_SHADOWSOCKS=false || ENABLE_SHADOWSOCKS=true
                     fi
                     ;;
+                8)
+                    if [[ "$ENABLE_ANYTLS" == "true" ]]; then
+                        ENABLE_ANYTLS=false
+                    else
+                        ENABLE_ANYTLS=true
+                        if [[ $(calculate_port_usage) -gt $max_ports ]]; then
+                            red "超出端口限制! 请先取消其他协议"
+                            ENABLE_ANYTLS=false
+                            sleep 1
+                        fi
+                    fi
+                    ;;
                 a|A)
                     # 推荐组合
                     ENABLE_ARGO=true
@@ -5131,6 +5184,7 @@ select_protocols() {
                     ENABLE_HYSTERIA2=true
                     ENABLE_TUIC=true
                     ENABLE_SHADOWSOCKS=false
+                    ENABLE_ANYTLS=false
                     ;;
                 n|N)
                     ENABLE_ARGO=false
@@ -5140,12 +5194,13 @@ select_protocols() {
                     ENABLE_HYSTERIA2=false
                     ENABLE_TUIC=false
                     ENABLE_SHADOWSOCKS=false
+                    ENABLE_ANYTLS=false
                     ;;
                 d|D)
                     # 检查是否有选择
                     if [[ "$ENABLE_ARGO" != "true" ]] && [[ "$ENABLE_VLESS_REALITY" != "true" ]] && \
                        [[ "$ENABLE_VMESS_WS" != "true" ]] && [[ "$ENABLE_HYSTERIA2" != "true" ]] && \
-                       [[ "$ENABLE_TUIC" != "true" ]]; then
+                       [[ "$ENABLE_TUIC" != "true" ]] && [[ "$ENABLE_ANYTLS" != "true" ]]; then
                         red "请至少选择一个协议!"
                         sleep 1
                         continue
@@ -5174,6 +5229,7 @@ select_protocols() {
     [[ "$ENABLE_HYSTERIA2" == "true" ]] && purple "  ✓ Hysteria2 (1 UDP)"
     [[ "$ENABLE_TUIC" == "true" ]] && purple "  ✓ TUIC v5 (1 UDP)"
     [[ "$ENABLE_SHADOWSOCKS" == "true" ]] && purple "  ✓ Shadowsocks-2022 (共用VMess端口)"
+    [[ "$ENABLE_ANYTLS" == "true" ]] && purple "  ✓ AnyTLS (1 TCP)"
     
     green "端口占用: $(calculate_port_usage) 个"
     
@@ -5335,6 +5391,27 @@ EOF
       \"method\": \"2022-blake3-aes-128-gcm\",
       \"password\": \"$SS_PASSWORD\"
     }")
+    fi
+    
+    # AnyTLS - 为每个IP创建监听 (v1.12+)
+    if [[ "$ENABLE_ANYTLS" == "true" ]]; then
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            inbounds+=("    {
+      \"tag\": \"anytls-in-$idx\",
+      \"type\": \"anytls\",
+      \"listen\": \"$ip\",
+      \"listen_port\": $ANYTLS_PORT,
+      \"users\": [{\"name\": \"default\", \"password\": \"$UUID\"}],
+      \"tls\": {
+        \"enabled\": true,
+        \"server_name\": \"www.bing.com\",
+        \"certificate_path\": \"cert.pem\",
+        \"key_path\": \"private.key\"
+      }
+    }")
+            ((idx++))
+        done
     fi
     
     # 如果启用 WARP，添加回环 Socks 入站用于出口 IP 检测
@@ -6140,6 +6217,7 @@ VMESS_PORT=$VMESS_PORT
 VLESS_PORT=$VLESS_PORT
 HY2_PORT=$HY2_PORT
 TUIC_PORT=$TUIC_PORT
+ANYTLS_PORT=$ANYTLS_PORT
 EOF
         generate_singbox_config
     fi
@@ -6447,6 +6525,7 @@ load_saved_config() {
             [[ "$key" == "VLESS_PORT" ]] && export VLESS_PORT="$val"
             [[ "$key" == "HY2_PORT"   ]] && export HY2_PORT="$val"
             [[ "$key" == "TUIC_PORT"  ]] && export TUIC_PORT="$val"
+            [[ "$key" == "ANYTLS_PORT" ]] && export ANYTLS_PORT="$val"
         done < "$WORKDIR/ports.txt"
 
         # 自动将净化后的端口回写盘中
@@ -6455,6 +6534,7 @@ VMESS_PORT=${VMESS_PORT:-}
 VLESS_PORT=${VLESS_PORT:-}
 HY2_PORT=${HY2_PORT:-}
 TUIC_PORT=${TUIC_PORT:-}
+ANYTLS_PORT=${ANYTLS_PORT:-}
 EOF
     fi
 
@@ -6471,6 +6551,7 @@ EOF
     [ -f "$WORKDIR/enable_hy2.txt" ]     && ENABLE_HYSTERIA2=$(cat "$WORKDIR/enable_hy2.txt" 2>/dev/null)
     [ -f "$WORKDIR/enable_tuic.txt" ]    && ENABLE_TUIC=$(cat "$WORKDIR/enable_tuic.txt" 2>/dev/null)
     [ -f "$WORKDIR/enable_ss.txt" ]      && ENABLE_SHADOWSOCKS=$(cat "$WORKDIR/enable_ss.txt" 2>/dev/null)
+    [ -f "$WORKDIR/enable_anytls.txt" ]  && ENABLE_ANYTLS=$(cat "$WORKDIR/enable_anytls.txt" 2>/dev/null)
 
     # 加载Reality密钥
     [ -f "$WORKDIR/public_key.txt" ]  && REALITY_PUBLIC_KEY=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
@@ -6717,6 +6798,22 @@ generate_links() {
             ((node_count++))
         done
         purple "TUIC v5 节点已生成 (${IP_COUNT} 个)"
+    fi
+    
+    # 为每个IP生成 AnyTLS (v1.12+)
+    if [[ "$ENABLE_ANYTLS" == "true" ]]; then
+        echo "=== AnyTLS === " >> list.txt
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            anytls_link="anytls://$UUID@$ip:$ANYTLS_PORT?security=tls&sni=www.bing.com&allowInsecure=1#$NAME-anytls-$idx"
+            echo "$anytls_link" >> links.txt
+            echo "[$idx] $ip" >> list.txt
+            echo "$anytls_link" >> list.txt
+            echo "" >> list.txt
+            ((idx++))
+            ((node_count++))
+        done
+        purple "AnyTLS 节点已生成 (${IP_COUNT} 个)"
     fi
     
     # Shadowsocks (只需要一个，监听::)
@@ -7371,6 +7468,7 @@ install_nodes() {
     echo "$ENABLE_HYSTERIA2" > "$WORKDIR/enable_hy2.txt"
     echo "$ENABLE_TUIC" > "$WORKDIR/enable_tuic.txt"
     echo "$ENABLE_SHADOWSOCKS" > "$WORKDIR/enable_ss.txt"
+    echo "$ENABLE_ANYTLS" > "$WORKDIR/enable_anytls.txt"
     
     # 保存端口配置 (用于后续自定义推送)
     cat > "$WORKDIR/ports.txt" <<EOF
@@ -7378,6 +7476,7 @@ VMESS_PORT=$VMESS_PORT
 VLESS_PORT=$VLESS_PORT
 HY2_PORT=$HY2_PORT
 TUIC_PORT=$TUIC_PORT
+ANYTLS_PORT=$ANYTLS_PORT
 EOF
     
     # 生成配置
