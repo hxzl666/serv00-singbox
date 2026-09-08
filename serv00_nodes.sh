@@ -4021,6 +4021,76 @@ node_group_exists() {
 }
 
 # 添加多出口节点组 (核心函数)
+# ==================== 全局 UDP 端口占用收集 (2026-09-08 用户核心需求) ====================
+# 覆盖: 主节点 4 大端口 + 自定义代理组 + 赛风出口组, 输出每行: port|proto|ip|owner
+# 任何组添加时都基于此视图选择复用端口/绑定IP, 实现端口+IP 全局共享利用最大化
+collect_global_udp_binds() {
+    local -a out=()
+    local ip
+    # 1. 主节点端口 (绑全部 IP)
+    if [ -n "${HY2_PORT:-}" ] && [ "$HY2_PORT" != "0" ]; then
+        for ip in "${ALL_IPS[@]:-}"; do
+            [ -n "$ip" ] && out+=("$HY2_PORT|hy2|$ip|main")
+        done
+    fi
+    if [ -n "${TUIC_PORT:-}" ] && [ "$TUIC_PORT" != "0" ]; then
+        for ip in "${ALL_IPS[@]:-}"; do
+            [ -n "$ip" ] && out+=("$TUIC_PORT|tuic|$ip|main")
+        done
+    fi
+
+    # 2. 自定义代理组
+    local gtag gdir
+    for gtag in $(get_all_proxy_groups 2>/dev/null || true); do
+        gdir="${PROXY_GROUPS_DIR}/${gtag}"
+        [ -d "$gdir" ] || continue
+        local h2=$(cat "$gdir/hy2_port.txt" 2>/dev/null)
+        local t2=$(cat "$gdir/tuic_port.txt" 2>/dev/null)
+        [ -z "$h2" ] && [ -z "$t2" ] && continue
+        if [ -f "$gdir/ip_protos.txt" ]; then
+            local bip bproto
+            while IFS='|' read -r bip bproto; do
+                [ -z "$bip" ] && continue
+                if [ "$bproto" == "hy2" ] || [ "$bproto" == "both" ]; then [ -n "$h2" ] && out+=("$h2|hy2|$bip|$gtag"); fi
+                if [ "$bproto" == "tuic" ] || [ "$bproto" == "both" ]; then [ -n "$t2" ] && out+=("$t2|tuic|$bip|$gtag"); fi
+            done < "$gdir/ip_protos.txt"
+        else
+            for ip in "${ALL_IPS[@]:-}"; do
+                [ -z "$ip" ] && continue
+                [ -n "$h2" ] && out+=("$h2|hy2|$ip|$gtag")
+                [ -n "$t2" ] && out+=("$t2|tuic|$ip|$gtag")
+            done
+        fi
+    done
+
+    # 3. 赛风出口组
+    local cc
+    if [ -d "${PSI_INSTANCES_DIR:-}" ]; then
+        for cc in $(ls "$PSI_INSTANCES_DIR" 2>/dev/null || true); do
+            [ -d "$PSI_INSTANCES_DIR/$cc" ] || continue
+            local h3=$(cat "$PSI_INSTANCES_DIR/$cc/hy2_port.txt" 2>/dev/null)
+            local t3=$(cat "$PSI_INSTANCES_DIR/$cc/tuic_port.txt" 2>/dev/null)
+            [ -z "$h3" ] && [ -z "$t3" ] && continue
+            if [ -f "$PSI_INSTANCES_DIR/$cc/ip_protos.txt" ]; then
+                local cip cproto
+                while IFS='|' read -r cip cproto; do
+                    [ -z "$cip" ] && continue
+                    if [ "$cproto" == "hy2" ] || [ "$cproto" == "both" ]; then [ -n "$h3" ] && out+=("$h3|hy2|$cip|$cc"); fi
+                    if [ "$cproto" == "tuic" ] || [ "$cproto" == "both" ]; then [ -n "$t3" ] && out+=("$t3|tuic|$cip|$cc"); fi
+                done < "$PSI_INSTANCES_DIR/$cc/ip_protos.txt"
+            else
+                for ip in "${ALL_IPS[@]:-}"; do
+                    [ -z "$ip" ] && continue
+                    [ -n "$h3" ] && out+=("$h3|hy2|$ip|$cc")
+                    [ -n "$t3" ] && out+=("$t3|tuic|$ip|$cc")
+                done
+            fi
+        done
+    fi
+
+    printf '%s\n' "${out[@]}"
+}
+
 add_egress_node_group() {
     local cc="${1^^}"
     local enable_vless="${2:-true}"
@@ -4054,19 +4124,25 @@ add_egress_node_group() {
     fi
     green "    Psiphon $cc SOCKS 端口: $psi_port"
     
-    # 2. 申请新端口
-    yellow "[2/5] 申请新端口..."
+    # 2. 选择端口 (对齐自定义代理组: 复用已有 or 申请新端口)
+    yellow "[2/5] 选择端口..."
     local tcp_port="" udp_port1="" udp_port2=""
-    local retry=0
     
-    # TCP 端口 (VLESS)
+    # 收集全局 UDP 端口占用 (主节点+代理组+赛风)
+    local global_binds=()
+    mapfile -t global_binds < <(collect_global_udp_binds)
+
+    # --- VLESS: 监听 :: 独占端口, 只能新开 ---
     if [[ "$enable_vless" == "true" ]]; then
-        while [[ $retry -lt 20 && -z "$tcp_port" ]]; do
+        yellow "[VLESS] VLESS 入站监听 :: 独占端口，不能按 IP 复用，申请新 TCP 端口..."
+        local retry=0
+        while [[ $retry -lt 30 && -z "$tcp_port" ]]; do
             local candidate=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_safe_for_config $candidate >/dev/null 2>&1; then
-                result=$(devil port add tcp $candidate 2>&1)
-                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                    tcp_port=$candidate
+            if check_port_safe_for_config "$candidate" >/dev/null 2>&1; then
+                local vres
+                vres=$(devil port add tcp "$candidate" 2>&1)
+                if [[ "$vres" == *"succesfully"* || "$vres" == *"Ok"* ]]; then
+                    tcp_port="$candidate"
                 fi
             fi
             ((retry++))
@@ -4074,36 +4150,231 @@ add_egress_node_group() {
         [[ -n "$tcp_port" ]] && green "    VLESS-$cc TCP 端口: $tcp_port"
     fi
     
-    # UDP 端口 1 (Hy2)
-    retry=0
+    # --- Hy2: 复用 or 新开 ---
+    local hy2_choice=""
     if [[ "$enable_hy2" == "true" ]]; then
-        while [[ $retry -lt 20 && -z "$udp_port1" ]]; do
-            local candidate=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_safe_for_config $candidate >/dev/null 2>&1; then
-                result=$(devil port add udp $candidate 2>&1)
-                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                    udp_port1=$candidate
+        local hy2_ports=() bl
+        for bl in "${global_binds[@]}"; do
+            local bp bpr bip
+            IFS='|' read -r bp bpr bip x <<< "$bl"
+            [[ "$bpr" == "hy2" ]] || continue
+            local found=false p2
+            for p2 in "${hy2_ports[@]}"; do [[ "$p2" == "$bp" ]] && found=true; done
+            [[ "$found" == "false" ]] && hy2_ports+=("$bp")
+        done
+        if [[ ${#hy2_ports[@]} -gt 0 ]]; then
+            echo
+            yellow "检测到目前已有 Hysteria2 端口: ${hy2_ports[*]}"
+            yellow "为了节省端口资源（共享同端口绑定不同 IP），可选择复用已有端口或申请新端口。"
+            echo "  1. 复用已有 Hysteria2 端口"
+            echo "  2. 申请新的 Hysteria2 端口"
+            reading "  请选择 [1-2]: " hy2_choice
+            if [[ "$hy2_choice" == "1" ]]; then
+                echo "已有端口列表 (括号内为占用情况):"
+                local i
+                for i in "${!hy2_ports[@]}"; do
+                    local hp="${hy2_ports[$i]}"
+                    local occ=() b3
+                    for b3 in "${global_binds[@]}"; do
+                        local p3 pr3 ip3 o3
+                        IFS='|' read -r p3 pr3 ip3 o3 <<< "$b3"
+                        [[ "$p3" == "$hp" && "$pr3" == "hy2" ]] && occ+=("$ip3($o3)")
+                    done
+                    if [[ ${#occ[@]} -eq 0 ]]; then
+                        green "  $((i+1)). $hp  [全部 ${#ALL_IPS[@]} 个IP可用]"
+                    elif [[ ${#occ[@]} -ge ${#ALL_IPS[@]} ]]; then
+                        red "  $((i+1)). $hp  [!! 所有IP已被占用: ${occ[*]}]"
+                    else
+                        yellow "  $((i+1)). $hp  [可用 $(( ${#ALL_IPS[@]} - ${#occ[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${occ[*]}]"
+                    fi
+                done
+                reading "  请选择复用的端口序号: " p_idx
+                p_idx=$((p_idx-1))
+                if [[ $p_idx -ge 0 && $p_idx -lt ${#hy2_ports[@]} ]]; then
+                    udp_port1="${hy2_ports[$p_idx]}"
+                    green "  → 选择复用 Hysteria2 端口: $udp_port1"
+                else
+                    red "  [!] 无效选择，将申请新端口"
                 fi
             fi
-            ((retry++))
-        done
-        [[ -n "$udp_port1" ]] && green "    Hysteria2-$cc UDP 端口: $udp_port1"
+        fi
+        if [[ -z "$udp_port1" ]]; then
+            yellow "[*] 申请新的 Hysteria2 UDP 端口..."
+            local retry=0
+            while [[ $retry -lt 30 && -z "$udp_port1" ]]; do
+                local cand=$(shuf -i 10000-65535 -n 1)
+                if check_port_safe_for_config "$cand" >/dev/null 2>&1; then
+                    local res
+                    res=$(devil port add udp "$cand" 2>&1)
+                    if [[ "$res" == *"succesfully"* || "$res" == *"Ok"* ]]; then
+                        udp_port1="$cand"
+                        green "    已成功申请 Hy2 UDP 端口: $udp_port1"
+                    fi
+                fi
+                ((retry++))
+            done
+            [[ -z "$udp_port1" ]] && { red "[!] Hy2 UDP 端口申请失败"; return 1; }
+        fi
     fi
     
-    # UDP 端口 2 (TUIC)
-    retry=0
+    # --- TUIC: 复用 or 新开 ---
+    local tuic_choice=""
     if [[ "$enable_tuic" == "true" ]]; then
-        while [[ $retry -lt 20 && -z "$udp_port2" ]]; do
-            local candidate=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_safe_for_config $candidate >/dev/null 2>&1; then
-                result=$(devil port add udp $candidate 2>&1)
-                if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
-                    udp_port2=$candidate
+        local tuic_ports=() bl2
+        for bl2 in "${global_binds[@]}"; do
+            local bp2 bpr2 bip2
+            IFS='|' read -r bp2 bpr2 bip2 x <<< "$bl2"
+            [[ "$bpr2" == "tuic" ]] || continue
+            local found2=false p4
+            for p4 in "${tuic_ports[@]}"; do [[ "$p4" == "$bp2" ]] && found2=true; done
+            [[ "$found2" == "false" ]] && tuic_ports+=("$bp2")
+        done
+        if [[ ${#tuic_ports[@]} -gt 0 ]]; then
+            echo
+            yellow "检测到目前已有 TUIC 端口: ${tuic_ports[*]}"
+            yellow "为了节省端口资源（共享同端口绑定不同 IP），可选择复用已有端口或申请新端口。"
+            echo "  1. 复用已有 TUIC 端口"
+            echo "  2. 申请新的 TUIC 端口"
+            reading "  请选择 [1-2]: " tuic_choice
+            if [[ "$tuic_choice" == "1" ]]; then
+                echo "已有端口列表 (括号内为占用情况):"
+                local i2
+                for i2 in "${!tuic_ports[@]}"; do
+                    local tp="${tuic_ports[$i2]}"
+                    local tocc=() b4
+                    for b4 in "${global_binds[@]}"; do
+                        local p5 pr5 ip5 o5
+                        IFS='|' read -r p5 pr5 ip5 o5 <<< "$b4"
+                        [[ "$p5" == "$tp" && "$pr5" == "tuic" ]] && tocc+=("$ip5($o5)")
+                    done
+                    if [[ ${#tocc[@]} -eq 0 ]]; then
+                        green "  $((i2+1)). $tp  [全部 ${#ALL_IPS[@]} 个IP可用]"
+                    elif [[ ${#tocc[@]} -ge ${#ALL_IPS[@]} ]]; then
+                        red "  $((i2+1)). $tp  [!! 所有IP已被占用: ${tocc[*]}]"
+                    else
+                        yellow "  $((i2+1)). $tp  [可用 $(( ${#ALL_IPS[@]} - ${#tocc[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${tocc[*]}]"
+                    fi
+                done
+                reading "  请选择复用的端口序号: " p_idx2
+                p_idx2=$((p_idx2-1))
+                if [[ $p_idx2 -ge 0 && $p_idx2 -lt ${#tuic_ports[@]} ]]; then
+                    udp_port2="${tuic_ports[$p_idx2]}"
+                    green "  → 选择复用 TUIC 端口: $udp_port2"
+                else
+                    red "  [!] 无效选择，将申请新端口"
                 fi
             fi
-            ((retry++))
+        fi
+        if [[ -z "$udp_port2" ]]; then
+            yellow "[*] 申请新的 TUIC UDP 端口..."
+            local retry=0
+            while [[ $retry -lt 30 && -z "$udp_port2" ]]; do
+                local cand2=$(shuf -i 10000-65535 -n 1)
+                if check_port_safe_for_config "$cand2" >/dev/null 2>&1; then
+                    local res2
+                    res2=$(devil port add udp "$cand2" 2>&1)
+                    if [[ "$res2" == *"succesfully"* || "$res2" == *"Ok"* ]]; then
+                        udp_port2="$cand2"
+                        green "    已成功申请 TUIC UDP 端口: $udp_port2"
+                    fi
+                fi
+                ((retry++))
+            done
+            [[ -z "$udp_port2" ]] && { red "[!] TUIC UDP 端口申请失败"; return 1; }
+        fi
+    fi
+    
+    # 2.5 配置入站 IP (对齐自定义代理组: 逐 IP 选择绑定, 已被占用的自动跳过)
+    local egress_ip_protos=()
+    if [[ -n "$udp_port1" || -n "$udp_port2" ]]; then
+        echo
+        green "==== 配置入站 IP (赛风 $cc 出口组) ===="
+        blue  "选择哪些 IP 映射到此赛风出口组 (已在其他组占用的 IP 自动跳过)"
+        echo
+        local i3
+        for i3 in "${!ALL_IPS[@]}"; do
+            local ipx="${ALL_IPS[$i3]}"
+            local st=$(cat "$WORKDIR/ip_status_${ipx}.txt" 2>/dev/null)
+            local st_str=""
+            [[ "$st" == "Available" ]] && st_str=" [大陆可用]"
+            [[ "$st" == "Blocked"   ]] && st_str=" [被墙]"
+            
+            local hy2_occ=false tuic_occ=false b6
+            if [[ -n "$udp_port1" ]]; then
+                for b6 in "${global_binds[@]}"; do
+                    local p6 pr6 ip6 o6
+                    IFS='|' read -r p6 pr6 ip6 o6 <<< "$b6"
+                    [[ "$p6" == "$udp_port1" && "$pr6" == "hy2" && "$ip6" == "$ipx" ]] && hy2_occ=true
+                done
+            fi
+            if [[ -n "$udp_port2" ]]; then
+                for b6 in "${global_binds[@]}"; do
+                    local p7 pr7 ip7 o7
+                    IFS='|' read -r p7 pr7 ip7 o7 <<< "$b6"
+                    [[ "$p7" == "$udp_port2" && "$pr7" == "tuic" && "$ip7" == "$ipx" ]] && tuic_occ=true
+                done
+            fi
+            
+            local can_h=false can_t=false
+            [[ "$enable_hy2" == "true" && "$hy2_occ" == "false" ]] && can_h=true
+            [[ "$enable_tuic" == "true" && "$tuic_occ" == "false" ]] && can_t=true
+            
+            echo
+            blue "  IP[$((i3+1))]: $ipx${st_str}"
+            
+            if [[ "$can_h" == "false" && "$can_t" == "false" ]]; then
+                yellow "    [自动跳过] 该 IP 在选定的端口上均已被其他组占用"
+                continue
+            fi
+            if [[ "$can_h" == "true" && "$can_t" == "true" ]]; then
+                yellow "    1. 启用 Hysteria2 + TUIC 双入站"
+                yellow "    2. 仅启用 Hysteria2 入站"
+                yellow "    3. 仅启用 TUIC 入站"
+                yellow "    0. 跳过此 IP"
+                reading "    选择 [0-3]: " eipc
+                case "$eipc" in
+                    1) egress_ip_protos+=("${ipx}|both"); green "    → 绑定 Hysteria2 + TUIC" ;;
+                    2) egress_ip_protos+=("${ipx}|hy2");  green "    → 仅绑定 Hysteria2" ;;
+                    3) egress_ip_protos+=("${ipx}|tuic"); green "    → 仅绑定 TUIC" ;;
+                    *) yellow "    → 跳过 $ipx" ;;
+                esac
+            elif [[ "$can_h" == "true" ]]; then
+                yellow "    1. 启用 Hysteria2 入站"
+                yellow "    0. 跳过此 IP"
+                reading "    选择 [0-1]: " eipc
+                case "$eipc" in
+                    1) egress_ip_protos+=("${ipx}|hy2"); green "    → 仅绑定 Hysteria2" ;;
+                    *) yellow "    → 跳过 $ipx" ;;
+                esac
+            elif [[ "$can_t" == "true" ]]; then
+                yellow "    1. 启用 TUIC 入站"
+                yellow "    0. 跳过此 IP"
+                reading "    选择 [0-1]: " eipc
+                case "$eipc" in
+                    1) egress_ip_protos+=("${ipx}|tuic"); green "    → 仅绑定 TUIC" ;;
+                    *) yellow "    → 跳过 $ipx" ;;
+                esac
+            fi
         done
-        [[ -n "$udp_port2" ]] && green "    TUIC-$cc UDP 端口: $udp_port2"
+        if [[ ${#egress_ip_protos[@]} -eq 0 ]]; then
+            red "[!] 未绑定任何 IP，操作取消。"
+            # 回滚新申请的端口 (仅当该端口是本次新开的且无其他引用)
+            local gb7
+            for gb7 in "${global_binds[@]}"; do
+                local p8 pr8 ip8 o8
+                IFS='|' read -r p8 pr8 ip8 o8 <<< "$gb7"
+                [[ "$p8" == "$udp_port1" && "$pr8" == "hy2" ]] && { udp_port1=""; break; }
+            done
+            for gb7 in "${global_binds[@]}"; do
+                local p9 pr9 ip9 o9
+                IFS='|' read -r p9 pr9 ip9 o9 <<< "$gb7"
+                [[ "$p9" == "$udp_port2" && "$pr9" == "tuic" ]] && { udp_port2=""; break; }
+            done
+            [[ -n "$udp_port1" ]] && devil port del udp "$udp_port1" >/dev/null 2>&1
+            [[ -n "$udp_port2" ]] && devil port del udp "$udp_port2" >/dev/null 2>&1
+            [[ -n "$tcp_port" ]] && devil port del tcp "$tcp_port" >/dev/null 2>&1
+            return 1
+        fi
     fi
     
     # 保存端口信息
@@ -4111,6 +4382,7 @@ add_egress_node_group() {
     echo "$tcp_port" > "$PSI_INSTANCES_DIR/$cc/vless_port.txt"
     echo "$udp_port1" > "$PSI_INSTANCES_DIR/$cc/hy2_port.txt"
     echo "$udp_port2" > "$PSI_INSTANCES_DIR/$cc/tuic_port.txt"
+    printf '%s\n' "${egress_ip_protos[@]}" > "$PSI_INSTANCES_DIR/$cc/ip_protos.txt"
     
     # 3. 更新 sing-box 配置
     yellow "[3/5] 更新 sing-box 配置..."
@@ -4173,8 +4445,29 @@ sync_egress_group_to_singbox() {
     local reality_domain=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
     local server_ip="${ALL_IPS[0]:-$HOSTNAME}"
     
-    # 把 IP 列表拼成逗号串传给 Python
-    local ip_csv="$(printf "%s," "${ALL_IPS[@]}")"; ip_csv="${ip_csv%,}"
+    # 读取该组的 IP 绑定关系 (ip_protos.txt: 每行 ip|proto), 按协议分别生成 IP 列表
+    # 无 ip_protos.txt 的旧组 fallback 到 ALL_IPS 全部绑定
+    local hy2_ip_csv="" tuic_ip_csv="" all_ip_csv=""
+    if [[ -f "$PSI_INSTANCES_DIR/$cc/ip_protos.txt" ]]; then
+        local eip eproto
+        while IFS='|' read -r eip eproto; do
+            [[ -z "$eip" ]] && continue
+            if [[ "$eproto" == "hy2" || "$eproto" == "both" ]]; then
+                hy2_ip_csv="${hy2_ip_csv},${eip}"
+            fi
+            if [[ "$eproto" == "tuic" || "$eproto" == "both" ]]; then
+                tuic_ip_csv="${tuic_ip_csv},${eip}"
+            fi
+            all_ip_csv="${all_ip_csv},${eip}"
+        done < "$PSI_INSTANCES_DIR/$cc/ip_protos.txt"
+        hy2_ip_csv="${hy2_ip_csv#,}"
+        tuic_ip_csv="${tuic_ip_csv#,}"
+        all_ip_csv="${all_ip_csv#,}"
+    else
+        all_ip_csv="$(printf "%s," "${ALL_IPS[@]}")"; all_ip_csv="${all_ip_csv%,}"
+        hy2_ip_csv="$all_ip_csv"
+        tuic_ip_csv="$all_ip_csv"
+    fi
     
     python3 - <<PY
 import json
@@ -4192,9 +4485,12 @@ reality_private = r"$reality_private"
 reality_domain = r"$reality_domain"
 server_ip = r"$server_ip"
 
-# 解析 IP 列表
-ip_csv = r"$ip_csv"
-ips = [x.strip() for x in ip_csv.split(",") if x.strip()]
+# 解析 IP 列表 (hy2/tuic 各自绑定的 IP)
+hy2_ip_csv = r"$hy2_ip_csv"
+tuic_ip_csv = r"$tuic_ip_csv"
+hy2_ips = [x.strip() for x in hy2_ip_csv.split(",") if x.strip()]
+tuic_ips = [x.strip() for x in tuic_ip_csv.split(",") if x.strip()]
+ips = list(dict.fromkeys(hy2_ips + tuic_ips))
 if not ips:
     ips = [server_ip]
 
@@ -4260,13 +4556,13 @@ if vless_port > 0:
         }
     })
 
-# 3. 添加 Hysteria2 inbound（每个 IP 一个 inbound，像 serv00.sh 那样）
-if hy2_port > 0 and ips:
+# 3. 添加 Hysteria2 inbound（每个绑定的 IP 一个 inbound，像 serv00.sh 那样）
+if hy2_port > 0 and hy2_ips:
     # 先移除旧的 hysteria2-*-{cc_lower} 格式的 inbound
     inbounds[:] = [i for i in inbounds 
                    if not (i.get("tag", "").startswith("hysteria2-") and i.get("tag", "").endswith(f"-{cc_lower}"))]
 
-    for idx, ip in enumerate(ips, start=1):
+    for idx, ip in enumerate(hy2_ips, start=1):
         hy2_tag = f"hysteria2-{idx}-{cc_lower}"
         inbound_tags.append(hy2_tag)
 
@@ -4284,13 +4580,13 @@ if hy2_port > 0 and ips:
             }
         })
 
-# 4. 添加 TUIC inbound（每个 IP 一个 inbound）
-if tuic_port > 0 and ips:
+# 4. 添加 TUIC inbound（每个绑定的 IP 一个 inbound）
+if tuic_port > 0 and tuic_ips:
     # 先移除旧的 tuic-*-{cc_lower} 格式的 inbound
     inbounds[:] = [i for i in inbounds 
                    if not (i.get("tag", "").startswith("tuic-") and i.get("tag", "").endswith(f"-{cc_lower}"))]
 
-    for idx, ip in enumerate(ips, start=1):
+    for idx, ip in enumerate(tuic_ips, start=1):
         tuic_tag = f"tuic-{idx}-{cc_lower}"
         inbound_tags.append(tuic_tag)
 
@@ -4353,18 +4649,36 @@ generate_egress_node_links() {
     fi
     [[ ${#ALL_IPS[@]} -eq 0 ]] && ALL_IPS=("$HOSTNAME")
 
+    # 读取该组 IP 绑定关系 (ip_protos.txt), 无则回退 ALL_IPS
+    local hy2_ips=() tuic_ips=() all_ips=()
+    if [[ -f "$PSI_INSTANCES_DIR/$cc/ip_protos.txt" ]]; then
+        local eip2 eproto2
+        while IFS='|' read -r eip2 eproto2; do
+            [[ -z "$eip2" ]] && continue
+            if [[ "$eproto2" == "hy2" || "$eproto2" == "both" ]]; then hy2_ips+=("$eip2"); fi
+            if [[ "$eproto2" == "tuic" || "$eproto2" == "both" ]]; then tuic_ips+=("$eip2"); fi
+            local dup=false ipx2
+            for ipx2 in "${all_ips[@]}"; do [[ "$ipx2" == "$eip2" ]] && dup=true; done
+            [[ "$dup" == "false" ]] && all_ips+=("$eip2")
+        done < "$PSI_INSTANCES_DIR/$cc/ip_protos.txt"
+    else
+        hy2_ips=("${ALL_IPS[@]}")
+        tuic_ips=("${ALL_IPS[@]}")
+        all_ips=("${ALL_IPS[@]}")
+    fi
+
     # 中转标签（可改为自动识别落地国家）
     local transit_label="PL中转"
 
     echo
     green "========== $cc ($name) 出口节点链接 =========="
 
-    # VLESS-Reality：为每个IP输出一条
+    # VLESS-Reality：为每个绑定的 IP 输出一条 (VLESS 是 :: 独占, 用全部绑定IP)
     if [[ -n "$vless_port" && "$vless_port" != "0" ]]; then
         echo
-        purple "VLESS-Reality-$cc (共 ${#ALL_IPS[@]} 个IP):"
+        purple "VLESS-Reality-$cc (共 ${#all_ips[@]} 个IP):"
         local idx=1
-        for ip in "${ALL_IPS[@]}"; do
+        for ip in "${all_ips[@]}"; do
             local node_name="${cc}-VLESS-${transit_label}-${idx}"
             local vless_link="vless://${uuid}@${ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_domain}&fp=chrome&pbk=${reality_public}&type=tcp#${node_name}"
             echo "$vless_link"
@@ -4372,12 +4686,12 @@ generate_egress_node_links() {
         done
     fi
 
-    # Hysteria2：为每个IP输出一条
+    # Hysteria2：为每个绑定的 IP 输出一条
     if [[ -n "$hy2_port" && "$hy2_port" != "0" ]]; then
         echo
-        purple "Hysteria2-$cc (共 ${#ALL_IPS[@]} 个IP):"
+        purple "Hysteria2-$cc (共 ${#hy2_ips[@]} 个IP):"
         local idx=1
-        for ip in "${ALL_IPS[@]}"; do
+        for ip in "${hy2_ips[@]}"; do
             local node_name="${cc}-Hysteria2-${transit_label}-${idx}"
             local hy2_link="hysteria2://${uuid}@${ip}:${hy2_port}?insecure=1&sni=${HOSTNAME}#${node_name}"
             echo "$hy2_link"
@@ -4385,12 +4699,12 @@ generate_egress_node_links() {
         done
     fi
 
-    # TUIC：如果端口申请成功，也为每个IP输出一条
+    # TUIC：为每个绑定的 IP 输出一条
     if [[ -n "$tuic_port" && "$tuic_port" != "0" ]]; then
         echo
-        purple "TUIC-$cc (共 ${#ALL_IPS[@]} 个IP):"
+        purple "TUIC-$cc (共 ${#tuic_ips[@]} 个IP):"
         local idx=1
-        for ip in "${ALL_IPS[@]}"; do
+        for ip in "${tuic_ips[@]}"; do
             local node_name="${cc}-TUIC-${transit_label}-${idx}"
             local tuic_link="tuic://${uuid}:${uuid}@${ip}:${tuic_port}?congestion_control=bbr&alpn=h3&allow_insecure=1#${node_name}"
             echo "$tuic_link"
@@ -4418,10 +4732,34 @@ remove_egress_node_group() {
     local hy2_port=$(cat "$PSI_INSTANCES_DIR/$cc/hy2_port.txt" 2>/dev/null)
     local tuic_port=$(cat "$PSI_INSTANCES_DIR/$cc/tuic_port.txt" 2>/dev/null)
     
-    # 删除端口
+    # 端口可能被其他组(代理组/主节点/其他赛风组)复用, 删除前检查全局引用:
+    # 仅当没有任何其他位置引用该端口时才 devil port del, 否则保留端口只移除本组绑定
+    local port_ref_check
+    port_ref_check=$(collect_global_udp_binds 2>/dev/null | grep -c "|hy2|" ) || true
+    # VLESS 是 TCP 且 :: 独占, 无复用可能, 直接删除
     [[ -n "$vless_port" ]] && devil port del tcp "$vless_port" >/dev/null 2>&1
-    [[ -n "$hy2_port" ]] && devil port del udp "$hy2_port" >/dev/null 2>&1
-    [[ -n "$tuic_port" ]] && devil port del udp "$tuic_port" >/dev/null 2>&1
+    
+    if [[ -n "$hy2_port" ]]; then
+        local hy2_refs
+        hy2_refs=$(collect_global_udp_binds 2>/dev/null | grep -E "^${hy2_port}\|hy2\|" | grep -v "|${cc}$" || true)
+        if [[ -n "$hy2_refs" ]]; then
+            yellow "  [*] Hy2 端口 $hy2_port 仍被其他组引用，保留端口:"
+            echo "$hy2_refs" | head -5
+        else
+            devil port del udp "$hy2_port" >/dev/null 2>&1
+        fi
+    fi
+    
+    if [[ -n "$tuic_port" ]]; then
+        local tuic_refs
+        tuic_refs=$(collect_global_udp_binds 2>/dev/null | grep -E "^${tuic_port}\|tuic\|" | grep -v "|${cc}$" || true)
+        if [[ -n "$tuic_refs" ]]; then
+            yellow "  [*] TUIC 端口 $tuic_port 仍被其他组引用，保留端口:"
+            echo "$tuic_refs" | head -5
+        else
+            devil port del udp "$tuic_port" >/dev/null 2>&1
+        fi
+    fi
     
     # 删除 Psiphon 实例
     remove_psiphon_instance "$cc"
@@ -8868,32 +9206,27 @@ add_proxy_egress_group() {
         *) red "[!] 无效选择，默认启用仅 Hysteria2"; need_hy2=true ;;
     esac
 
-    # 收集当前已有的端口和绑定关系
+    # 收集全局端口占用 (主节点 + 自定义代理组 + 赛风出口组), 全局共享资源池
+    local GLOBAL_BINDS=()
+    mapfile -t GLOBAL_BINDS < <(collect_global_udp_binds 2>/dev/null || true)
     local used_binds=()
     local used_hy2_ports=()
     local used_tuic_ports=()
-    local g
-    for g in $(get_all_proxy_groups); do
-        local g_dir="${PROXY_GROUPS_DIR}/$g"
-        [[ -d "$g_dir" ]] || continue
-        local h_p=$(cat "$g_dir/hy2_port.txt" 2>/dev/null)
-        local t_p=$(cat "$g_dir/tuic_port.txt" 2>/dev/null)
-        if [[ -f "$g_dir/ip_protos.txt" ]]; then
-            while IFS='|' read -r ip proto; do
-                [[ -z "$ip" ]] && continue
-                if [[ -n "$h_p" ]] && [[ "$proto" == "hy2" || "$proto" == "both" ]]; then
-                    used_binds+=("${h_p}|${ip}|hy2")
-                    local found=false
-                    for p in "${used_hy2_ports[@]}"; do [[ "$p" == "$h_p" ]] && found=true; done
-                    [[ "$found" == "false" ]] && used_hy2_ports+=("$h_p")
-                fi
-                if [[ -n "$t_p" ]] && [[ "$proto" == "tuic" || "$proto" == "both" ]]; then
-                    used_binds+=("${t_p}|${ip}|tuic")
-                    local found=false
-                    for p in "${used_tuic_ports[@]}"; do [[ "$p" == "$t_p" ]] && found=true; done
-                    [[ "$found" == "false" ]] && used_tuic_ports+=("$t_p")
-                fi
-            done < "$g_dir/ip_protos.txt"
+    local gb
+    for gb in "${GLOBAL_BINDS[@]}"; do
+        local gp gpr gip gowner
+        IFS='|' read -r gp gpr gip gowner <<< "$gb"
+        [[ -z "$gp" ]] && continue
+        if [[ "$gpr" == "hy2" ]]; then
+            used_binds+=("${gp}|${gip}|hy2")
+            local found=false
+            for p in "${used_hy2_ports[@]}"; do [[ "$p" == "$gp" ]] && found=true; done
+            [[ "$found" == "false" ]] && used_hy2_ports+=("$gp")
+        elif [[ "$gpr" == "tuic" ]]; then
+            used_binds+=("${gp}|${gip}|tuic")
+            local found=false
+            for p in "${used_tuic_ports[@]}"; do [[ "$p" == "$gp" ]] && found=true; done
+            [[ "$found" == "false" ]] && used_tuic_ports+=("$gp")
         fi
     done
 
@@ -8912,18 +9245,11 @@ add_proxy_egress_group() {
                 for i in "${!used_hy2_ports[@]}"; do
                     local hp="${used_hy2_ports[$i]}"
                     local occ=()
-                    local g2
-                    for g2 in $(get_all_proxy_groups); do
-                        local gd2="${PROXY_GROUPS_DIR}/$g2"
-                        [[ -d "$gd2" ]] || continue
-                        local gh2=$(cat "$gd2/hy2_port.txt" 2>/dev/null)
-                        [[ -n "$gh2" && "$gh2" == "$hp" ]] || continue
-                        while IFS='|' read -r bip bproto; do
-                            [[ -z "$bip" ]] && continue
-                            if [[ "$bproto" == "hy2" || "$bproto" == "both" ]]; then
-                                occ+=("$bip($g2)")
-                            fi
-                        done < "$gd2/ip_protos.txt"
+                    local gb2
+                    for gb2 in "${GLOBAL_BINDS[@]}"; do
+                        local gp2 gpr2 gip2 gowner2
+                        IFS='|' read -r gp2 gpr2 gip2 gowner2 <<< "$gb2"
+                        [[ "$gp2" == "$hp" && "$gpr2" == "hy2" ]] && occ+=("$gip2($gowner2)")
                     done
                     if [[ ${#occ[@]} -eq 0 ]]; then
                         green "  $((i+1)). $hp  [全部 ${#ALL_IPS[@]} 个IP可用]"
@@ -8942,17 +9268,13 @@ add_proxy_egress_group() {
                     local free_ips=() occ_ips=()
                     for ip2 in "${ALL_IPS[@]}"; do
                         local ip_occ=false
-                        for g4 in $(get_all_proxy_groups); do
-                            local gd4="${PROXY_GROUPS_DIR}/$g4"
-                            [[ -d "$gd4" ]] || continue
-                            local gh4=$(cat "$gd4/hy2_port.txt" 2>/dev/null)
-                            [[ -n "$gh4" && "$gh4" == "$hy2_port" ]] || continue
-                            while IFS='|' read -r bip bproto; do
-                                if [[ "$bip" == "$ip2" && ( "$bproto" == "hy2" || "$bproto" == "both" ) ]]; then
-                                    ip_occ=true; occ_ips+=("$ip2($g4)"); break
-                                fi
-                            done < "$gd4/ip_protos.txt"
-                            [[ "$ip_occ" == "true" ]] && break
+                        local gb4
+                        for gb4 in "${GLOBAL_BINDS[@]}"; do
+                            local gp4 gpr4 gip4 gowner4
+                            IFS='|' read -r gp4 gpr4 gip4 gowner4 <<< "$gb4"
+                            if [[ "$gp4" == "$hy2_port" && "$gpr4" == "hy2" && "$gip4" == "$ip2" ]]; then
+                                ip_occ=true; occ_ips+=("$ip2($gowner4)"); break
+                            fi
                         done
                         [[ "$ip_occ" == "false" ]] && free_ips+=("$ip2")
                     done
@@ -8999,18 +9321,11 @@ add_proxy_egress_group() {
                 for i in "${!used_tuic_ports[@]}"; do
                     local tp="${used_tuic_ports[$i]}"
                     local tocc=()
-                    local g3
-                    for g3 in $(get_all_proxy_groups); do
-                        local gd3="${PROXY_GROUPS_DIR}/$g3"
-                        [[ -d "$gd3" ]] || continue
-                        local gt3=$(cat "$gd3/tuic_port.txt" 2>/dev/null)
-                        [[ -n "$gt3" && "$gt3" == "$tp" ]] || continue
-                        while IFS='|' read -r bip bproto; do
-                            [[ -z "$bip" ]] && continue
-                            if [[ "$bproto" == "tuic" || "$bproto" == "both" ]]; then
-                                tocc+=("$bip($g3)")
-                            fi
-                        done < "$gd3/ip_protos.txt"
+                    local gb3
+                    for gb3 in "${GLOBAL_BINDS[@]}"; do
+                        local gp3 gpr3 gip3 gowner3
+                        IFS='|' read -r gp3 gpr3 gip3 gowner3 <<< "$gb3"
+                        [[ "$gp3" == "$tp" && "$gpr3" == "tuic" ]] && tocc+=("$gip3($gowner3)")
                     done
                     if [[ ${#tocc[@]} -eq 0 ]]; then
                         green "  $((i+1)). $tp  [全部 ${#ALL_IPS[@]} 个IP可用]"
@@ -9029,17 +9344,13 @@ add_proxy_egress_group() {
                     local tfree_ips=() tocc_ips=()
                     for ip2 in "${ALL_IPS[@]}"; do
                         local tip_occ=false
-                        for g5 in $(get_all_proxy_groups); do
-                            local gd5="${PROXY_GROUPS_DIR}/$g5"
-                            [[ -d "$gd5" ]] || continue
-                            local gt5=$(cat "$gd5/tuic_port.txt" 2>/dev/null)
-                            [[ -n "$gt5" && "$gt5" == "$tuic_port" ]] || continue
-                            while IFS='|' read -r bip bproto; do
-                                if [[ "$bip" == "$ip2" && ( "$bproto" == "tuic" || "$bproto" == "both" ) ]]; then
-                                    tip_occ=true; tocc_ips+=("$ip2($g5)"); break
-                                fi
-                            done < "$gd5/ip_protos.txt"
-                            [[ "$tip_occ" == "true" ]] && break
+                        local gb5
+                        for gb5 in "${GLOBAL_BINDS[@]}"; do
+                            local gp5 gpr5 gip5 gowner5
+                            IFS='|' read -r gp5 gpr5 gip5 gowner5 <<< "$gb5"
+                            if [[ "$gp5" == "$tuic_port" && "$gpr5" == "tuic" && "$gip5" == "$ip2" ]]; then
+                                tip_occ=true; tocc_ips+=("$ip2($gowner5)"); break
+                            fi
                         done
                         [[ "$tip_occ" == "false" ]] && tfree_ips+=("$ip2")
                     done
