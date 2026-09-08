@@ -2167,9 +2167,34 @@ PY
         red "[!] sing-box 启动失败，查看日志：$WORKDIR/singbox.log"
         tail -20 "$WORKDIR/singbox.log" 2>/dev/null
 
-        # 自愈：检测到端口冲突 (address already in use / bind 错误) 时，
+        # 自愈1: 检测到 mac_portacl 端口未注册 (operation not permitted) 时，
+        # 自动把 socks-loopback 端口改为 devil 已注册端口并重试
+        if grep -qE "operation not permitted" "$WORKDIR/singbox.log" 2>/dev/null; then
+            if [ "$retry_count" -lt "$max_retries" ]; then
+                yellow "[!] 检测到端口未授权绑定 (mac_portacl / operation not permitted)，正在改用已注册端口重试 (尝试 $((retry_count + 1))/$max_retries)..."
+                local lp
+                lp=$(get_free_loopback_port)
+                if python3 -c "
+import json,sys
+try:
+    cfg=r'$WORKDIR/config.json'
+    d=json.load(open(cfg))
+    for ib in d.get('inbounds',[]):
+        if ib.get('tag')=='socks-loopback':
+            ib['listen_port']=$lp
+    with open(cfg,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2)
+    print('[+] socks-loopback 端口已改为 $lp')
+except Exception as e:
+    print(f'[!] 修正失败: {e}'); sys.exit(1)
+"; then
+                    start_singbox_safe $((retry_count + 1))
+                    return $?
+                fi
+                yellow "[!] loopback 端口修正未完成，启动失败 (已尝试 $((retry_count + 1)) 次)"
+            fi
+        # 自愈2: 检测到端口冲突 (address already in use) 时，
         # 自动调用 auto_repair_conflicting_ports 修复端口并重试 (最多 max_retries 次)
-        if grep -qE "address already in use|bind:" "$WORKDIR/singbox.log" 2>/dev/null; then
+        elif grep -qE "address already in use" "$WORKDIR/singbox.log" 2>/dev/null; then
             if [ "$retry_count" -lt "$max_retries" ]; then
                 yellow "[!] 检测到端口冲突 (address already in use)，正在自动修复端口并重试 (尝试 $((retry_count + 1))/$max_retries)..."
                 if auto_repair_conflicting_ports; then
@@ -2648,6 +2673,8 @@ disable_psiphon_egress() {
 
     yellow "[*] 移除 Psiphon 出站配置..."
 
+    local loopback_port
+    loopback_port=$(get_free_loopback_port)
     python3 - <<PY
 import json
 import sys
@@ -2708,7 +2735,7 @@ for o in outbounds:
         break
 
 inbound_tag = "socks-loopback"
-loopback_port = 31092
+loopback_port = int(r"$loopback_port")
 
 # 移除旧的 loopback 路由规则
 rules[:] = [r for r in rules if not (r.get("inbound") and inbound_tag in r["inbound"])]
@@ -2837,21 +2864,33 @@ show_supported_psiphon_codes() {
     echo "    AUTO - 智能自动优选最佳出口"
 }
 
-# 获取空闲本地回环端口以防冲突 (默认 31092)
+# 获取可绑定的本地回环端口 (FreeBSD mac_portacl: 非 root 只能绑定 devil 已注册端口)
+# 策略: 优先复用 config 中已有 socks-loopback 端口; 否则从 devil 已注册 tcp 端口中挑空闲的
 get_free_loopback_port() {
-    local target_port=31092
-    if check_port_available_on_ip "$target_port" "tcp" "127.0.0.1" >/dev/null 2>&1; then
-        echo "$target_port"
-        return 0
+    local registered
+    registered=$(devil port list 2>/dev/null | awk 'NR>2 && $2=="tcp" {print $1}')
+    local existing=""
+    # 1. 若 config.json 已有 socks-loopback, 复用其端口 (前提: 该端口已在 devil 注册)
+    if [ -f "$WORKDIR/config.json" ]; then
+        existing=$(python3 -c "import json;d=json.load(open('$WORKDIR/config.json'));print([ib.get('listen_port') for ib in d.get('inbounds',[]) if ib.get('tag')=='socks-loopback'][0])" 2>/dev/null || echo "")
     fi
-    local candidate
-    for candidate in {31093..31150}; do
-        if check_port_available_on_ip "$candidate" "tcp" "127.0.0.1" >/dev/null 2>&1; then
-            echo "$candidate"
+    if [ -n "$existing" ]; then
+        if echo "$registered" | grep -qx "$existing"; then
+            echo "$existing"
+            return 0
+        fi
+    fi
+    # 2. 从 devil 已注册 tcp 端口挑一个当前空闲的
+    local p
+    for p in $registered; do
+        if check_port_available_on_ip "$p" "tcp" "127.0.0.1" >/dev/null 2>&1; then
+            echo "$p"
             return 0
         fi
     done
+    # 3. 全部被占用: 回退 31092 (大概率绑定失败, 调用方应跳过 loopback 注入)
     echo "31092"
+    return 1
 }
 
 # WARP 出口 IP 检测 - 智能坚固版
@@ -2886,8 +2925,8 @@ warp_egress_test() {
 
     # 如果配置中不存在 socks-loopback，自动补充
     if [[ -z "$socks" || "$socks" == "None" || "$socks" == "0" ]]; then
-        socks=31092
-        yellow "[*] 配置中未检测到 socks-loopback 节点，正在自动补充..."
+        socks=$(get_free_loopback_port)
+        yellow "[*] 配置中未检测到 socks-loopback 节点，正在自动补充 (端口: $socks)..."
         python3 -c "
 import json
 cfg = r'$WORKDIR/config.json'
@@ -2896,7 +2935,7 @@ try:
     ibs = data.setdefault('inbounds', [])
     rules = data.setdefault('route', {}).setdefault('rules', [])
     if not any(ib.get('tag') == 'socks-loopback' for ib in ibs):
-        ibs.append({'tag': 'socks-loopback', 'type': 'socks', 'listen': '127.0.0.1', 'listen_port': 31092})
+        ibs.append({'tag': 'socks-loopback', 'type': 'socks', 'listen': '127.0.0.1', 'listen_port': $socks})
     if not any(r.get('inbound') == ['socks-loopback'] for r in rules):
         rules.insert(0, {'inbound': ['socks-loopback'], 'outbound': 'warp-out'})
     with open(cfg, 'w') as f: json.dump(data, f, ensure_ascii=False, indent=2)
@@ -5415,15 +5454,22 @@ EOF
     fi
     
     # 如果启用 WARP，添加回环 Socks 入站用于出口 IP 检测
+    # 注意: FreeBSD mac_portacl 只允许绑定 devil 已注册端口, get_free_loopback_port
+    # 会优先从已注册端口挑选; 若全部被占(返回31092兜底), 跳过注入避免启动失败
     if [[ "$WARP_ENABLED" == "true" ]]; then
         local loopback_port
         loopback_port=$(get_free_loopback_port)
-        inbounds+=("    {
+        local lp_rc=$?
+        if [[ "$loopback_port" != "31092" ]] || devil port list 2>/dev/null | grep -qw "31092"; then
+            inbounds+=("    {
       \"tag\": \"socks-loopback\",
       \"type\": \"socks\",
       \"listen\": \"127.0.0.1\",
       \"listen_port\": $loopback_port
     }")
+        else
+            yellow "[!] 无可用已注册端口用于 socks-loopback，跳过注入 (WARP 出口检测不可用)"
+        fi
     fi
     
     # 用逗号连接inbounds
@@ -6566,6 +6612,23 @@ EOF
     # 加载Argo信息
     [ -f "$WORKDIR/ARGO_AUTH.log" ]   && ARGO_AUTH=$(cat "$WORKDIR/ARGO_AUTH.log" 2>/dev/null)
     [ -f "$WORKDIR/ARGO_DOMAIN.log" ] && ARGO_DOMAIN=$(cat "$WORKDIR/ARGO_DOMAIN.log" 2>/dev/null)
+
+    # 加载WARP出站状态 (与磁盘保持一致, 防止残留状态导致生成废 WARP 配置)
+    if [ -f "$WORKDIR/warp_enabled.txt" ]; then
+        WARP_ENABLED=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
+    fi
+    if [ -f "$WORKDIR/warp_mode.txt" ]; then
+        WARP_MODE=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+    fi
+
+    # WARP 状态自检: enabled=true 但 WARP 参数不完整时自动降级为直连
+    if [[ "$WARP_ENABLED" == "true" ]]; then
+        if [ ! -f "$WORKDIR/warp_private_key.txt" ] || [ ! -f "$WORKDIR/warp_ipv6.txt" ] || [ ! -f "$WORKDIR/warp_reserved.txt" ]; then
+            yellow "[!] WARP 参数不完整，自动降级为直连出站"
+            WARP_ENABLED=false
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+        fi
+    fi
 }
 
 # 获取Argo域名
