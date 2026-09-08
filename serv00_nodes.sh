@@ -440,6 +440,56 @@ display_ip_list() {
 
 
 
+# ── 端口冲突检测(配置文件内部) ──────────────────────────
+# 检查 config.json 里是否已有相同 (listen, listen_port) 的 inbound
+# 返回: 0=冲突, 1=不冲突
+port_conflict_in_config() {
+    local ip="$1"
+    local port="$2"
+    local cfg="${3:-$WORKDIR/config.json}"
+    
+    [[ ! -f "$cfg" || -z "$ip" || -z "$port" ]] && return 1
+    
+    python3 - "$cfg" "$ip" "$port" <<'PYEOF' 2>/dev/null
+import json, sys
+cfg_path, ip, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    with open(cfg_path) as f:
+        data = json.load(f)
+    for ib in data.get("inbounds", []):
+        if ib.get("listen") == ip and int(ib.get("listen_port", 0)) == port:
+            sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+# 在端口分配前检查: 系统空闲 + 配置内不冲突
+# 返回: 0=可用, 1=不可用
+check_port_safe_for_config() {
+    local port="$1"
+    local proto="${2:-udp}"
+    local cfg="${3:-$WORKDIR/config.json}"
+    
+    # 1. 系统端口检查(原逻辑)
+    if check_port_in_use "$port" "$proto" >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # 2. 配置内冲突检查(新增)
+    if [[ ${#ALL_IPS[@]} -eq 0 ]]; then
+        get_all_ips 2>/dev/null || true
+    fi
+    for ip in "${ALL_IPS[@]}"; do
+        if port_conflict_in_config "$ip" "$port" "$cfg"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+
 # 检测端口是否被占用 (sockstat 基础检测)
 check_port_in_use() {
     local port=$1
@@ -3927,7 +3977,7 @@ add_egress_node_group() {
     if [[ "$enable_vless" == "true" ]]; then
         while [[ $retry -lt 20 && -z "$tcp_port" ]]; do
             local candidate=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_in_use $candidate >/dev/null 2>&1; then
+            if ! check_port_safe_for_config $candidate >/dev/null 2>&1; then
                 result=$(devil port add tcp $candidate 2>&1)
                 if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
                     tcp_port=$candidate
@@ -3943,7 +3993,7 @@ add_egress_node_group() {
     if [[ "$enable_hy2" == "true" ]]; then
         while [[ $retry -lt 20 && -z "$udp_port1" ]]; do
             local candidate=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_in_use $candidate >/dev/null 2>&1; then
+            if ! check_port_safe_for_config $candidate >/dev/null 2>&1; then
                 result=$(devil port add udp $candidate 2>&1)
                 if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
                     udp_port1=$candidate
@@ -3959,7 +4009,7 @@ add_egress_node_group() {
     if [[ "$enable_tuic" == "true" ]]; then
         while [[ $retry -lt 20 && -z "$udp_port2" ]]; do
             local candidate=$(shuf -i 10000-65535 -n 1)
-            if ! check_port_in_use $candidate >/dev/null 2>&1; then
+            if ! check_port_safe_for_config $candidate >/dev/null 2>&1; then
                 result=$(devil port add udp $candidate 2>&1)
                 if [[ $result == *"succesfully"* ]] || [[ $result == *"Ok"* ]]; then
                     udp_port2=$candidate
