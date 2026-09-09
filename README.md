@@ -69,6 +69,7 @@ bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/hxzl66
 | Argo 隧道 | 支持临时隧道和固定隧道切换 |
 | **WARP 出站** | 支持 Cloudflare WARP 代理出站，解锁流媒体 |
 | **Psiphon 赛风出站** | 支持 Psiphon 代理出站，32 个国家智能切换 |
+| **URPool 中继** | 自建 URPool API 按国家一键建组 (socks5 出口), 每分钟自愈, 失效自动换新 |
 | 自动端口管理 | 自动配置 TCP/UDP 端口 |
 | Reality 支持 | 自动生成 Reality 密钥对 |
 | 订阅链接 | 自动生成 Base64 订阅链接 |
