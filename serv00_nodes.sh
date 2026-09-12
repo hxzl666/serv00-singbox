@@ -2807,35 +2807,65 @@ PSI_ALL_CC=(
 get_country_name() {
     local cc="${1^^}"
     case "$cc" in
-        US) echo "美国 (United States)" ;;
-        JP) echo "日本 (Japan)" ;;
-        SG) echo "新加坡 (Singapore)" ;;
-        HK) echo "中国香港 (Hong Kong)" ;;
-        KR) echo "韩国 (South Korea)" ;;
-        TW) echo "中国台湾 (Taiwan)" ;;
-        GB) echo "英国 (United Kingdom)" ;;
-        DE) echo "德国 (Germany)" ;;
-        CA) echo "加拿大 (Canada)" ;;
-        NL) echo "荷兰 (Netherlands)" ;;
-        FR) echo "法国 (France)" ;;
-        IN) echo "印度 (India)" ;;
-        AU) echo "澳大利亚 (Australia)" ;;
-        CH) echo "瑞士 (Switzerland)" ;;
-        SE) echo "瑞典 (Sweden)" ;;
-        IT) echo "意大利 (Italy)" ;;
-        ES) echo "西班牙 (Spain)" ;;
-        PL) echo "波兰 (Poland)" ;;
-        AT) echo "奥地利 (Austria)" ;;
-        BE) echo "比利时 (Belgium)" ;;
-        DK) echo "丹麦 (Denmark)" ;;
-        NO) echo "挪威 (Norway)" ;;
-        RO) echo "罗马尼亚 (Romania)" ;;
-        CZ) echo "捷克 (Czech Republic)" ;;
-        HU) echo "匈牙利 (Hungary)" ;;
-        BG) echo "保加利亚 (Bulgaria)" ;;
-        IE) echo "爱尔兰 (Ireland)" ;;
-        FI) echo "芬兰 (Finland)" ;;
-        AUTO) echo "自动优选 (Auto)" ;;
+        AD) echo "Andorra" ;;
+        AE) echo "United Arab Emirates" ;;
+        AF) echo "Afghanistan" ;;
+        AM) echo "Armenia" ;;
+        AR) echo "Argentina" ;;
+        AS) echo "American Samoa" ;;
+        AT) echo "Austria" ;;
+        AU) echo "Australia" ;;
+        BB) echo "Barbados" ;;
+        BE) echo "Belgium" ;;
+        BG) echo "Bulgaria" ;;
+        BF) echo "Burkina Faso" ;;
+        BY) echo "Belarus" ;;
+        CA) echo "Canada" ;;
+        CC) echo "Cocos Islands" ;;
+        CM) echo "Cameroon" ;;
+        CP) echo "Clipperton Island" ;;
+        CY) echo "Cyprus" ;;
+        CZ) echo "Czech Republic" ;;
+        DE) echo "Germany" ;;
+        DK) echo "Denmark" ;;
+        EE) echo "Estonia" ;;
+        ES) echo "Spain" ;;
+        FI) echo "Finland" ;;
+        FR) echo "France" ;;
+        GB) echo "United Kingdom" ;;
+        GR) echo "Greece" ;;
+        GT) echo "Guatemala" ;;
+        HK) echo "Hong Kong" ;;
+        HU) echo "Hungary" ;;
+        ID) echo "Indonesia" ;;
+        IE) echo "Ireland" ;;
+        IL) echo "Israel" ;;
+        IN) echo "India" ;;
+        IR) echo "Iran" ;;
+        IT) echo "Italy" ;;
+        JP) echo "Japan" ;;
+        KR) echo "South Korea" ;;
+        KZ) echo "Kazakhstan" ;;
+        LT) echo "Lithuania" ;;
+        LV) echo "Latvia" ;;
+        MY) echo "Malaysia" ;;
+        MX) echo "Mexico" ;;
+        NL) echo "Netherlands" ;;
+        NO) echo "Norway" ;;
+        PL) echo "Poland" ;;
+        RO) echo "Romania" ;;
+        RU) echo "Russia" ;;
+        SE) echo "Sweden" ;;
+        SG) echo "Singapore" ;;
+        SS) echo "South Sudan" ;;
+        TH) echo "Thailand" ;;
+        TR) echo "Turkey" ;;
+        TW) echo "Taiwan" ;;
+        UA) echo "Ukraine" ;;
+        US) echo "United States" ;;
+        ZA) echo "South Africa" ;;
+        AUTO) echo "Auto" ;;
+        XX) echo "Unknown" ;;
         *) echo "$cc" ;;
     esac
 }
@@ -9937,33 +9967,34 @@ add_openrung_egress_group() {
     done
 
     # 辅助: 复用已有端口或 devil 申请新端口 (serv00 模式)
+    # 注意: 交互输出走 stderr, 只返回端口号到 stdout
     alloc_or_port() {
         local ptype="$1"   # hy2|tuic|vless
         local -a used_ports=("${@:2}")
         local chosen=""
         if [[ ${#used_ports[@]} -gt 0 ]]; then
-            echo
-            yellow "已有 ${ptype^^} 端口: ${used_ports[*]} (端口受限, 建议复用)"
-            echo "  1. 复用已有端口"
-            echo "  2. 申请新端口"
-            reading "  请选择 [1-2, 默认1]: " p_choice
+            echo >&2
+            yellow >&2 "已有 ${ptype^^} 端口: ${used_ports[*]} (端口受限, 建议复用)"
+            echo >&2 "  1. 复用已有端口"
+            echo >&2 "  2. 申请新端口"
+            reading >&2 "  请选择 [1-2, 默认1]: " p_choice
             [[ -z "$p_choice" ]] && p_choice="1"
             if [[ "$p_choice" == "1" ]]; then
                 for i in "${!used_ports[@]}"; do
-                    yellow "  $((i+1)). ${used_ports[$i]}"
+                    yellow >&2 "  $((i+1)). ${used_ports[$i]}"
                 done
-                reading "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
+                reading >&2 "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
                     chosen="${used_ports[$p_idx]}"
-                    green "  → 复用 ${ptype^^} 端口: $chosen"
+                    green >&2 "  -> 复用 ${ptype^^} 端口: $chosen"
                 else
-                    red "  [!] 无效选择, 将申请新端口"
+                    red >&2 "  [!] 无效选择, 将申请新端口"
                 fi
             fi
         fi
         if [[ -z "$chosen" ]]; then
-            yellow "[*] 申请新的 ${ptype^^} 端口..."
+            yellow >&2 "[*] 申请新的 ${ptype^^} 端口..."
             local retry=0
             while [[ $retry -lt 30 && -z "$chosen" ]]; do
                 local cand=$(shuf -i 10000-65535 -n 1)
@@ -9972,12 +10003,12 @@ add_openrung_egress_group() {
                     alloc_result=$(devil port add tcp "$cand" "singbox-or-${ptype}" 2>&1)
                     if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
                         chosen="$cand"
-                        green "    已成功申请 ${ptype^^} TCP 端口: $chosen"
+                        green >&2 "    已成功申请 ${ptype^^} TCP 端口: $chosen"
                     fi
                 fi
                 ((retry++))
             done
-            [[ -z "$chosen" ]] && red "[!] ${ptype^^} 端口申请失败"
+            [[ -z "$chosen" ]] && red >&2 "[!] ${ptype^^} 端口申请失败"
         fi
         echo "$chosen"
     }
@@ -10406,33 +10437,34 @@ add_freepool_egress_group() {
     done
 
     # 辅助: 复用已有端口或 devil 申请新端口 (serv00 模式)
+    # 注意: 交互输出走 stderr, 只返回端口号到 stdout
     alloc_or_port() {
         local ptype="$1"
         local -a used_ports=("${@:2}")
         local chosen=""
         if [[ ${#used_ports[@]} -gt 0 ]]; then
-            echo
-            yellow "已有 ${ptype^^} 端口: ${used_ports[*]} (端口受限, 建议复用)"
-            echo "  1. 复用已有端口"
-            echo "  2. 申请新端口"
-            reading "  请选择 [1-2, 默认1]: " p_choice
+            echo >&2
+            yellow >&2 "已有 ${ptype^^} 端口: ${used_ports[*]} (端口受限, 建议复用)"
+            echo >&2 "  1. 复用已有端口"
+            echo >&2 "  2. 申请新端口"
+            reading >&2 "  请选择 [1-2, 默认1]: " p_choice
             [[ -z "$p_choice" ]] && p_choice="1"
             if [[ "$p_choice" == "1" ]]; then
                 for i in "${!used_ports[@]}"; do
-                    yellow "  $((i+1)). ${used_ports[$i]}"
+                    yellow >&2 "  $((i+1)). ${used_ports[$i]}"
                 done
-                reading "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
+                reading >&2 "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
                     chosen="${used_ports[$p_idx]}"
-                    green "  -> 复用 ${ptype^^} 端口: $chosen"
+                    green >&2 "  -> 复用 ${ptype^^} 端口: $chosen"
                 else
-                    red "  [!] 无效选择, 将申请新端口"
+                    red >&2 "  [!] 无效选择, 将申请新端口"
                 fi
             fi
         fi
         if [[ -z "$chosen" ]]; then
-            yellow "[*] 申请新的 ${ptype^^} 端口..."
+            yellow >&2 "[*] 申请新的 ${ptype^^} 端口..."
             local retry=0
             while [[ $retry -lt 30 && -z "$chosen" ]]; do
                 local cand=$(shuf -i 10000-65535 -n 1)
@@ -10441,12 +10473,12 @@ add_freepool_egress_group() {
                     alloc_result=$(devil port add tcp "$cand" "singbox-fp-${ptype}" 2>&1)
                     if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
                         chosen="$cand"
-                        green "    已成功申请 ${ptype^^} TCP 端口: $chosen"
+                        green >&2 "    已成功申请 ${ptype^^} TCP 端口: $chosen"
                     fi
                 fi
                 ((retry++))
             done
-            [[ -z "$chosen" ]] && red "[!] ${ptype^^} 端口申请失败"
+            [[ -z "$chosen" ]] && red >&2 "[!] ${ptype^^} 端口申请失败"
         fi
         echo "$chosen"
     }
