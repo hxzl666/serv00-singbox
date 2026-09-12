@@ -10249,8 +10249,8 @@ EOF
 }
 
 
-# ==================== URPool 中继网络 (自建 API 服务: 用户提供地址+token) ====================
-add_urpool_egress_group() {
+# ==================== 免费节点池 (用户提供 API 地址+token, 拉取免费节点) ====================
+add_freepool_egress_group() {
     init_proxy_groups_dir
 
     if [[ ${#ALL_IPS[@]} -eq 0 ]]; then
@@ -10260,18 +10260,18 @@ add_urpool_egress_group() {
     [[ ${#ALL_IPS[@]} -eq 0 ]] && { red "[!] 无法获取本机 IP 列表"; return 1; }
 
     echo
-    green "==== 一键添加 URPool 中继节点 (API 按国家, 自动自愈) ===="
+    green "==== 一键添加免费节点池 (按国家分类, 自动自愈) ===="
 
-    # 读取/输入 URPool API 地址与 token (持久化 $WORKDIR/urpool/api.txt, 两行: 地址 / token)
-    local urpool_dir="$WORKDIR/urpool"
-    mkdir -p "$urpool_dir" 2>/dev/null || true
+    # 读取/输入免费节点池 API 地址与 token (持久化 $WORKDIR/freepool/api.txt, 两行: 地址 / token)
+    local fp_dir="$WORKDIR/freepool"
+    mkdir -p "$fp_dir" 2>/dev/null || true
     local api_base="" api_token=""
-    if [[ -f "$urpool_dir/api.txt" ]]; then
-        api_base=$(sed -n '1p' "$urpool_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
-        api_token=$(sed -n '2p' "$urpool_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
+    if [[ -f "$fp_dir/api.txt" ]]; then
+        api_base=$(sed -n '1p' "$fp_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
+        api_token=$(sed -n '2p' "$fp_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
     fi
     if [[ -n "$api_base" ]]; then
-        yellow "[*] 检测到已保存的 URPool API: $api_base"
+        yellow "[*] 检测到已保存的免费节点池 API: $api_base"
         echo "  1. 使用已保存配置"
         echo "  2. 重新输入 API 地址与 token"
         reading "  请选择 [1-2, 默认1]: " api_choice
@@ -10281,45 +10281,72 @@ add_urpool_egress_group() {
         fi
     fi
     if [[ -z "$api_base" ]]; then
-        reading "  请输入 URPool API 地址 (如 http://127.0.0.1:8899): " api_base
-        reading "  请输入 URPool API Token: " api_token
+        reading "  请输入免费节点池 API 地址 (如 https://free.example.com/free): " api_base
+        reading "  请输入 API Token: " api_token
         api_base=$(echo "$api_base" | tr -d ' \r\n')
         api_token=$(echo "$api_token" | tr -d ' \r\n')
     fi
     if [[ -z "$api_base" || -z "$api_token" ]]; then
-        red "[!] URPool API 地址与 token 不能为空"
+        red "[!] API 地址与 token 不能为空"
         return 1
     fi
     api_base="${api_base%/}"
 
     echo
-    yellow "[*] 正在从 URPool API 获取国家列表..."
-    local countries_json
-    countries_json=$(curl -s --max-time 15 -H "Authorization: Bearer ${api_token}" "${api_base}/api/countries" 2>/dev/null)
-    if ! echo "$countries_json" | jq -e '.countries | type == "array"' >/dev/null 2>&1; then
-        red "[!] 获取 URPool 国家列表失败 (地址/token 错误或服务不可用)"
+    yellow "[*] 正在从免费节点池拉取节点列表..."
+    local nodes_raw
+    nodes_raw=$(curl -s --max-time 30 "${api_base}?api=get&token=${api_token}" 2>/dev/null)
+    if [[ -z "$nodes_raw" ]]; then
+        red "[!] 获取节点列表失败 (地址/token 错误或服务不可用)"
         return 1
     fi
-    echo "$api_base" > "$urpool_dir/api.txt"
-    echo "$api_token" >> "$urpool_dir/api.txt"
 
-    local cc_summary
-    cc_summary=$(echo "$countries_json" | jq -r '
-        [.countries[] | {cc: (.country_code // "?"), cn: (.name // "?"), pc: (.provider_count // 0)}]
-        | sort_by(-.pc)
-        | .[] | [.cc, .cn, .pc] | @tsv' 2>/dev/null)
+    # 检查是否返回错误信息 (403 forbidden 等)
+    if echo "$nodes_raw" | grep -qi "forbidden\|unauthorized\|error\|403"; then
+        # 只有当整行都是错误信息时才算失败 (节点链接不会包含这些词在行首)
+        if echo "$nodes_raw" | head -1 | grep -qi "forbidden\|unauthorized\|403\|error"; then
+            red "[!] API 返回错误: $(echo "$nodes_raw" | head -1)"
+            return 1
+        fi
+    fi
+
+    echo "$api_base" > "$fp_dir/api.txt"
+    echo "$api_token" >> "$fp_dir/api.txt"
+
+    # 按国家分类统计节点
+    # 节点名格式: #XX-NNN-... (XX=国家码)
+    local -A cc_nodes=()
+    local -A cc_count=()
+    local total=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # 提取国家码: 从 # 后取前两个大写字母
+        local cc=$(echo "$line" | grep -oE '#[A-Z]{2}[-_]' | head -1 | tr -d '#-_')
+        [[ -z "$cc" ]] && cc="XX"
+        cc_nodes["$cc"]+="${line}"$'\n'
+        cc_count["$cc"]=$(( ${cc_count["$cc"]:-0} + 1 ))
+        ((total++))
+    done <<< "$nodes_raw"
+
+    if [[ $total -eq 0 ]]; then
+        red "[!] 节点池为空"
+        return 1
+    fi
 
     echo "------------------------------------------------------------"
-    echo "  URPool 可用国家 (按节点数降序):"
+    echo "  免费节点池: 共 $total 个节点, $(echo "${!cc_count[@]}" | wc -w) 个国家"
     echo "------------------------------------------------------------"
+
+    # 按节点数降序显示国家
     local -a cc_list=() cn_list=() pc_list=()
     local cc_idx=0
-    while IFS=$'\t' read -r cc cn pc; do
+    while IFS=$'\t' read -r cnt cc; do
         [[ -z "$cc" ]] && continue
-        cc_list+=("$cc"); cn_list+=("$cn"); pc_list+=("$pc")
+        local cname=$(get_country_name "$cc" 2>/dev/null || echo "$cc")
+        cc_list+=("$cc"); cn_list+=("$cname"); pc_list+=("$cnt")
         ((cc_idx++))
-        yellow "  [$cc_idx] [$cc] $cn (${pc}个节点)"
-    done < <(echo "$cc_summary")
+        yellow "  [$cc_idx] [$cc] $cname (${cnt}个节点)"
+    done < <(for k in "${!cc_count[@]}"; do echo -e "${cc_count[$k]}\t$k"; done | sort -rn)
 
     echo "------------------------------------------------------------"
     echo "  支持: 单个编号 (如 3) | 多个 (如 1,3,5) | 范围 (如 2-4) | 全部 (a)"
@@ -10378,7 +10405,7 @@ add_urpool_egress_group() {
 
     # 辅助: 复用已有端口或 devil 申请新端口 (serv00 模式)
     alloc_or_port() {
-        local ptype="$1"   # hy2|tuic|vless
+        local ptype="$1"
         local -a used_ports=("${@:2}")
         local chosen=""
         if [[ ${#used_ports[@]} -gt 0 ]]; then
@@ -10396,7 +10423,7 @@ add_urpool_egress_group() {
                 p_idx=$((p_idx-1))
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
                     chosen="${used_ports[$p_idx]}"
-                    green "  → 复用 ${ptype^^} 端口: $chosen"
+                    green "  -> 复用 ${ptype^^} 端口: $chosen"
                 else
                     red "  [!] 无效选择, 将申请新端口"
                 fi
@@ -10409,7 +10436,7 @@ add_urpool_egress_group() {
                 local cand=$(shuf -i 10000-65535 -n 1)
                 if check_port_available_all_ips "$cand" "tcp"; then
                     local alloc_result
-                    alloc_result=$(devil port add tcp "$cand" "singbox-or-${ptype}" 2>&1)
+                    alloc_result=$(devil port add tcp "$cand" "singbox-fp-${ptype}" 2>&1)
                     if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
                         chosen="$cand"
                         green "    已成功申请 ${ptype^^} TCP 端口: $chosen"
@@ -10426,27 +10453,28 @@ add_urpool_egress_group() {
     for ci in "${pick_cc[@]}"; do
         local ccc="${cc_list[$ci]}" cname="${cn_list[$ci]}"
 
-        local proxy_json proxy_url
-        proxy_json=$(curl -s --max-time 30 -H "Authorization: Bearer ${api_token}" "${api_base}/api/proxy?country=${ccc}" 2>/dev/null)
-        proxy_url=$(echo "$proxy_json" | jq -r '.socks5 // empty' 2>/dev/null | tr -d ' \r\n')
-        if [[ -z "$proxy_url" ]]; then
-            red "[✗] [URPool-$ccc] 获取代理失败 ($(echo "$proxy_json" | jq -r '.error // "未知错误"' 2>/dev/null)), 跳过"
-            ((failed++))
-            continue
-        fi
+        # 从该国家的节点列表中随机选一个
+        local country_nodes
+        country_nodes="${cc_nodes[$ccc]}"
+        [[ -z "$country_nodes" ]] && { red "[x] [FreePool-$ccc] 无节点, 跳过"; ((failed++)); continue; }
+
+        # 随机选一行节点
+        local node_url
+        node_url=$(echo "$country_nodes" | shuf -n 1 2>/dev/null | tr -d '\r')
+        [[ -z "$node_url" ]] && { red "[x] [FreePool-$ccc] 随机选节点失败, 跳过"; ((failed++)); continue; }
 
         local group_tag
         group_tag=$(generate_proxy_group_tag)
 
         local out_json
-        out_json=$(validate_and_parse_proxy_url "$proxy_url" "${group_tag}-out")
+        out_json=$(validate_and_parse_proxy_url "$node_url" "${group_tag}-out")
         if [[ $? -ne 0 || -z "$out_json" ]]; then
-            red "[✗] [URPool-$ccc] 链接解析失败, 跳过"
+            red "[x] [FreePool-$ccc] 链接解析失败, 跳过"
             ((failed++))
             continue
         fi
 
-        # 按选择分配端口 (hy2/tuic 走 UDP 需 devil udp 端口; 与 add_proxy_egress_group 的申请逻辑对齐)
+        # 按选择分配端口
         local hy2_port_p="0" tuic_port_p="0" vless_port_p="0"
         case "$oproto" in
             1) hy2_port_p=$(alloc_or_port "hy2" "${used_hy2_ports[@]}") ;;
@@ -10455,16 +10483,15 @@ add_urpool_egress_group() {
             *) hy2_port_p=$(alloc_or_port "hy2" "${used_hy2_ports[@]}")
                tuic_port_p=$(alloc_or_port "tuic" "${used_tuic_ports[@]}") ;;
         esac
-        [[ "$hy2_port_p" == "0" && "$tuic_port_p" == "0" && "$vless_port_p" == "0" ]] && { red "[✗] [URPool-$ccc] 端口分配失败, 跳过"; ((failed++)); continue; }
+        [[ "$hy2_port_p" == "0" && "$tuic_port_p" == "0" && "$vless_port_p" == "0" ]] && { red "[x] [FreePool-$ccc] 端口分配失败, 跳过"; ((failed++)); continue; }
 
         local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
         mkdir -p "$gdir"
-        echo "URPool-${ccc}" > "$gdir/remark.txt"
+        echo "FreePool-${ccc}" > "$gdir/remark.txt"
         echo "$ccc" > "$gdir/country.txt"
-        echo "$api_base" > "$gdir/urpool_api.txt"
-        echo "$api_token" >> "$gdir/urpool_api.txt"
-        echo "$(date +%s)" > "$gdir/urpool_ts.txt"
-        echo "$proxy_url" > "$gdir/raw_url.txt"
+        echo "$api_base" > "$gdir/freepool_api.txt"
+        echo "$api_token" >> "$gdir/freepool_api.txt"
+        echo "$node_url" > "$gdir/raw_url.txt"
         echo "$out_json" > "$gdir/outbound.json"
         echo "$hy2_port_p" > "$gdir/hy2_port.txt"
         echo "$tuic_port_p" > "$gdir/tuic_port.txt"
@@ -10486,41 +10513,41 @@ add_urpool_egress_group() {
                 echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
             fi
             if start_singbox_safe; then
-                green "[✓] URPool [$ccc] 建组成功! (标识: $group_tag, 出口约需预热45秒)"
+                green "[v] FreePool [$ccc] 建组成功! (标识: $group_tag, 节点: $(echo "$node_url" | grep -oP '#\K[^#]*$' || echo 'unknown'))"
                 generate_proxy_group_links "$group_tag"
                 ((added++))
             else
                 rm -rf "$gdir"
                 sed -i "/^${group_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null || true
-                red "[✗] [URPool-$ccc] sing-box 重启失败, 跳过"
+                red "[x] [FreePool-$ccc] sing-box 重启失败, 跳过"
                 ((failed++))
             fi
         else
             rm -rf "$gdir"
             sed -i "/^${group_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null || true
-            red "[✗] [URPool-$ccc] 同步配置失败, 跳过"
+            red "[x] [FreePool-$ccc] 同步配置失败, 跳过"
             ((failed++))
         fi
         echo
     done
 
     echo "============================================================"
-    green "  URPool 中继建组完成: 成功 $added 个国家, 失败 $failed 个"
-    cyan  "  自愈探测: 每分钟自动检测出口IP, 失效自动调 rotate 端点换新"
+    green "  免费节点池建组完成: 成功 $added 个国家, 失败 $failed 个"
+    cyan  "  自愈探测: 每分钟自动检测出口IP, 失效自动重新拉取节点换新"
     echo "============================================================"
 }
 
-# ============ URPool 中继自愈探测 (挂 run_cron_check) ============
-urpool_health_check() {
+# ============ 免费节点池自愈探测 (挂 run_cron_check) ============
+freepool_health_check() {
     local monitor_log="$WORKDIR/monitor.log"
-    local urpool_dir="$WORKDIR/urpool"
-    mkdir -p "$urpool_dir" 2>/dev/null || true
+    local fp_dir="$WORKDIR/freepool"
+    mkdir -p "$fp_dir" 2>/dev/null || true
 
     if [[ ! -d "$PROXY_GROUPS_DIR" ]]; then
         return 0
     fi
 
-    local lock_file="$urpool_dir/check.lock"
+    local lock_file="$fp_dir/check.lock"
     if [[ -f "$lock_file" ]]; then
         local old_pid
         old_pid=$(cat "$lock_file" 2>/dev/null)
@@ -10532,38 +10559,29 @@ urpool_health_check() {
     echo "$$" > "$lock_file"
     trap 'rm -f "$lock_file"' EXIT
 
-    local -a up_groups=()
+    local -a fp_groups=()
     for gdir in "$PROXY_GROUPS_DIR"/*/; do
         [[ -d "$gdir" ]] || continue
-        [[ -f "$gdir/urpool_api.txt" && -f "$gdir/country.txt" ]] || continue
-        up_groups+=("$(basename "$gdir")")
+        [[ -f "$gdir/freepool_api.txt" && -f "$gdir/country.txt" ]] || continue
+        fp_groups+=("$(basename "$gdir")")
     done
 
-    if [[ ${#up_groups[@]} -eq 0 ]]; then
+    if [[ ${#fp_groups[@]} -eq 0 ]]; then
         rm -f "$lock_file"
         return 0
     fi
 
-    local log_line="$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] 开始探测 ${#up_groups[@]} 个中继组"
+    local log_line="$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] 开始探测 ${#fp_groups[@]} 个节点组"
     echo "$log_line" >> "$monitor_log"
     if [[ -f "$monitor_log" && $(wc -c < "$monitor_log" 2>/dev/null || echo 0) -gt 204800 ]]; then
         tail -n 200 "$monitor_log" > "$monitor_log.tmp" 2>/dev/null && mv -f "$monitor_log.tmp" "$monitor_log" 2>/dev/null || true
     fi
 
     local changed=false
-    local now_ts
-    now_ts=$(date +%s)
-    for tag in "${up_groups[@]}"; do
+    for tag in "${fp_groups[@]}"; do
         local gdir="${PROXY_GROUPS_DIR}/$tag"
         local remark=$(cat "$gdir/remark.txt" 2>/dev/null || echo "$tag")
         local cc=$(cat "$gdir/country.txt" 2>/dev/null || echo "?")
-
-        # 预热宽限期: 新实例需 ~45s 预热, 期间跳过探测, 避免"建了又死、死了又建"循环
-        local ts=$(cat "$gdir/urpool_ts.txt" 2>/dev/null || echo "0")
-        [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
-        if (( now_ts - ts < 90 )); then
-            continue
-        fi
 
         local egress_ip ok
         egress_ip=$(openrung_probe_egress_ip "$gdir")
@@ -10575,47 +10593,70 @@ urpool_health_check() {
             continue
         fi
 
-        # 失效 → 调 URPool rotate 端点强制换新实例
+        # 失效 -> 重新拉取节点列表, 随机选一个该国家的新节点
         local api_base api_token
-        api_base=$(sed -n '1p' "$gdir/urpool_api.txt" 2>/dev/null | tr -d ' \r\n')
-        api_token=$(sed -n '2p' "$gdir/urpool_api.txt" 2>/dev/null | tr -d ' \r\n')
+        api_base=$(sed -n '1p' "$gdir/freepool_api.txt" 2>/dev/null | tr -d ' \r\n')
+        api_token=$(sed -n '2p' "$gdir/freepool_api.txt" 2>/dev/null | tr -d ' \r\n')
         if [[ -z "$api_base" || -z "$api_token" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] API 配置缺失, 跳过" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] [$remark] API 配置缺失, 跳过" >> "$monitor_log"
             continue
         fi
 
-        local new_json new_url
-        new_json=$(curl -s --max-time 30 -X POST -H "Authorization: Bearer ${api_token}" "${api_base%/}/api/rotate?country=${cc}" 2>/dev/null)
-        new_url=$(echo "$new_json" | jq -r '.socks5 // empty' 2>/dev/null | tr -d ' \r\n')
+        # 重新拉取节点列表
+        local nodes_raw
+        nodes_raw=$(curl -s --max-time 30 "${api_base}?api=get&token=${api_token}" 2>/dev/null)
+        if [[ -z "$nodes_raw" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] [$remark] 重新拉取节点失败, 跳过" >> "$monitor_log"
+            continue
+        fi
+
+        # 提取该国家的节点
+        local country_nodes
+        country_nodes=$(echo "$nodes_raw" | grep -i "#${cc}[-_]" 2>/dev/null)
+        if [[ -z "$country_nodes" ]]; then
+            # 尝试无分隔符匹配
+            country_nodes=$(echo "$nodes_raw" | grep -i "#${cc}" 2>/dev/null)
+        fi
+        if [[ -z "$country_nodes" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] [$remark] 未找到 [$cc] 节点, 跳过" >> "$monitor_log"
+            continue
+        fi
+
+        # 随机选一个新节点 (排除当前使用的)
+        local old_url current_node
+        old_url=$(cat "$gdir/raw_url.txt" 2>/dev/null | tr -d '\r')
+        local new_url
+        new_url=$(echo "$country_nodes" | grep -v "^${old_url}$" | shuf -n 1 2>/dev/null | tr -d '\r')
+        [[ -z "$new_url" ]] && new_url=$(echo "$country_nodes" | shuf -n 1 2>/dev/null | tr -d '\r')
         if [[ -z "$new_url" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] rotate 失败 ($(echo "$new_json" | jq -r '.error // "未知错误"' 2>/dev/null)), 跳过" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] [$remark] 无可用替换节点, 跳过" >> "$monitor_log"
             continue
         fi
 
         local new_out
         new_out=$(validate_and_parse_proxy_url "$new_url" "${tag}-out" 2>/dev/null)
         if [[ -z "$new_out" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] rotate 返回链接解析失败, 跳过" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] [$remark] 新节点链接解析失败, 跳过" >> "$monitor_log"
             continue
         fi
 
         echo "$new_url" > "$gdir/raw_url.txt"
         echo "$new_out" > "$gdir/outbound.json"
-        echo "$(date +%s)" > "$gdir/urpool_ts.txt"
+        echo "$(date +%s)" > "$gdir/freepool_ts.txt"
         rm -f "$gdir/last_egress_ip.txt"
 
         if sync_proxy_group_to_singbox "$tag"; then
             changed=true
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 中继失效, 已 rotate 换新: $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] [$remark] 节点失效, 已换新: $(echo "$new_url" | grep -oP '#\K[^#]*$' || echo '?')" >> "$monitor_log"
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 切换同步失败!" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] [$remark] 切换同步失败!" >> "$monitor_log"
         fi
         sleep 1
     done
 
     if $changed; then
         start_singbox_safe
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] 配置已生效 (sing-box 已重启)" >> "$monitor_log"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreePool自愈] 配置已生效 (sing-box 已重启)" >> "$monitor_log"
     fi
 
     rm -f "$lock_file"
@@ -11143,7 +11184,7 @@ proxy_egress_menu() {
         red    "  4. 删除代理节点组"
         blue   "  5. 重新同步全部代理配置并重启"
         cyan   "  6. 一键添加 OpenRung 中继节点 (按国家分类, 自动自愈)"
-        cyan   "  7. 一键添加 URPool 中继节点 (API 按国家, 自动自愈)"
+        cyan   "  7. 一键添加免费节点池 (按国家分类, 自动自愈)"
         echo "------------------------------------------------------------"
         red    "  0. 返回上一级菜单"
         echo "============================================================"
@@ -11158,7 +11199,7 @@ proxy_egress_menu() {
                 add_openrung_egress_group
                 ;;
             7)
-                add_urpool_egress_group
+                add_freepool_egress_group
                 ;;
             2)
                 if [[ ${#groups[@]} -eq 0 ]]; then
@@ -11445,8 +11486,8 @@ run_cron_check() {
     
     # OpenRung 中继自愈探测
     openrung_health_check
-    # URPool 中继自愈探测
-    urpool_health_check
+    # 免费节点池自愈探测
+    freepool_health_check
 }
 
 # ==================== 入口调度与 CLI 支持 ====================
