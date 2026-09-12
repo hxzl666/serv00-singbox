@@ -10320,9 +10320,11 @@ add_freepool_egress_group() {
     local total=0
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        # 提取国家码: 从 # 后取前两个大写字母
-        local cc=$(echo "$line" | grep -oE '#[A-Z]{2}[-_]' | head -1 | tr -d '#-_')
-        [[ -z "$cc" ]] && cc="XX"
+        # 提取国家码: URL # 后的 fragment (如 BA-001-H-vless -> BA)
+        local frag="${line##*#}"
+        local cc="${frag:0:2}"
+        # 确保是大写字母
+        [[ "$cc" =~ ^[A-Z]{2}$ ]] || cc="XX"
         cc_nodes["$cc"]+="${line}"$'\n'
         cc_count["$cc"]=$(( ${cc_count["$cc"]:-0} + 1 ))
         ((total++))
