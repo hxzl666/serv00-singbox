@@ -6509,9 +6509,25 @@ full_port_reset_and_realloc() {
                     done
                 fi
                 # 3. 智能 Fallback: 如果端口额度受限 (limit) 导致申请新端口失败，退回复用已有端口
+                #    ⚠️ 必须查 port_ip_map: 同端口在同一 IP 上只能有一个组绑定 (否则 sing-box 单 IP 双入站必崩)
                 if [[ -z "$hy2_port" && ${#available_hy2_ports[@]} -gt 0 ]]; then
-                    hy2_port="${available_hy2_ports[0]}"
-                    yellow "  [!] 代理组 [$gtag] 端口配额已满，自动退回复用端口: $hy2_port"
+                    local fb_p
+                    for fb_p in "${available_hy2_ports[@]}"; do
+                        local fb_ok=true
+                        for ip in "${hy2_ips[@]}"; do
+                            for m2 in "${port_ip_map[@]}"; do
+                                [[ "$m2" == "${fb_p}|${ip}" ]] && { fb_ok=false; break; }
+                            done
+                            [[ "$fb_ok" == "false" ]] && break
+                        done
+                        if [[ "$fb_ok" == "true" ]]; then
+                            hy2_port="$fb_p"
+                            break
+                        fi
+                    done
+                    if [[ -n "$hy2_port" ]]; then
+                        yellow "  [!] 代理组 [$gtag] 端口配额已满，自动退回复用端口: $hy2_port"
+                    fi
                 fi
 
                 if [[ -n "$hy2_port" ]]; then
@@ -6565,9 +6581,25 @@ full_port_reset_and_realloc() {
                     done
                 fi
                 # 3. 智能 Fallback: 如果端口额度受限 (limit) 导致申请新端口失败，退回复用已有端口
+                #    ⚠️ 必须查 port_ip_map: 同端口在同一 IP 上只能有一个组绑定 (否则 sing-box 单 IP 双入站必崩)
                 if [[ -z "$tuic_port" && ${#available_tuic_ports[@]} -gt 0 ]]; then
-                    tuic_port="${available_tuic_ports[0]}"
-                    yellow "  [!] 代理组 [$gtag] 端口配额已满，自动退回复用端口: $tuic_port"
+                    local fb_p2
+                    for fb_p2 in "${available_tuic_ports[@]}"; do
+                        local fb_ok2=true
+                        for ip in "${tuic_ips[@]}"; do
+                            for m2 in "${port_ip_map[@]}"; do
+                                [[ "$m2" == "${fb_p2}|${ip}" ]] && { fb_ok2=false; break; }
+                            done
+                            [[ "$fb_ok2" == "false" ]] && break
+                        done
+                        if [[ "$fb_ok2" == "true" ]]; then
+                            tuic_port="$fb_p2"
+                            break
+                        fi
+                    done
+                    if [[ -n "$tuic_port" ]]; then
+                        yellow "  [!] 代理组 [$gtag] 端口配额已满，自动退回复用端口: $tuic_port"
+                    fi
                 fi
 
                 if [[ -n "$tuic_port" ]]; then
@@ -6942,7 +6974,7 @@ PYPROBE
     devil port del "$proto" "$old_port" >/dev/null 2>&1
     sleep 1
 
-    # 6) 申请新端口(在涉及的全部 IP 上可用)
+    # 6) 申请新端口(在涉及的全部 IP 上可用 + config 内无 (IP,port) 冲突)
     local new_p="" cand can_use ip rc=0 res
     local retry=0
     while [[ $retry -lt 60 && -z "$new_p" ]]; do
@@ -6950,6 +6982,10 @@ PYPROBE
         can_use=true
         for ip in $involved_ips; do
             if ! check_port_available_on_ip "$cand" "$proto" "$ip" >/dev/null 2>&1; then
+                can_use=false; break
+            fi
+            # ⚠️ 必须查 config.json: 该 (IP,port) 已有 inbound 则换过去照样崩
+            if port_conflict_in_config "$ip" "$cand" "$WORKDIR/config.json"; then
                 can_use=false; break
             fi
         done
