@@ -10244,8 +10244,16 @@ add_openrung_egress_group() {
             reading >&2 "  请选择 [1-2, 默认1]: " p_choice
             [[ -z "$p_choice" ]] && p_choice="1"
             if [[ "$p_choice" == "1" ]]; then
-                for i in "${!used_ports[@]}"; do
-                    local up="${used_ports[$i]}"
+                # ⭐ 去重端口显示 (多组复用同端口只显示一次)
+                local -a unique_ports=()
+                local up_tmp seen_tmp
+                for up_tmp in "${used_ports[@]}"; do
+                    seen_tmp=false
+                    for uu_tmp in "${unique_ports[@]}"; do [[ "$uu_tmp" == "$up_tmp" ]] && seen_tmp=true; done
+                    [[ "$seen_tmp" == "false" ]] && unique_ports+=("$up_tmp")
+                done
+                for i in "${!unique_ports[@]}"; do
+                    local up="${unique_ports[$i]}"
                     local occ=()
                     local oip
                     for oip in "${ALL_IPS[@]}"; do
@@ -10259,7 +10267,7 @@ add_openrung_egress_group() {
                         yellow >&2 "  $((i+1)). $up  [可用 $(( ${#ALL_IPS[@]} - ${#occ[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${occ[*]}]"
                     fi
                 done
-                reading >&2 "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
+                reading >&2 "  请选择端口序号 [1-${#unique_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
                     chosen="${used_ports[$p_idx]}"
@@ -10283,12 +10291,14 @@ add_openrung_egress_group() {
             local retry=0
             while [[ $retry -lt 30 && -z "$chosen" ]]; do
                 local cand=$(shuf -i 10000-65535 -n 1)
-                if check_port_available_all_ips "$cand" "tcp"; then
+                local pproto="tcp"
+                [[ "$ptype" == "hy2" || "$ptype" == "tuic" ]] && pproto="udp"
+                if check_port_available_all_ips "$cand" "$pproto"; then
                     local alloc_result
-                    alloc_result=$(devil port add tcp "$cand" "singbox-or-${ptype}" 2>&1)
+                    alloc_result=$(devil port add "$pproto" "$cand" "singbox-or-${ptype}" 2>&1)
                     if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
                         chosen="$cand"
-                        green >&2 "    已成功申请 ${ptype^^} TCP 端口: $chosen"
+                        green >&2 "    已成功申请 ${ptype^^} ${pproto^^} 端口: $chosen"
                     fi
                 fi
                 ((retry++))
@@ -10355,7 +10365,7 @@ add_openrung_egress_group() {
             3) ip_proto="vless" ;;
             *) ip_proto="both" ;;
         esac
-        # ⭐ 自动跳过已被其它组占用的 IP (2026-09-13 用户发火修复: 复用端口必须跳过被占 IP)
+        # ⭐ 逐 IP 手动选择绑定: 被占自动跳过, 可用询问用户 (2026-09-13 用户发火修复)
         local bound_any=false
         for ip in "${ALL_IPS[@]}"; do
             [[ -n "$ip" ]] || continue
@@ -10369,20 +10379,25 @@ add_openrung_egress_group() {
             if [[ "$ip_proto" == "vless" ]]; then
                 [[ "$vless_port_p" != "0" ]] && can_h=true
             fi
-            local write_proto=""
-            if [[ "$can_h" == "true" && "$can_t" == "true" ]]; then write_proto="both"
-            elif [[ "$can_h" == "true" ]]; then write_proto="hy2"
-            elif [[ "$can_t" == "true" ]]; then write_proto="tuic"
-            fi
-            if [[ -n "$write_proto" ]]; then
-                echo "${ip}|${write_proto}" >> "$gdir/ip_protos.txt"
-                bound_any=true
-            else
+            if [[ "$can_h" == "false" && "$can_t" == "false" ]]; then
                 yellow "    [自动跳过] $ip 上所选端口已被其它组占用"
+                continue
+            fi
+            # 该 IP 可用 → 仅两个选项: 绑定此 IP / 跳过 (协议类型已在前面选定)
+            blue "    IP $ip: 端口可用"
+            yellow "      1. 绑定此 IP"
+            yellow "      0. 跳过"
+            reading "      选择 [1, 默认1, 0跳过]: " ipc
+            if [[ "$ipc" == "0" ]]; then
+                yellow "      → 跳过 $ip"
+            else
+                echo "${ip}|${ip_proto}" >> "$gdir/ip_protos.txt"
+                green "      → 绑定 $ip"
+                bound_any=true
             fi
         done
         if [[ "$bound_any" == "false" ]]; then
-            red "  [!] [$remark] 所选端口在所有 IP 上均不可用, 回滚本组"
+            red "  [!] [$remark] 未绑定任何可用 IP, 回滚本组"
             rm -rf "$gdir" 2>/dev/null
             ((failed++))
             continue
@@ -10777,8 +10792,16 @@ add_freepool_egress_group() {
             reading >&2 "  请选择 [1-2, 默认1]: " p_choice
             [[ -z "$p_choice" ]] && p_choice="1"
             if [[ "$p_choice" == "1" ]]; then
-                for i in "${!used_ports[@]}"; do
-                    local up="${used_ports[$i]}"
+                # ⭐ 去重端口显示 (多组复用同端口只显示一次)
+                local -a unique_ports=()
+                local up_tmp seen_tmp
+                for up_tmp in "${used_ports[@]}"; do
+                    seen_tmp=false
+                    for uu_tmp in "${unique_ports[@]}"; do [[ "$uu_tmp" == "$up_tmp" ]] && seen_tmp=true; done
+                    [[ "$seen_tmp" == "false" ]] && unique_ports+=("$up_tmp")
+                done
+                for i in "${!unique_ports[@]}"; do
+                    local up="${unique_ports[$i]}"
                     local occ=()
                     local oip
                     for oip in "${ALL_IPS[@]}"; do
@@ -10792,7 +10815,7 @@ add_freepool_egress_group() {
                         yellow >&2 "  $((i+1)). $up  [可用 $(( ${#ALL_IPS[@]} - ${#occ[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${occ[*]}]"
                     fi
                 done
-                reading >&2 "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
+                reading >&2 "  请选择端口序号 [1-${#unique_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
                     chosen="${used_ports[$p_idx]}"
@@ -10816,12 +10839,14 @@ add_freepool_egress_group() {
             local retry=0
             while [[ $retry -lt 30 && -z "$chosen" ]]; do
                 local cand=$(shuf -i 10000-65535 -n 1)
-                if check_port_available_all_ips "$cand" "tcp"; then
+                local pproto="tcp"
+                [[ "$ptype" == "hy2" || "$ptype" == "tuic" ]] && pproto="udp"
+                if check_port_available_all_ips "$cand" "$pproto"; then
                     local alloc_result
-                    alloc_result=$(devil port add tcp "$cand" "singbox-fp-${ptype}" 2>&1)
+                    alloc_result=$(devil port add "$pproto" "$cand" "singbox-fp-${ptype}" 2>&1)
                     if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
                         chosen="$cand"
-                        green >&2 "    已成功申请 ${ptype^^} TCP 端口: $chosen"
+                        green >&2 "    已成功申请 ${ptype^^} ${pproto^^} 端口: $chosen"
                     fi
                 fi
                 ((retry++))
@@ -10886,7 +10911,7 @@ add_freepool_egress_group() {
             3) ip_proto="vless" ;;
             *) ip_proto="both" ;;
         esac
-        # ⭐ 自动跳过已被其它组占用的 IP (2026-09-13 用户发火修复: 复用端口必须跳过被占 IP)
+        # ⭐ 逐 IP 手动选择绑定: 被占自动跳过, 可用询问用户 (2026-09-13 用户发火修复)
         local bound_any=false
         for ip in "${ALL_IPS[@]}"; do
             [[ -n "$ip" ]] || continue
@@ -10900,20 +10925,25 @@ add_freepool_egress_group() {
             if [[ "$ip_proto" == "vless" ]]; then
                 [[ "$vless_port_p" != "0" ]] && can_h=true
             fi
-            local write_proto=""
-            if [[ "$can_h" == "true" && "$can_t" == "true" ]]; then write_proto="both"
-            elif [[ "$can_h" == "true" ]]; then write_proto="hy2"
-            elif [[ "$can_t" == "true" ]]; then write_proto="tuic"
-            fi
-            if [[ -n "$write_proto" ]]; then
-                echo "${ip}|${write_proto}" >> "$gdir/ip_protos.txt"
-                bound_any=true
-            else
+            if [[ "$can_h" == "false" && "$can_t" == "false" ]]; then
                 yellow "    [自动跳过] $ip 上所选端口已被其它组占用"
+                continue
+            fi
+            # 该 IP 可用 → 仅两个选项: 绑定此 IP / 跳过 (协议类型已在前面选定)
+            blue "    IP $ip: 端口可用"
+            yellow "      1. 绑定此 IP"
+            yellow "      0. 跳过"
+            reading "      选择 [1, 默认1, 0跳过]: " ipc
+            if [[ "$ipc" == "0" ]]; then
+                yellow "      → 跳过 $ip"
+            else
+                echo "${ip}|${ip_proto}" >> "$gdir/ip_protos.txt"
+                green "      → 绑定 $ip"
+                bound_any=true
             fi
         done
         if [[ "$bound_any" == "false" ]]; then
-            red "  [!] [FreePool-$ccc] 所选端口在所有 IP 上均不可用, 回滚本组"
+            red "  [!] [FreePool-$ccc] 未绑定任何可用 IP, 回滚本组"
             rm -rf "$gdir" 2>/dev/null
             ((failed++))
             continue
@@ -11635,7 +11665,18 @@ proxy_egress_menu() {
                         printf "  %d. [%-10s] %s\n" "$((i+1))" "$t" "$r"
                     done
                     echo
-                    reading "请输入要删除的分组 tag (如 proxy-1): " del_tag
+                    reading "请输入要删除的分组序号 [1-${#groups[@]}] 或 tag (如 proxy-1): " del_input
+                    if [[ "$del_input" =~ ^[0-9]+$ ]]; then
+                        local del_idx=$((del_input - 1))
+                        if [[ $del_idx -ge 0 && $del_idx -lt ${#groups[@]} ]]; then
+                            del_tag="${groups[$del_idx]}"
+                        else
+                            red "  [!] 无效序号: $del_input"
+                            del_tag=""
+                        fi
+                    else
+                        del_tag="$del_input"
+                    fi
                     [[ -n "$del_tag" ]] && remove_proxy_egress_group "$del_tag"
                 fi
                 ;;
