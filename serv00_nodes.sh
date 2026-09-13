@@ -4326,6 +4326,16 @@ collect_global_udp_binds() {
     printf '%s\n' "${out[@]}"
 }
 
+# ⭐ 检查 (port, proto, ip) 是否已被全局任何组占用 (2026-09-13 用户发火修复: free pool/OpenRung 复用端口必须跳过被占 IP)
+# 返回: 0=已被占用, 1=空闲
+port_ip_taken_global() {
+    local port="$1" proto="$2" ip="$3"
+    [[ -z "$port" || -z "$proto" || -z "$ip" ]] && return 1
+    local binds
+    binds=$(collect_global_udp_binds 2>/dev/null || true)
+    echo "$binds" | grep -q "^${port}|${proto}|${ip}|"
+}
+
 add_egress_node_group() {
     local cc="${1^^}"
     local enable_vless="${2:-true}"
@@ -10213,22 +10223,56 @@ add_openrung_egress_group() {
         local ptype="$1"   # hy2|tuic|vless
         local -a used_ports=("${@:2}")
         local chosen=""
+        # 收集全局端口占用 (主节点+代理组+赛风), 用于显示可用 IP 与自动跳过
+        local -a gbinds=()
+        while IFS='|' read -r gbp gbpr gbip gbown; do
+            [[ -n "$gbp" ]] && gbinds+=("$gbp|$gbpr|$gbip|$gbown")
+        done < <(collect_global_udp_binds 2>/dev/null || true)
+        ip_in_use() {
+            local p="$1" pr="$2" ip="$3" b
+            for b in "${gbinds[@]}"; do
+                IFS='|' read -r bp bpr bip bown <<< "$b"
+                [[ "$bp" == "$p" && "$bpr" == "$pr" && "$bip" == "$ip" ]] && return 0
+            done
+            return 1
+        }
         if [[ ${#used_ports[@]} -gt 0 ]]; then
             echo >&2
-            yellow >&2 "已有 ${ptype^^} 端口: ${used_ports[*]} (端口受限, 建议复用)"
+            yellow >&2 "已有 ${ptype^^} 端口 (括号内为可用IP数):"
             echo >&2 "  1. 复用已有端口"
             echo >&2 "  2. 申请新端口"
             reading >&2 "  请选择 [1-2, 默认1]: " p_choice
             [[ -z "$p_choice" ]] && p_choice="1"
             if [[ "$p_choice" == "1" ]]; then
                 for i in "${!used_ports[@]}"; do
-                    yellow >&2 "  $((i+1)). ${used_ports[$i]}"
+                    local up="${used_ports[$i]}"
+                    local occ=()
+                    local oip
+                    for oip in "${ALL_IPS[@]}"; do
+                        [[ -n "$oip" ]] && ip_in_use "$up" "$ptype" "$oip" && occ+=("$oip")
+                    done
+                    if [[ ${#occ[@]} -eq 0 ]]; then
+                        green >&2 "  $((i+1)). $up  [全部 ${#ALL_IPS[@]} 个IP可用]"
+                    elif [[ ${#occ[@]} -ge ${#ALL_IPS[@]} ]]; then
+                        red >&2 "  $((i+1)). $up  [!! 所有IP已被占用: ${occ[*]}]"
+                    else
+                        yellow >&2 "  $((i+1)). $up  [可用 $(( ${#ALL_IPS[@]} - ${#occ[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${occ[*]}]"
+                    fi
                 done
                 reading >&2 "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
                     chosen="${used_ports[$p_idx]}"
                     green >&2 "  -> 复用 ${ptype^^} 端口: $chosen"
+                    # 预告可用 IP / 将被自动跳过的 IP
+                    local free_ips=() occ_ips=()
+                    local oip2
+                    for oip2 in "${ALL_IPS[@]}"; do
+                        [[ -n "$oip2" ]] || continue
+                        if ip_in_use "$chosen" "$ptype" "$oip2"; then occ_ips+=("$oip2"); else free_ips+=("$oip2"); fi
+                    done
+                    yellow >&2 "    可用IP: ${free_ips[*]:-无}"
+                    [[ ${#occ_ips[@]} -gt 0 ]] && red >&2 "    已被占用(将自动跳过): ${occ_ips[*]}"
                 else
                     red >&2 "  [!] 无效选择, 将申请新端口"
                 fi
@@ -10311,9 +10355,38 @@ add_openrung_egress_group() {
             3) ip_proto="vless" ;;
             *) ip_proto="both" ;;
         esac
+        # ⭐ 自动跳过已被其它组占用的 IP (2026-09-13 用户发火修复: 复用端口必须跳过被占 IP)
+        local bound_any=false
         for ip in "${ALL_IPS[@]}"; do
-            echo "${ip}|${ip_proto}" >> "$gdir/ip_protos.txt"
+            [[ -n "$ip" ]] || continue
+            local can_h=false can_t=false
+            if [[ "$ip_proto" == "hy2" || "$ip_proto" == "both" ]]; then
+                [[ "$hy2_port_p" != "0" ]] && ! port_ip_taken_global "$hy2_port_p" "hy2" "$ip" && can_h=true
+            fi
+            if [[ "$ip_proto" == "tuic" || "$ip_proto" == "both" ]]; then
+                [[ "$tuic_port_p" != "0" ]] && ! port_ip_taken_global "$tuic_port_p" "tuic" "$ip" && can_t=true
+            fi
+            if [[ "$ip_proto" == "vless" ]]; then
+                [[ "$vless_port_p" != "0" ]] && can_h=true
+            fi
+            local write_proto=""
+            if [[ "$can_h" == "true" && "$can_t" == "true" ]]; then write_proto="both"
+            elif [[ "$can_h" == "true" ]]; then write_proto="hy2"
+            elif [[ "$can_t" == "true" ]]; then write_proto="tuic"
+            fi
+            if [[ -n "$write_proto" ]]; then
+                echo "${ip}|${write_proto}" >> "$gdir/ip_protos.txt"
+                bound_any=true
+            else
+                yellow "    [自动跳过] $ip 上所选端口已被其它组占用"
+            fi
         done
+        if [[ "$bound_any" == "false" ]]; then
+            red "  [!] [$remark] 所选端口在所有 IP 上均不可用, 回滚本组"
+            rm -rf "$gdir" 2>/dev/null
+            ((failed++))
+            continue
+        fi
 
         if sync_proxy_group_to_singbox "$group_tag"; then
             if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
@@ -10680,25 +10753,59 @@ add_freepool_egress_group() {
     # 辅助: 复用已有端口或 devil 申请新端口 (serv00 模式)
     # 注意: 交互输出走 stderr, 只返回端口号到 stdout
     alloc_or_port() {
-        local ptype="$1"
+        local ptype="$1"   # hy2|tuic|vless
         local -a used_ports=("${@:2}")
         local chosen=""
+        # 收集全局端口占用 (主节点+代理组+赛风), 用于显示可用 IP 与自动跳过
+        local -a gbinds=()
+        while IFS='|' read -r gbp gbpr gbip gbown; do
+            [[ -n "$gbp" ]] && gbinds+=("$gbp|$gbpr|$gbip|$gbown")
+        done < <(collect_global_udp_binds 2>/dev/null || true)
+        ip_in_use() {
+            local p="$1" pr="$2" ip="$3" b
+            for b in "${gbinds[@]}"; do
+                IFS='|' read -r bp bpr bip bown <<< "$b"
+                [[ "$bp" == "$p" && "$bpr" == "$pr" && "$bip" == "$ip" ]] && return 0
+            done
+            return 1
+        }
         if [[ ${#used_ports[@]} -gt 0 ]]; then
             echo >&2
-            yellow >&2 "已有 ${ptype^^} 端口: ${used_ports[*]} (端口受限, 建议复用)"
+            yellow >&2 "已有 ${ptype^^} 端口 (括号内为可用IP数):"
             echo >&2 "  1. 复用已有端口"
             echo >&2 "  2. 申请新端口"
             reading >&2 "  请选择 [1-2, 默认1]: " p_choice
             [[ -z "$p_choice" ]] && p_choice="1"
             if [[ "$p_choice" == "1" ]]; then
                 for i in "${!used_ports[@]}"; do
-                    yellow >&2 "  $((i+1)). ${used_ports[$i]}"
+                    local up="${used_ports[$i]}"
+                    local occ=()
+                    local oip
+                    for oip in "${ALL_IPS[@]}"; do
+                        [[ -n "$oip" ]] && ip_in_use "$up" "$ptype" "$oip" && occ+=("$oip")
+                    done
+                    if [[ ${#occ[@]} -eq 0 ]]; then
+                        green >&2 "  $((i+1)). $up  [全部 ${#ALL_IPS[@]} 个IP可用]"
+                    elif [[ ${#occ[@]} -ge ${#ALL_IPS[@]} ]]; then
+                        red >&2 "  $((i+1)). $up  [!! 所有IP已被占用: ${occ[*]}]"
+                    else
+                        yellow >&2 "  $((i+1)). $up  [可用 $(( ${#ALL_IPS[@]} - ${#occ[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${occ[*]}]"
+                    fi
                 done
                 reading >&2 "  请选择端口序号 [1-${#used_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
                 if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
                     chosen="${used_ports[$p_idx]}"
                     green >&2 "  -> 复用 ${ptype^^} 端口: $chosen"
+                    # 预告可用 IP / 将被自动跳过的 IP
+                    local free_ips=() occ_ips=()
+                    local oip2
+                    for oip2 in "${ALL_IPS[@]}"; do
+                        [[ -n "$oip2" ]] || continue
+                        if ip_in_use "$chosen" "$ptype" "$oip2"; then occ_ips+=("$oip2"); else free_ips+=("$oip2"); fi
+                    done
+                    yellow >&2 "    可用IP: ${free_ips[*]:-无}"
+                    [[ ${#occ_ips[@]} -gt 0 ]] && red >&2 "    已被占用(将自动跳过): ${occ_ips[*]}"
                 else
                     red >&2 "  [!] 无效选择, 将申请新端口"
                 fi
@@ -10779,9 +10886,38 @@ add_freepool_egress_group() {
             3) ip_proto="vless" ;;
             *) ip_proto="both" ;;
         esac
+        # ⭐ 自动跳过已被其它组占用的 IP (2026-09-13 用户发火修复: 复用端口必须跳过被占 IP)
+        local bound_any=false
         for ip in "${ALL_IPS[@]}"; do
-            echo "${ip}|${ip_proto}" >> "$gdir/ip_protos.txt"
+            [[ -n "$ip" ]] || continue
+            local can_h=false can_t=false
+            if [[ "$ip_proto" == "hy2" || "$ip_proto" == "both" ]]; then
+                [[ "$hy2_port_p" != "0" ]] && ! port_ip_taken_global "$hy2_port_p" "hy2" "$ip" && can_h=true
+            fi
+            if [[ "$ip_proto" == "tuic" || "$ip_proto" == "both" ]]; then
+                [[ "$tuic_port_p" != "0" ]] && ! port_ip_taken_global "$tuic_port_p" "tuic" "$ip" && can_t=true
+            fi
+            if [[ "$ip_proto" == "vless" ]]; then
+                [[ "$vless_port_p" != "0" ]] && can_h=true
+            fi
+            local write_proto=""
+            if [[ "$can_h" == "true" && "$can_t" == "true" ]]; then write_proto="both"
+            elif [[ "$can_h" == "true" ]]; then write_proto="hy2"
+            elif [[ "$can_t" == "true" ]]; then write_proto="tuic"
+            fi
+            if [[ -n "$write_proto" ]]; then
+                echo "${ip}|${write_proto}" >> "$gdir/ip_protos.txt"
+                bound_any=true
+            else
+                yellow "    [自动跳过] $ip 上所选端口已被其它组占用"
+            fi
         done
+        if [[ "$bound_any" == "false" ]]; then
+            red "  [!] [FreePool-$ccc] 所选端口在所有 IP 上均不可用, 回滚本组"
+            rm -rf "$gdir" 2>/dev/null
+            ((failed++))
+            continue
+        fi
 
         if sync_proxy_group_to_singbox "$group_tag"; then
             if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
