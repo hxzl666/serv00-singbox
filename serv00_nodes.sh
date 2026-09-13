@@ -10432,6 +10432,68 @@ add_openrung_egress_group() {
     echo "============================================================"
 }
 
+# 从 broker API 重新拉取指定国家的中继列表, 重建 relays.txt (新列表, active_idx 归零)
+openrung_refresh_relays() {
+    local gdir="$1" cc="$2"
+    [[ -z "$cc" || "$cc" == "?" ]] && return 1
+    local relays_json
+    relays_json=$(curl -s --max-time 15 -H "User-Agent: openrung/0.3.8" "https://broker.openrung.org/api/v1/relays?limit=20" 2>/dev/null)
+    if ! echo "$relays_json" | jq -e '.relays | type == "array"' >/dev/null 2>&1; then
+        return 1
+    fi
+    local urls
+    urls=$(echo "$relays_json" | jq -r --arg cc "$cc" '
+        [.relays[] | select(.country_code == $cc) |
+         "vless://\(.client_id)@\(.public_host):\(.public_port)?encryption=none&flow=xtls-rprx-vision&security=reality&sni=\(.server_name // "www.cloudflare.com")&fp=chrome&pbk=\(.reality_public_key)&sid=\(.short_id)&type=tcp"] | .[]')
+    if [[ -z "$urls" ]]; then
+        return 1
+    fi
+    echo "$urls" > "$gdir/relays.txt"
+    echo 0 > "$gdir/active_idx.txt"
+    return 0
+}
+
+# 遍历 relays.txt 逐个真实代理探测 (含延迟), 选第一个能通的写入全局 new_idx/new_url/new_out
+# 判定标准: 真实走代理出网成功 (临时 sing-box + curl api.ipify.org), 不是 TCP 端口通
+openrung_pick_relay() {
+    local gdir="$1" skip_idx="$2" tag="$3" remark="$4" monitor_log="$5"
+    new_idx=-1; new_url=""; new_out=""
+    local total
+    total=$(wc -l < "$gdir/relays.txt" 2>/dev/null || echo "0")
+    [[ -z "$total" || "$total" -eq 0 ]] && return 1
+    local __i __u __host __probe_out __probe_ip __probe_ok __probe_dir __probe_start __probe_ts __probe_lat
+    __probe_start=$(date +%s)
+    for ((__i=0; __i<total; __i++)); do
+        [[ "$skip_idx" -ge 0 && "$__i" -eq "$skip_idx" ]] && continue
+        __u=$(sed -n "$((__i + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$__u" ]] && continue
+        # 总超时保护
+        if (( $(date +%s) - __probe_start > 100 )); then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 探测总超时(100s), 停止本轮" >> "$monitor_log"
+            break
+        fi
+        __host=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@([^:/]+).*|\1|')
+        # 直接真实代理探测 (不用 TCP 快检), 并测真连接延迟 (FreeBSD 兼容 %N)
+        __probe_out=$(validate_and_parse_proxy_url "$__u" "probe-${tag}-${__i}" 2>/dev/null)
+        [[ -z "$__probe_out" ]] && continue
+        __probe_dir=$(mktemp -d /tmp/or-probe-XXXXXX 2>/dev/null) || continue
+        echo "$__probe_out" > "$__probe_dir/outbound.json"
+        __probe_ts=$(date +%s%N)
+        __probe_ip=$(openrung_probe_egress_ip "$__probe_dir" 2>/dev/null)
+        __probe_ok=$?
+        __probe_lat=$(( ( $(date +%s%N) - __probe_ts ) / 1000000 ))
+        rm -rf "$__probe_dir" 2>/dev/null || true
+        if [[ $__probe_ok -eq 0 && -n "$__probe_ip" ]]; then
+            new_idx=$__i
+            new_url="$__u"
+            new_out="$__probe_out"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 真实探测通过 #$((__i+1)) $__host (出口: $__probe_ip, 延迟: ${__probe_lat}ms)" >> "$monitor_log"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ============ OpenRung 中继自愈探测 (挂 run_cron_check) ============
 openrung_health_check() {
     local monitor_log="$WORKDIR/monitor.log"
@@ -10477,36 +10539,38 @@ openrung_health_check() {
         local gdir="${PROXY_GROUPS_DIR}/$tag"
         local remark=$(cat "$gdir/remark.txt" 2>/dev/null || echo "$tag")
 
-        local egress_ip ok
+        local egress_ip ok probe_ts probe_lat
+        probe_ts=$(date +%s%N)
         egress_ip=$(openrung_probe_egress_ip "$gdir")
         ok=$?
+        probe_lat=$(( ( $(date +%s%N) - probe_ts ) / 1000000 ))
 
         if [[ $ok -eq 0 && -n "$egress_ip" ]]; then
             echo "$egress_ip" > "$gdir/last_egress_ip.txt"
             echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$gdir/last_check_ok.txt"
+            echo "${probe_lat}ms" > "$gdir/last_latency.txt"
             continue
         fi
 
+        # 失效: 先探测备用中继 (真实代理探测+延迟); 全失败则从 broker 自动重新拉取后再探测
         local cc=$(cat "$gdir/country.txt" 2>/dev/null || echo "?")
         local idx=$(cat "$gdir/active_idx.txt" 2>/dev/null || echo "0")
-        local total=$(wc -l < "$gdir/relays.txt" 2>/dev/null || echo "0")
-        [[ -z "$total" || "$total" -eq 0 ]] && total=0
-        local new_idx=$((idx + 1))
-        if [[ "$new_idx" -ge "$total" ]]; then
-            new_idx=0
+        local new_idx=-1 new_url="" new_out=""
+
+        if ! openrung_pick_relay "$gdir" "$idx" "$tag" "$remark" "$monitor_log"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 全部备用中继真实探测失败, 从 broker 重新拉取 $cc 中继..." >> "$monitor_log"
+            if openrung_refresh_relays "$gdir" "$cc"; then
+                local new_total
+                new_total=$(wc -l < "$gdir/relays.txt" 2>/dev/null || echo "0")
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 已从 broker 重新拉取 $new_total 条中继, 重新真实探测..." >> "$monitor_log"
+                openrung_pick_relay "$gdir" -1 "$tag" "$remark" "$monitor_log"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] broker 重新拉取失败 (网络不通或无 $cc 中继)" >> "$monitor_log"
+            fi
         fi
 
-        local new_url
-        new_url=$(sed -n "$((new_idx + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d ' \r\n')
-        if [[ -z "$new_url" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 探测失败且无备用中继, 跳过" >> "$monitor_log"
-            continue
-        fi
-
-        local new_out
-        new_out=$(validate_and_parse_proxy_url "$new_url" "${tag}-out" 2>/dev/null)
-        if [[ -z "$new_out" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 备用中继解析失败, 跳过" >> "$monitor_log"
+        if [[ "$new_idx" -lt 0 || -z "$new_url" || -z "$new_out" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 拉取后仍全部真实探测失败, 跳过本轮" >> "$monitor_log"
             continue
         fi
 
@@ -10517,7 +10581,7 @@ openrung_health_check() {
 
         if sync_proxy_group_to_singbox "$tag"; then
             changed=true
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 中继失效, 已自动切换至备用 #$((new_idx+1)): $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 中继失效, 已自动切换至真实探测通过的备用 #$((new_idx+1)): $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 切换同步失败!" >> "$monitor_log"
         fi
