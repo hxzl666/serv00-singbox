@@ -10269,8 +10269,8 @@ add_openrung_egress_group() {
                 done
                 reading >&2 "  请选择端口序号 [1-${#unique_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
-                if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
-                    chosen="${used_ports[$p_idx]}"
+                if [[ $p_idx -ge 0 && $p_idx -lt ${#unique_ports[@]} ]]; then
+                    chosen="${unique_ports[$p_idx]}"
                     green >&2 "  -> 复用 ${ptype^^} 端口: $chosen"
                     # 预告可用 IP / 将被自动跳过的 IP
                     local free_ips=() occ_ips=()
@@ -10817,8 +10817,8 @@ add_freepool_egress_group() {
                 done
                 reading >&2 "  请选择端口序号 [1-${#unique_ports[@]}]: " p_idx
                 p_idx=$((p_idx-1))
-                if [[ $p_idx -ge 0 && $p_idx -lt ${#used_ports[@]} ]]; then
-                    chosen="${used_ports[$p_idx]}"
+                if [[ $p_idx -ge 0 && $p_idx -lt ${#unique_ports[@]} ]]; then
+                    chosen="${unique_ports[$p_idx]}"
                     green >&2 "  -> 复用 ${ptype^^} 端口: $chosen"
                     # 预告可用 IP / 将被自动跳过的 IP
                     local free_ips=() occ_ips=()
