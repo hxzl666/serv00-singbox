@@ -3179,7 +3179,12 @@ except Exception: pass
         start_singbox_safe
     fi
 
-    yellow "[*] 正在检测 WARP 出口 IP (SOCKS5 端口: $socks)..."
+    local psi_en=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null || echo "false")
+    if [[ "$psi_en" == "true" ]]; then
+        yellow "[*] 正在检测主节点赛风出口 IP (SOCKS5 端口: $socks)..."
+    else
+        yellow "[*] 正在检测主节点 WARP 出口 IP (SOCKS5 端口: $socks)..."
+    fi
 
     local json=""
     # 尝试 ipinfo.io (可能限流/403)
@@ -6243,6 +6248,82 @@ EOF
   }
 }
 EOF
+    elif [[ "$PSIPHON_ENABLED" == "true" ]] && [[ "$PSIPHON_MODE" == "all" ]]; then
+        local psi_sport=$(get_psiphon_socks_port)
+        yellow "配置: 全部流量通过 Psiphon 赛风出站 (端口: ${psi_sport:-自动})"
+        cat >> config.json <<EOF
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "socks",
+      "tag": "psiphon-out",
+      "server": "127.0.0.1",
+      "server_port": ${psi_sport:-1080},
+      "version": "5",
+      "network": "tcp"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": ["socks-loopback"],
+        "outbound": "psiphon-out"
+      }
+    ],
+    "final": "psiphon-out"
+  }
+}
+EOF
+    elif [[ "$PSIPHON_ENABLED" == "true" ]] && [[ "$PSIPHON_MODE" == "google" ]]; then
+        local psi_sport=$(get_psiphon_socks_port)
+        yellow "配置: Google/YouTube/OpenAI/Netflix 通过 Psiphon 赛风出站 (端口: ${psi_sport:-自动})"
+        cat >> config.json <<EOF
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "socks",
+      "tag": "psiphon-out",
+      "server": "127.0.0.1",
+      "server_port": ${psi_sport:-1080},
+      "version": "5",
+      "network": "tcp"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": ["socks-loopback"],
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "google.com", "google.co.jp", "google.com.hk",
+          "googleapis.com", "gstatic.com", "ggpht.com",
+          "youtube.com", "ytimg.com", "youtu.be",
+          "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+          "netflix.com", "nflxvideo.net", "nflxso.net"
+        ],
+        "outbound": "psiphon-out"
+      }
+    ],
+    "final": "direct"
+  }
+}
+EOF
     else
         # 默认直连出站
         cat >> config.json <<EOF
@@ -7390,12 +7471,18 @@ EOF
     [ -f "$WORKDIR/ARGO_AUTH.log" ]   && ARGO_AUTH=$(cat "$WORKDIR/ARGO_AUTH.log" 2>/dev/null)
     [ -f "$WORKDIR/ARGO_DOMAIN.log" ] && ARGO_DOMAIN=$(cat "$WORKDIR/ARGO_DOMAIN.log" 2>/dev/null)
 
-    # 加载WARP出站状态 (与磁盘保持一致, 防止残留状态导致生成废 WARP 配置)
+    # 加载WARP与Psiphon出站状态 (与磁盘保持一致, 防止残留状态导致生成废配置)
     if [ -f "$WORKDIR/warp_enabled.txt" ]; then
         WARP_ENABLED=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
     fi
     if [ -f "$WORKDIR/warp_mode.txt" ]; then
         WARP_MODE=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+    fi
+    if [ -f "$WORKDIR/psiphon_enabled.txt" ]; then
+        PSIPHON_ENABLED=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
+    fi
+    if [ -f "$WORKDIR/psiphon_mode.txt" ]; then
+        PSIPHON_MODE=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null)
     fi
 
     # WARP 状态自检: enabled=true 但 WARP 参数不完整时自动降级为直连
@@ -8414,6 +8501,14 @@ restart_processes() {
     else
         yellow "[2/5] 未检测到赛风多出口副节点，跳过"
     fi
+
+    # 2.1 若主节点启用了赛风出站，确保主 Psiphon 服务运行并在位同步
+    if [[ "$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)" == "true" ]]; then
+        yellow "[2.1/5] 启动并同步主节点 Psiphon 赛风服务..."
+        start_psiphon_userland 2>/dev/null || true
+        psiphon_wait_ready 20 2>/dev/null || true
+        sync_all_psiphon_ports
+    fi
     
     # 3. 同步副节点 - 自定义代理分组配置到 sing-box
     yellow "[3/5] 同步副节点: 自定义代理出站多出口配置..."
@@ -8741,13 +8836,13 @@ view_logs_menu() {
 
 # 配置WARP出站 (安装后修改 - 保留现有节点)
 # ==================== 主节点出站管理 ====================
-# 仅控制【主节点】流量的出站方式 (直连出站 / WARP全局出站 / WARP分流出站)
+# 控制【主节点】流量的出站方式 (直连出站 / WARP全局出站 / WARP分流出站 / 赛风全局出站 / 赛风分流出站)
 # 副节点 (赛风多出口、自定义代理出站) 为独立平行系统，拥有独立入站端口与专属路由，绝不受此设置影响
 configure_warp_outbound() {
-    clear
+    clear 2>/dev/null || true
     echo
     green "============================================================"
-    green "  主节点出站管理 (直连出站 / WARP 出站)"
+    green "  主节点出站管理 (直连出站 / WARP 出站 / 赛风出站)"
     green "============================================================"
     yellow "  说明: 本设置仅作用于【主节点】入站流量"
     yellow "        副节点(赛风出站、自定义代理出站)为独立平行系统，不受影响"
@@ -8761,15 +8856,29 @@ configure_warp_outbound() {
     cd "$WORKDIR"
     
     # 显示当前主节点出站状态
-    local current_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
-    local current_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+    local current_warp=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
+    local current_warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
     local current_endpoint=$(cat "$WORKDIR/warp_best_endpoint.txt" 2>/dev/null)
     local current_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null)
     
+    local current_psi=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null || echo "false")
+    local current_psi_mode=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null || echo "all")
+    local current_psi_reg=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null || echo "AUTO")
+    current_psi_reg="${current_psi_reg:-AUTO}"
+    
     echo
     purple "当前主节点出站状态:"
-    if [[ "$current_status" == "true" ]]; then
-        if [[ "$current_mode" == "all" ]]; then
+    if [[ "$current_psi" == "true" ]]; then
+        local psi_sport=$(get_psiphon_socks_port)
+        if [[ "$current_psi_mode" == "google" ]]; then
+            blue "  主节点出站模式: ✓ Psiphon 赛风分流出站 (Google/YouTube/Netflix/OpenAI 走赛风)"
+        else
+            blue "  主节点出站模式: ✓ Psiphon 赛风全局出站 (全部主节点流量走赛风)"
+        fi
+        green "  出口国家: $current_psi_reg - $(get_country_name "$current_psi_reg")"
+        green "  Socks5端口: ${psi_sport:-自动分配}"
+    elif [[ "$current_warp" == "true" ]]; then
+        if [[ "$current_warp_mode" == "all" ]]; then
             blue "  主节点出站模式: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
         else
             blue "  主节点出站模式: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI 走 WARP)"
@@ -8790,29 +8899,32 @@ configure_warp_outbound() {
     yellow "  0. 主节点 - 直连出站 (Direct, 恢复原生出站)"
     yellow "  1. 主节点 - WARP 全局出站 (全部主节点流量走 WARP)"
     yellow "  2. 主节点 - WARP 分流出站 (仅 Google/YouTube/Netflix/OpenAI)"
+    yellow "  3. 主节点 - Psiphon 赛风全局出站 (全部主节点流量走赛风)"
+    yellow "  4. 主节点 - Psiphon 赛风分流出站 (仅 Google/YouTube/Netflix/OpenAI)"
     echo "------------------------------------------------------------"
-    green  "  3. 优选 WARP Endpoint IP (优化连接质量与延迟)"
-    blue   "  4. 恢复 Cloudflare 默认 Endpoint"
-    blue   "  5. 重新获取勇哥 WARP API 配置"
-    green  "  6. 检测主节点 WARP 出口 IP"
+    green  "  5. 优选 WARP Endpoint IP (优化连接质量与延迟)"
+    blue   "  6. 恢复 Cloudflare 默认 Endpoint"
+    blue   "  7. 重新获取勇哥 WARP API 配置"
+    green  "  8. 检测主节点当前出口 IP"
     echo "------------------------------------------------------------"
-    red    "  7. 返回主菜单"
+    red    "  9. 返回主菜单"
     echo "============================================================"
-    reading "请选择 [0-7]: " new_choice
+    reading "请选择 [0-9, q]: " new_choice
     
-    if [[ "$new_choice" == "7" || "$new_choice" == "" ]]; then
+    if [[ "$new_choice" == "9" || "$new_choice" =~ ^[Qq]$ || "$new_choice" == "" ]]; then
         return 0
     fi
     
-    if [[ "$new_choice" == "6" ]]; then
+    # 选项 8: 检测主节点当前出口 IP (兼容 Direct / WARP / Psiphon)
+    if [[ "$new_choice" == "8" ]]; then
         warp_egress_test
         echo
         reading "按回车键继续..." temp
         return 0
     fi
     
-    # 恢复默认 Endpoint
-    if [[ "$new_choice" == "4" ]]; then
+    # 选项 6: 恢复默认 Endpoint
+    if [[ "$new_choice" == "6" ]]; then
         echo
         yellow "将恢复 Cloudflare 默认 Endpoint..."
         
@@ -8842,8 +8954,8 @@ configure_warp_outbound() {
         return 0
     fi
     
-    # 重新获取勇哥API配置
-    if [[ "$new_choice" == "5" ]]; then
+    # 选项 7: 重新获取勇哥API配置
+    if [[ "$new_choice" == "7" ]]; then
         echo
         yellow "正在重新获取勇哥API配置..."
         
@@ -8875,9 +8987,9 @@ configure_warp_outbound() {
         return 0
     fi
     
-    # 如果选择优选 Endpoint
-    if [[ "$new_choice" == "3" ]]; then
-        if [[ "$current_status" != "true" ]]; then
+    # 选项 5: 优选 Endpoint
+    if [[ "$new_choice" == "5" ]]; then
+        if [[ "$current_warp" != "true" ]]; then
             yellow "WARP 未启用，是否先启用 WARP?"
             reading "选择模式 (1=全部流量, 2=分流, 其他=取消): " enable_mode
             
@@ -8886,8 +8998,12 @@ configure_warp_outbound() {
                     if init_warp_config; then
                         WARP_ENABLED=true
                         WARP_MODE="all"
+                        PSIPHON_ENABLED=false
+                        PSIPHON_MODE=""
                         echo "true" > "$WORKDIR/warp_enabled.txt"
                         echo "all" > "$WORKDIR/warp_mode.txt"
+                        echo "false" > "$WORKDIR/psiphon_enabled.txt"
+                        echo "" > "$WORKDIR/psiphon_mode.txt"
                         green "已启用 WARP (全部流量)"
                     else
                         red "WARP 配置失败"
@@ -8898,8 +9014,12 @@ configure_warp_outbound() {
                     if init_warp_config; then
                         WARP_ENABLED=true
                         WARP_MODE="google"
+                        PSIPHON_ENABLED=false
+                        PSIPHON_MODE=""
                         echo "true" > "$WORKDIR/warp_enabled.txt"
                         echo "google" > "$WORKDIR/warp_mode.txt"
+                        echo "false" > "$WORKDIR/psiphon_enabled.txt"
+                        echo "" > "$WORKDIR/psiphon_mode.txt"
                         green "已启用 WARP (分流模式)"
                     else
                         red "WARP 配置失败"
@@ -8927,14 +9047,19 @@ configure_warp_outbound() {
         return 0
     fi
     
-    # 根据选择设置变量
+    # 模式切换逻辑 (0=直连, 1=WARP全, 2=WARP分流, 3=赛风全, 4=赛风分流)
+    local socks_port=0
     case "$new_choice" in
         1)
             if init_warp_config; then
                 WARP_ENABLED=true
                 WARP_MODE="all"
+                PSIPHON_ENABLED=false
+                PSIPHON_MODE=""
                 echo "true" > "$WORKDIR/warp_enabled.txt"
                 echo "all" > "$WORKDIR/warp_mode.txt"
+                echo "false" > "$WORKDIR/psiphon_enabled.txt"
+                echo "" > "$WORKDIR/psiphon_mode.txt"
                 green "已选择: 主节点全部流量通过 WARP 出站"
             else
                 red "WARP 配置获取失败"
@@ -8945,19 +9070,73 @@ configure_warp_outbound() {
             if init_warp_config; then
                 WARP_ENABLED=true
                 WARP_MODE="google"
+                PSIPHON_ENABLED=false
+                PSIPHON_MODE=""
                 echo "true" > "$WORKDIR/warp_enabled.txt"
                 echo "google" > "$WORKDIR/warp_mode.txt"
+                echo "false" > "$WORKDIR/psiphon_enabled.txt"
+                echo "" > "$WORKDIR/psiphon_mode.txt"
                 green "已选择: 主节点 Google/YouTube/Netflix/OpenAI 通过 WARP 出站"
             else
                 red "WARP 配置获取失败"
                 return 1
             fi
             ;;
+        3)
+            yellow "正在启动并就绪 Psiphon 赛风主服务..."
+            start_psiphon_userland || { red "Psiphon 启动失败"; return 1; }
+            if ! psiphon_wait_ready 30; then
+                red "等待 Psiphon 就绪超时"
+                return 1
+            fi
+            socks_port=$(get_psiphon_socks_port)
+            if [[ "$socks_port" == "0" || -z "$socks_port" ]]; then
+                red "无法获取 Psiphon 实际端口"
+                return 1
+            fi
+            PSIPHON_ENABLED=true
+            PSIPHON_MODE="all"
+            WARP_ENABLED=false
+            WARP_MODE=""
+            echo "true" > "$WORKDIR/psiphon_enabled.txt"
+            echo "all" > "$WORKDIR/psiphon_mode.txt"
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+            echo "" > "$WORKDIR/warp_mode.txt"
+            local cur_reg=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null || echo "AUTO")
+            green "已选择: 主节点全部流量通过 Psiphon 赛风出站 (出口: $cur_reg - $(get_country_name "$cur_reg"), SOCKS: $socks_port)"
+            ;;
+        4)
+            yellow "正在启动并就绪 Psiphon 赛风主服务..."
+            start_psiphon_userland || { red "Psiphon 启动失败"; return 1; }
+            if ! psiphon_wait_ready 30; then
+                red "等待 Psiphon 就绪超时"
+                return 1
+            fi
+            socks_port=$(get_psiphon_socks_port)
+            if [[ "$socks_port" == "0" || -z "$socks_port" ]]; then
+                red "无法获取 Psiphon 实际端口"
+                return 1
+            fi
+            PSIPHON_ENABLED=true
+            PSIPHON_MODE="google"
+            WARP_ENABLED=false
+            WARP_MODE=""
+            echo "true" > "$WORKDIR/psiphon_enabled.txt"
+            echo "google" > "$WORKDIR/psiphon_mode.txt"
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+            echo "" > "$WORKDIR/warp_mode.txt"
+            local cur_reg=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null || echo "AUTO")
+            green "已选择: 主节点 Google/YouTube/Netflix/OpenAI 通过 Psiphon 赛风出站 (出口: $cur_reg - $(get_country_name "$cur_reg"), SOCKS: $socks_port)"
+            ;;
         0)
             WARP_ENABLED=false
             WARP_MODE=""
+            PSIPHON_ENABLED=false
+            PSIPHON_MODE=""
             echo "false" > "$WORKDIR/warp_enabled.txt"
             echo "" > "$WORKDIR/warp_mode.txt"
+            echo "false" > "$WORKDIR/psiphon_enabled.txt"
+            echo "" > "$WORKDIR/psiphon_mode.txt"
             green "已选择: 主节点直连出站 (Direct)"
             ;;
         *)
@@ -8970,7 +9149,7 @@ configure_warp_outbound() {
     yellow "正在修改配置文件 (严格保持副节点配置与路由隔离)..."
     
     # 备份原配置
-    cp config.json config.json.bak.$(date +%Y%m%d%H%M%S)
+    cp config.json config.json.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null
     green "已备份原配置"
     
     # 获取 WARP 配置
@@ -8980,6 +9159,12 @@ configure_warp_outbound() {
     local warp_ipv6="${WARP_IPV6:-2606:4700:110:8d8d:1845:c39f:2dd5:a03a}"
     local warp_private_key="${WARP_PRIVATE_KEY:-52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=}"
     local warp_reserved="${WARP_RESERVED:-[215, 69, 233]}"
+    
+    # 获取 Psiphon SOCKS 端口 (若未通过分支设置)
+    if [[ "$PSIPHON_ENABLED" == "true" && ( "$socks_port" == "0" || -z "$socks_port" ) ]]; then
+        socks_port=$(get_psiphon_socks_port)
+        socks_port=${socks_port:-1080}
+    fi
     
     local loopback_port
     loopback_port=$(get_free_loopback_port)
@@ -8998,6 +9183,10 @@ warp_private_key = "$warp_private_key"
 warp_reserved_str = "$warp_reserved"
 loopback_port = int("$loopback_port")
 
+psiphon_enabled = "$PSIPHON_ENABLED"
+psiphon_mode = "$PSIPHON_MODE"
+socks_port = int("${socks_port:-0}")
+
 try:
     with open(cfg_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -9012,19 +9201,23 @@ inbounds = data.setdefault("inbounds", [])
 
 warp_tag = "warp-out"
 inbound_tag = "socks-loopback"
+psiphon_tag = "psiphon-out"
 
-# 1. 严格保护副节点规则：仅移除旧的主节点 WARP 相关规则 (loopback 规则和 WARP 分流域名规则)
-def is_warp_or_loopback_rule(r):
+# 1. 严格保护副节点规则：仅移除旧的主节点 WARP 和主节点 Psiphon 规则 (loopback 规则和分流域名规则)
+def is_main_outbound_rule(r):
     if r.get("inbound") and inbound_tag in r["inbound"]:
         return True
-    if r.get("outbound") == warp_tag and ("domain_suffix" in r or "rule_set" in r):
+    if r.get("outbound") in (warp_tag, psiphon_tag) and ("domain_suffix" in r or "rule_set" in r):
         return True
     return False
 
-rules[:] = [r for r in rules if not is_warp_or_loopback_rule(r)]
+rules[:] = [r for r in rules if not is_main_outbound_rule(r)]
 
-# 2. 如果启用 WARP，则追加并更新 warp outbound 以及 socks-loopback inbound
+# 2. 根据启用模式更新 outbounds 与 route
 if warp_enabled == "true":
+    # 移除主节点旧的 psiphon-out
+    outbounds[:] = [o for o in outbounds if o.get("tag") != psiphon_tag]
+
     try:
         warp_reserved = json.loads(warp_reserved_str)
     except Exception:
@@ -9088,18 +9281,18 @@ if warp_enabled == "true":
             "listen_port": loopback_port
         })
 
-    # 插入 loopback 专用路由规则
-    rules.insert(0, {
-        "inbound": [inbound_tag],
-        "outbound": warp_tag
-    })
-
     if warp_mode == "all":
         route["final"] = warp_tag
+        rules.insert(0, {
+            "inbound": [inbound_tag],
+            "outbound": warp_tag
+        })
     elif warp_mode == "google":
         route["final"] = "direct"
-        
-        # 仅针对 Google/YouTube/OpenAI/Netflix 分流走 WARP
+        rules.insert(0, {
+            "inbound": [inbound_tag],
+            "outbound": "direct"
+        })
         rules.append({
             "domain_suffix": [
                 "google.com", "google.co.jp", "google.com.hk",
@@ -9110,10 +9303,87 @@ if warp_enabled == "true":
             ],
             "outbound": warp_tag
         })
-else:
-    # 移除 warp-out outbound 和 socks-loopback inbound
+
+elif psiphon_enabled == "true":
+    # 移除主节点旧的 warp-out
     outbounds[:] = [o for o in outbounds if o.get("tag") != warp_tag]
+    if "endpoints" in data:
+        del data["endpoints"]
+
+    psi_found = False
+    for o in outbounds:
+        if o.get("tag") == psiphon_tag:
+            o.clear()
+            o.update({
+                "type": "socks",
+                "tag": psiphon_tag,
+                "server": "127.0.0.1",
+                "server_port": socks_port,
+                "version": "5",
+                "network": "tcp"
+            })
+            psi_found = True
+            break
+    if not psi_found:
+        outbounds.append({
+            "type": "socks",
+            "tag": psiphon_tag,
+            "server": "127.0.0.1",
+            "server_port": socks_port,
+            "version": "5",
+            "network": "tcp"
+        })
+
+    # 确保 socks-loopback 入站存在
+    inbound_found = False
+    for ib in inbounds:
+        if ib.get("tag") == inbound_tag:
+            ib.clear()
+            ib.update({
+                "tag": inbound_tag,
+                "type": "socks",
+                "listen": "127.0.0.1",
+                "listen_port": loopback_port
+            })
+            inbound_found = True
+            break
+    if not inbound_found:
+        inbounds.append({
+            "tag": inbound_tag,
+            "type": "socks",
+            "listen": "127.0.0.1",
+            "listen_port": loopback_port
+        })
+
+    if psiphon_mode == "all":
+        route["final"] = psiphon_tag
+        rules.insert(0, {
+            "inbound": [inbound_tag],
+            "outbound": psiphon_tag
+        })
+    elif psiphon_mode == "google":
+        route["final"] = "direct"
+        rules.insert(0, {
+            "inbound": [inbound_tag],
+            "outbound": "direct"
+        })
+        rules.append({
+            "domain_suffix": [
+                "google.com", "google.co.jp", "google.com.hk",
+                "googleapis.com", "gstatic.com", "ggpht.com",
+                "youtube.com", "ytimg.com", "youtu.be",
+                "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+                "netflix.com", "nflxvideo.net", "nflxso.net"
+            ],
+            "outbound": psiphon_tag
+        })
+
+else:
+    # 移除 warp-out、psiphon-out 以及 socks-loopback
+    outbounds[:] = [o for o in outbounds if o.get("tag") not in (warp_tag, psiphon_tag)]
     inbounds[:] = [ib for ib in inbounds if ib.get("tag") != inbound_tag]
+    if "endpoints" in data:
+        del data["endpoints"]
     
     def first_tag_by_type(t, fallback):
         for o in outbounds:
@@ -9123,8 +9393,8 @@ else:
     route["final"] = first_tag_by_type("direct", "direct")
 
 # 3. 规范化 rules 顺序：副节点(自定义代理 / 赛风)规则置顶，确保精准匹配互不干扰
-proxy_rules = [r for r in rules if r.get("outbound", "").endswith("-out") and r.get("outbound") != warp_tag]
-psi_rules = [r for r in rules if r.get("outbound", "").startswith("psiphon-")]
+proxy_rules = [r for r in rules if r.get("outbound", "").endswith("-out") and r.get("outbound") not in (warp_tag, psiphon_tag)]
+psi_rules = [r for r in rules if r.get("outbound", "").startswith("psiphon-") and r.get("outbound") != psiphon_tag]
 other_rules = [r for r in rules if r not in proxy_rules and r not in psi_rules]
 rules[:] = proxy_rules + psi_rules + other_rules
 
@@ -9176,7 +9446,15 @@ PY
         if pgrep -x "$SB_BINARY" > /dev/null; then
             green "服务重启成功！"
             
-            if [[ "$WARP_ENABLED" == "true" ]]; then
+            if [[ "$PSIPHON_ENABLED" == "true" ]]; then
+                if [[ "$PSIPHON_MODE" == "all" ]]; then
+                    blue "✓ 主节点 Psiphon 赛风出站已启用 (全部主节点流量走赛风)"
+                else
+                    blue "✓ 主节点 Psiphon 赛风出站已启用 (Google/YouTube/Netflix/OpenAI)"
+                fi
+                sleep 2
+                warp_egress_test || true
+            elif [[ "$WARP_ENABLED" == "true" ]]; then
                 if [[ "$WARP_MODE" == "all" ]]; then
                     blue "✓ 主节点 WARP 出站已启用 (全部主节点流量走 WARP)"
                 else
@@ -11834,7 +12112,17 @@ menu() {
         
         local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
         local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
-        if [[ "$warp_status" == "true" ]]; then
+        local psi_status=$(cat "$WORKDIR/psiphon_enabled.txt" 2>/dev/null)
+        local psi_mode=$(cat "$WORKDIR/psiphon_mode.txt" 2>/dev/null)
+        local psi_reg=$(cat "$WORKDIR/psiphon_region.txt" 2>/dev/null || echo "AUTO")
+        psi_reg="${psi_reg:-AUTO}"
+        if [[ "$psi_status" == "true" ]]; then
+            if [[ "$psi_mode" == "google" ]]; then
+                echo -e "  主节点出站模式: ${blue}Psiphon 赛风分流 (${psi_reg})${re}"
+            else
+                echo -e "  主节点出站模式: ${blue}Psiphon 赛风全局 (${psi_reg})${re}"
+            fi
+        elif [[ "$warp_status" == "true" ]]; then
             if [[ "$warp_mode" == "all" ]]; then
                 echo -e "  主节点出站模式: ${blue}WARP 全局出站${re}"
             else
