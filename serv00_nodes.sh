@@ -11626,15 +11626,18 @@ add_openvpn_egress_group() {
                     echo "proto=$proto"
                     echo "cipher=${cipher:-AES-128-CBC}"
                     echo "auth=${auth:-SHA1}"
-                    echo "---CA---"
+                    echo "###START_CA###"
                     echo "$ca_block"
+                    echo "###END_CA###"
                     if [[ -n "$cert_block" ]]; then
-                        echo "---CERT---"
+                        echo "###START_CERT###"
                         echo "$cert_block"
+                        echo "###END_CERT###"
                     fi
                     if [[ -n "$key_block" ]]; then
-                        echo "---KEY---"
+                        echo "###START_KEY###"
                         echo "$key_block"
+                        echo "###END_KEY###"
                     fi
                 } > "$node_file"
             done <<< "$raw_csv"
@@ -11720,10 +11723,19 @@ add_openvpn_egress_group() {
                     echo "proto=${proto:-tcp}"
                     echo "cipher=${cipher:-AES-128-CBC}"
                     echo "auth=${auth:-SHA1}"
-                    echo "---CA---"
+                    echo "###START_CA###"
                     echo "$ca_block"
-                    [[ -n "$cert_block" ]] && { echo "---CERT---"; echo "$cert_block"; }
-                    [[ -n "$key_block" ]] && { echo "---KEY---"; echo "$key_block"; }
+                    echo "###END_CA###"
+                    if [[ -n "$cert_block" ]]; then
+                        echo "###START_CERT###"
+                        echo "$cert_block"
+                        echo "###END_CERT###"
+                    fi
+                    if [[ -n "$key_block" ]]; then
+                        echo "###START_KEY###"
+                        echo "$key_block"
+                        echo "###END_KEY###"
+                    fi
                 } > "$vg_tmp_dir/$manual_cc/node_${mcount}.txt"
             done
             available_ccs+=("$manual_cc")
@@ -11765,8 +11777,9 @@ add_openvpn_egress_group() {
                     echo "proto=${proto:-tcp}"
                     echo "cipher=AES-128-CBC"
                     echo "auth=SHA1"
-                    echo "---CA---"
+                    echo "###START_CA###"
                     echo "$ca_block"
+                    echo "###END_CA###"
                 } > "$vg_tmp_dir/$manual_cc/node_1.txt"
                 available_ccs+=("$manual_cc")
                 selected_country_input="1"
@@ -11834,6 +11847,96 @@ add_openvpn_egress_group() {
         [[ -n "$t_p" ]] && used_tuic_ports+=("$t_p")
     done
 
+    # 辅助: 复用已有端口或 devil 申请新端口 (serv00/hostuno 模式)
+    alloc_or_port() {
+        local ptype="$1"   # hy2|tuic|vless
+        local -a used_ports=("${@:2}")
+        local chosen=""
+        local -a gbinds=()
+        while IFS='|' read -r gbp gbpr gbip gbown; do
+            [[ -n "$gbp" ]] && gbinds+=("$gbp|$gbpr|$gbip|$gbown")
+        done < <(collect_global_udp_binds 2>/dev/null || true)
+        ip_in_use() {
+            local p="$1" pr="$2" ip="$3" b
+            for b in "${gbinds[@]}"; do
+                IFS='|' read -r bp bpr bip bown <<< "$b"
+                [[ "$bp" == "$p" && "$bpr" == "$pr" && "$bip" == "$ip" ]] && return 0
+            done
+            return 1
+        }
+        if [[ ${#used_ports[@]} -gt 0 ]]; then
+            echo >&2
+            yellow >&2 "已有 ${ptype^^} 端口 (括号内为可用IP数):"
+            echo >&2 "  1. 复用已有端口"
+            echo >&2 "  2. 申请新端口"
+            reading >&2 "  请选择 [1-2, 默认1]: " p_choice
+            [[ -z "$p_choice" ]] && p_choice="1"
+            if [[ "$p_choice" == "1" ]]; then
+                local -a unique_ports=()
+                local up_tmp seen_tmp
+                for up_tmp in "${used_ports[@]}"; do
+                    seen_tmp=false
+                    for uu_tmp in "${unique_ports[@]}"; do [[ "$uu_tmp" == "$up_tmp" ]] && seen_tmp=true; done
+                    [[ "$seen_tmp" == "false" ]] && unique_ports+=("$up_tmp")
+                done
+                for i in "${!unique_ports[@]}"; do
+                    local up="${unique_ports[$i]}"
+                    local occ=()
+                    local oip
+                    for oip in "${ALL_IPS[@]}"; do
+                        [[ -n "$oip" ]] && ip_in_use "$up" "$ptype" "$oip" && occ+=("$oip")
+                    done
+                    if [[ ${#occ[@]} -eq 0 ]]; then
+                        green >&2 "  $((i+1)). $up  [全部 ${#ALL_IPS[@]} 个IP可用]"
+                    elif [[ ${#occ[@]} -ge ${#ALL_IPS[@]} ]]; then
+                        red >&2 "  $((i+1)). $up  [!! 所有IP已被占用: ${occ[*]}]"
+                    else
+                        yellow >&2 "  $((i+1)). $up  [可用 $(( ${#ALL_IPS[@]} - ${#occ[@]} ))/${#ALL_IPS[@]} 个IP, 已占用: ${occ[*]}]"
+                    fi
+                done
+                reading >&2 "  请选择端口序号 [1-${#unique_ports[@]}]: " p_idx
+                p_idx=$((p_idx-1))
+                if [[ $p_idx -ge 0 && $p_idx -lt ${#unique_ports[@]} ]]; then
+                    chosen="${unique_ports[$p_idx]}"
+                    green >&2 "  -> 复用 ${ptype^^} 端口: $chosen"
+                    local free_ips=() occ_ips=()
+                    local oip2
+                    for oip2 in "${ALL_IPS[@]}"; do
+                        [[ -n "$oip2" ]] || continue
+                        if ip_in_use "$chosen" "$ptype" "$oip2"; then occ_ips+=("$oip2"); else free_ips+=("$oip2"); fi
+                    done
+                    yellow >&2 "    可用IP: ${free_ips[*]:-无}"
+                    [[ ${#occ_ips[@]} -gt 0 ]] && red >&2 "    已被占用(将自动跳过): ${occ_ips[*]}"
+                else
+                    red >&2 "  [!] 无效选择, 将申请新端口"
+                fi
+            fi
+        fi
+        if [[ -z "$chosen" ]]; then
+            yellow >&2 "[*] 申请新的 ${ptype^^} 端口..."
+            local pmin="${PORT_MIN:-10000}"
+            local pmax="${PORT_MAX:-65535}"
+            [[ "$PLATFORM" == "hostuno" ]] && { pmin=63001; pmax=65535; }
+            local retry=0
+            while [[ $retry -lt 30 && -z "$chosen" ]]; do
+                local cand=$(shuf -i ${pmin}-${pmax} -n 1)
+                local pproto="tcp"
+                [[ "$ptype" == "hy2" || "$ptype" == "tuic" ]] && pproto="udp"
+                if check_port_available_all_ips "$cand" "$pproto"; then
+                    local alloc_result
+                    alloc_result=$(devil port add "$pproto" "$cand" "singbox-ovpn-${ptype}" 2>&1)
+                    if [[ "$alloc_result" == *"succesfully"* || "$alloc_result" == *"Ok"* ]]; then
+                        chosen="$cand"
+                        green >&2 "    已成功申请 ${ptype^^} ${pproto^^} 端口: $chosen"
+                    fi
+                fi
+                ((retry++))
+            done
+            [[ -z "$chosen" ]] && red >&2 "[!] ${ptype^^} 端口申请失败"
+        fi
+        echo "$chosen"
+    }
+
     local created_count=0
     local -a current_created_tags=()
 
@@ -11873,7 +11976,7 @@ add_openvpn_egress_group() {
         # 配置入站 IP (逐 IP 手动选择或自动跳过)
         local -a ip_protos=()
         local -a gbinds=()
-        mapfile -t gbinds < <(collect_global_udp_binds)
+        mapfile -t gbinds < <(collect_global_udp_binds 2>/dev/null || true)
         local bound_any=false
 
         echo
@@ -11949,9 +12052,14 @@ add_openvpn_egress_group() {
             local s_cipher=$(grep '^cipher=' "$nfile" | cut -d'=' -f2-)
             local s_auth=$(grep '^auth=' "$nfile" | cut -d'=' -f2-)
 
-            local s_ca=$(sed -n '/^---CA---$/,/^---[A-Z]/p' "$nfile" | grep -v '^---' | sed 's/^/      /')
-            local s_cert=$(sed -n '/^---CERT---$/,/^---[A-Z]/p' "$nfile" | grep -v '^---' | sed 's/^/      /')
-            local s_key=$(sed -n '/^---KEY---$/,/^---[A-Z]/p' "$nfile" | grep -v '^---' | sed 's/^/      /')
+            local s_ca=$(sed -n '/###START_CA###/,/###END_CA###/p' "$nfile" | grep -v '^###' | sed 's/^/      /')
+            local s_cert="" s_key=""
+            if grep -q '###START_CERT###' "$nfile"; then
+                s_cert=$(sed -n '/###START_CERT###/,/###END_CERT###/p' "$nfile" | grep -v '^###' | sed 's/^/      /')
+            fi
+            if grep -q '###START_KEY###' "$nfile"; then
+                s_key=$(sed -n '/###START_KEY###/,/###END_KEY###/p' "$nfile" | grep -v '^###' | sed 's/^/      /')
+            fi
 
             {
                 echo "  - name: \"${s_pname}\""
@@ -12101,8 +12209,6 @@ openvpn_health_check() {
         fi
     done
 }
-
-
 
 # ==== 修改代理出站后端 (保持入站配置不变) ====
 edit_proxy_egress_backend() {
