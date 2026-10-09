@@ -7407,6 +7407,8 @@ stop_all() {
     [ -n "$SB_BINARY" ] && pkill -9 -f "$WORKDIR/$SB_BINARY" >/dev/null 2>&1 || true
     [ -n "$CF_BINARY" ] && pkill -9 -f "$WORKDIR/$CF_BINARY" >/dev/null 2>&1 || true
     [ -n "$NZ_BINARY" ] && pkill -9 -f "$WORKDIR/$NZ_BINARY" >/dev/null 2>&1 || true
+    pkill -9 -f "mihomo -d" >/dev/null 2>&1 || true
+    pkill -9 -x "mihomo" >/dev/null 2>&1 || true
     
     # 清理历史垃圾与大日志截断
     cleanup_garbage_and_logs
@@ -8513,6 +8515,20 @@ restart_processes() {
     # 3. 同步副节点 - 自定义代理分组配置到 sing-box
     yellow "[3/5] 同步副节点: 自定义代理出站多出口配置..."
     sync_all_proxy_groups
+
+    # 3.1 确保所有 OpenVPN 用户态节点池的 Mihomo 进程存活
+    for og in $(get_all_proxy_groups); do
+        if [[ -f "${PROXY_GROUPS_DIR}/${og}/is_openvpn.txt" ]]; then
+            local m_dir="$WORKDIR/mihomo_${og}"
+            local m_pid=$(cat "$m_dir/mihomo.pid" 2>/dev/null)
+            if [[ -z "$m_pid" ]] || ! kill -0 "$m_pid" 2>/dev/null; then
+                ensure_mihomo_installed 2>/dev/null || true
+                local mh_bin="$WORKDIR/mihomo"
+                [[ ! -x "$mh_bin" ]] && mh_bin="$HOME/bin/mihomo"
+                [[ -x "$mh_bin" && -d "$m_dir" ]] && run_detached "$m_dir/mihomo.pid" "$m_dir/mihomo.log" "$mh_bin" -d "$m_dir"
+            fi
+        fi
+    done
     
     # 4. 启动 sing-box 主服务
     yellow "[4/5] 启动 sing-box 核心服务..."
@@ -10264,6 +10280,13 @@ remove_proxy_egress_group() {
     local out_tag="${group_tag}-out"
     yellow "[*] 正在删除代理节点组: $remark ($group_tag)"
 
+    if [[ -f "$group_dir/is_openvpn.txt" ]]; then
+        local m_pid=$(cat "$WORKDIR/mihomo_${group_tag}/mihomo.pid" 2>/dev/null)
+        [[ -n "$m_pid" ]] && kill -9 "$m_pid" 2>/dev/null || true
+        pkill -9 -f "mihomo -d .*mihomo_${group_tag}" 2>/dev/null || true
+        rm -rf "$WORKDIR/mihomo_${group_tag}" 2>/dev/null
+    fi
+
     # 释放端口（检测是否有其它组在使用）
     local hy2_port=$(cat  "$group_dir/hy2_port.txt"  2>/dev/null)
     local tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null)
@@ -11447,6 +11470,640 @@ freepool_health_check() {
 }
 
 
+# ==================== OpenVPN 用户态 (Mihomo) 出站模块 (FreeBSD/serv00/hostuno 适配版) ====================
+
+ensure_mihomo_installed() {
+    local mh_bin="$WORKDIR/mihomo"
+    if [[ -x "$mh_bin" ]] && "$mh_bin" -v >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ -x "$HOME/bin/mihomo" ]] && "$HOME/bin/mihomo" -v >/dev/null 2>&1; then
+        mkdir -p "$WORKDIR"
+        cp -f "$HOME/bin/mihomo" "$mh_bin" 2>/dev/null || true
+        [[ -x "$mh_bin" ]] && return 0
+    fi
+
+    yellow "[*] 正在安装 Mihomo 纯用户态运行时 (FreeBSD amd64)..."
+    local dl_url="https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-freebsd-amd64-compatible-v1.19.32.gz"
+    local tmp_gz="/tmp/mihomo_$$.gz"
+    curl -fsSL --max-time 30 "$dl_url" -o "$tmp_gz" 2>/dev/null || \
+    fetch -q -o "$tmp_gz" "$dl_url" 2>/dev/null
+    if [[ ! -s "$tmp_gz" ]]; then
+        red "[!] 下载 Mihomo 运行时失败，请检查网络"
+        rm -f "$tmp_gz"
+        return 1
+    fi
+    gzip -d -f "$tmp_gz"
+    local unzipped="${tmp_gz%.gz}"
+    chmod +x "$unzipped"
+    mkdir -p "$WORKDIR" "$HOME/bin"
+    mv -f "$unzipped" "$mh_bin"
+    cp -f "$mh_bin" "$HOME/bin/mihomo" 2>/dev/null || true
+    if [[ -x "$mh_bin" ]] && "$mh_bin" -v >/dev/null 2>&1; then
+        green "[✓] Mihomo 运行时安装就绪 ($mh_bin)"
+        return 0
+    else
+        red "[!] Mihomo 二进制校验失败"
+        return 1
+    fi
+}
+
+get_free_mihomo_port() {
+    local pmin="${PORT_MIN:-63001}"
+    local pmax="${PORT_MAX:-65535}"
+    if [ "$PLATFORM" = "hostuno" ]; then
+        pmin=63001; pmax=65535
+    fi
+    for ((i=0; i<80; i++)); do
+        local cand=$(shuf -i ${pmin}-${pmax} -n 1)
+        if ! check_port_in_use "$cand" >/dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo "63456"
+}
+
+add_openvpn_egress_group() {
+    init_proxy_groups_dir
+
+    if [[ ${#ALL_IPS[@]} -eq 0 ]]; then
+        [[ -f "$WORKDIR/all_ips.txt" ]] && mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt" \
+                                        || get_all_ips > /dev/null 2>&1
+    fi
+
+    echo
+    green "============================================================="
+    green "  添加 OpenVPN 出站节点池 (Mihomo 用户态免 TUN 运行)"
+    green "============================================================="
+    yellow "  特性: 纯用户态运行，无需 tun 虚拟网卡，完全不影响系统网络与配额"
+    yellow "        纯 Bash 脚本驱动，零 Python 依赖，完美契合 hostuno/serv00"
+    yellow "        支持指定/自动归类国家（JP/KR/US等），每国独立组池自动故障转移"
+    yellow "        底层由 Mihomo 托管多节点 fallback，上游由 Sing-box 提供多协议入站"
+    green "============================================================="
+    echo
+
+    if ! ensure_mihomo_installed; then
+        red "[!] Mihomo 运行时就绪失败，无法部署 OpenVPN 用户态节点池"
+        reading "按回车继续..." _
+        return 1
+    fi
+
+    echo "请选择 OpenVPN 节点来源:"
+    echo "  1. 一键自动抓取 VPN Gate 免费家宽节点 (自动识别并指定/选择国家)"
+    echo "  2. 导入本地 .ovpn 配置文件或目录 (支持单文件或多节点目录)"
+    echo "  3. 手动粘贴 .ovpn 配置文本或 Base64"
+    reading "请选择 [1-3, 默认1]: " src_choice
+    src_choice="${src_choice:-1}"
+
+    local vg_tmp_dir="/tmp/vg_ovpn_$$"
+    mkdir -p "$vg_tmp_dir"
+    trap 'rm -rf "$vg_tmp_dir"' RETURN
+
+    local -a available_ccs=()
+
+    case "$src_choice" in
+        1)
+            yellow "[*] 正在从 VPN Gate 抓取最新真实家宽节点清单并自动归类国家 (纯 Bash 处理)..."
+            local raw_csv
+            raw_csv=$(curl -fsSL --max-time 15 "http://www.vpngate.net/api/iphone/" 2>/dev/null)
+            [[ -z "$raw_csv" ]] && raw_csv=$(curl -fsSL --max-time 15 "https://www.vpngate.net/api/iphone/" 2>/dev/null)
+            if [[ -z "$raw_csv" ]]; then
+                red "[!] 无法连接到 VPN Gate API 服务器，请检查网络"
+                reading "按回车继续..." _
+                return 1
+            fi
+
+            local count=0
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ "$line" =~ ^[#\*] ]] && continue
+                [[ -z "$line" ]] && continue
+                line=$(echo "$line" | tr -d '\r')
+
+                local b64="${line##*,}"
+                [[ -z "$b64" || "$b64" == "$line" ]] && continue
+
+                local cc
+                cc=$(echo "$line" | awk -F',' '{print $7}' | tr '[:lower:]' '[:upper:]')
+                [[ -z "$cc" || "$cc" == "HOST" ]] && continue
+
+                local ovpn_txt
+                ovpn_txt=$(echo "$b64" | base64 -d 2>/dev/null | tr -d '\r')
+                [[ -z "$ovpn_txt" ]] && continue
+
+                local proto
+                proto=$(echo "$ovpn_txt" | awk '/^proto[ \t]+/{print $2; exit}' | tr '[:upper:]' '[:lower:]')
+                [[ "$proto" != "tcp" ]] && continue
+
+                local remote_ip remote_port
+                remote_ip=$(echo "$ovpn_txt" | awk '/^remote[ \t]+/{print $2; exit}')
+                remote_port=$(echo "$ovpn_txt" | awk '/^remote[ \t]+/{print $3; exit}')
+                [[ -z "$remote_ip" || -z "$remote_port" ]] && continue
+
+                local ca_block
+                ca_block=$(echo "$ovpn_txt" | sed -n '/<ca>/,/<\/ca>/p' | sed '1d;$d')
+                [[ -z "$ca_block" ]] && continue
+
+                local cert_block="" key_block=""
+                if echo "$ovpn_txt" | grep -q "<cert>"; then
+                    cert_block=$(echo "$ovpn_txt" | sed -n '/<cert>/,/<\/cert>/p' | sed '1d;$d')
+                fi
+                if echo "$ovpn_txt" | grep -q "<key>"; then
+                    key_block=$(echo "$ovpn_txt" | sed -n '/<key>/,/<\/key>/p' | sed '1d;$d')
+                fi
+
+                local cipher
+                cipher=$(echo "$ovpn_txt" | awk '/^cipher[ \t]+/{print $2; exit}')
+                local auth
+                auth=$(echo "$ovpn_txt" | awk '/^auth[ \t]+/{print $2; exit}')
+
+                mkdir -p "$vg_tmp_dir/$cc"
+                ((count++))
+                local node_file="$vg_tmp_dir/$cc/node_${count}.txt"
+                {
+                    echo "server=$remote_ip"
+                    echo "port=$remote_port"
+                    echo "proto=$proto"
+                    echo "cipher=${cipher:-AES-128-CBC}"
+                    echo "auth=${auth:-SHA1}"
+                    echo "---CA---"
+                    echo "$ca_block"
+                    if [[ -n "$cert_block" ]]; then
+                        echo "---CERT---"
+                        echo "$cert_block"
+                    fi
+                    if [[ -n "$key_block" ]]; then
+                        echo "---KEY---"
+                        echo "$key_block"
+                    fi
+                } > "$node_file"
+            done <<< "$raw_csv"
+
+            for d in "$vg_tmp_dir"/*/; do
+                if [[ -d "$d" ]]; then
+                    local c_name=$(basename "$d")
+                    available_ccs+=("$c_name")
+                fi
+            done
+
+            if [[ ${#available_ccs[@]} -eq 0 ]]; then
+                red "[!] 抓取 VPN Gate 节点失败或未发现可用 TCP 节点"
+                reading "按回车继续..." _
+                return 1
+            fi
+
+            echo "------------------------------------------------------------"
+            cyan "  VPN Gate 当前可用家宽国家分类 (共 ${#available_ccs[@]} 个国家/地区):"
+            local cc_idx=1
+            for c in "${available_ccs[@]}"; do
+                local c_count=$(ls -1 "$vg_tmp_dir/$c" 2>/dev/null | wc -l)
+                local cn_name=$(get_country_name "$c")
+                echo "  [$cc_idx] [$c] $cn_name (共 $c_count 个家宽节点)"
+                ((cc_idx++))
+            done
+            echo "------------------------------------------------------------"
+            yellow "  支持: 单个序号 (如 1) | 国家代码 (如 JP 或 KR) | 多个 (如 1,2) | 范围 (如 1-3) | 全部 (a)"
+            reading "  请指定要添加的国家: " selected_country_input
+            selected_country_input=$(echo "$selected_country_input" | tr '[:lower:]' '[:upper:]' | xargs)
+            [[ -z "$selected_country_input" ]] && selected_country_input="1"
+            ;;
+
+        2)
+            reading "请输入本地 .ovpn 配置文件或目录的完整路径: " local_ovpn_path
+            if [[ ! -e "$local_ovpn_path" ]]; then
+                red "[!] 路径不存在: $local_ovpn_path"
+                reading "按回车继续..." _
+                return 1
+            fi
+            reading "请输入该配置对应的国家代码 (大写2字母，如 JP/KR/US，默认 CUSTOM): " manual_cc
+            manual_cc=$(echo "${manual_cc:-CUSTOM}" | tr '[:lower:]' '[:upper:]' | xargs)
+            mkdir -p "$vg_tmp_dir/$manual_cc"
+
+            local -a ovpn_files=()
+            if [[ -d "$local_ovpn_path" ]]; then
+                while IFS= read -r f; do ovpn_files+=("$f"); done < <(find "$local_ovpn_path" -type f -name "*.ovpn")
+            else
+                ovpn_files+=("$local_ovpn_path")
+            fi
+
+            local mcount=0
+            for of in "${ovpn_files[@]}"; do
+                local ovpn_txt
+                ovpn_txt=$(tr -d '\r' < "$of")
+                local proto
+                proto=$(echo "$ovpn_txt" | awk '/^proto[ \t]+/{print $2; exit}' | tr '[:upper:]' '[:lower:]')
+                local remote_ip remote_port
+                remote_ip=$(echo "$ovpn_txt" | awk '/^remote[ \t]+/{print $2; exit}')
+                remote_port=$(echo "$ovpn_txt" | awk '/^remote[ \t]+/{print $3; exit}')
+                [[ -z "$remote_ip" || -z "$remote_port" ]] && continue
+
+                local ca_block
+                ca_block=$(echo "$ovpn_txt" | sed -n '/<ca>/,/<\/ca>/p' | sed '1d;$d')
+                [[ -z "$ca_block" ]] && continue
+                local cert_block="" key_block=""
+                if echo "$ovpn_txt" | grep -q "<cert>"; then
+                    cert_block=$(echo "$ovpn_txt" | sed -n '/<cert>/,/<\/cert>/p' | sed '1d;$d')
+                fi
+                if echo "$ovpn_txt" | grep -q "<key>"; then
+                    key_block=$(echo "$ovpn_txt" | sed -n '/<key>/,/<\/key>/p' | sed '1d;$d')
+                fi
+
+                local cipher
+                cipher=$(echo "$ovpn_txt" | awk '/^cipher[ \t]+/{print $2; exit}')
+                local auth
+                auth=$(echo "$ovpn_txt" | awk '/^auth[ \t]+/{print $2; exit}')
+
+                ((mcount++))
+                {
+                    echo "server=$remote_ip"
+                    echo "port=$remote_port"
+                    echo "proto=${proto:-tcp}"
+                    echo "cipher=${cipher:-AES-128-CBC}"
+                    echo "auth=${auth:-SHA1}"
+                    echo "---CA---"
+                    echo "$ca_block"
+                    [[ -n "$cert_block" ]] && { echo "---CERT---"; echo "$cert_block"; }
+                    [[ -n "$key_block" ]] && { echo "---KEY---"; echo "$key_block"; }
+                } > "$vg_tmp_dir/$manual_cc/node_${mcount}.txt"
+            done
+            available_ccs+=("$manual_cc")
+            selected_country_input="1"
+            ;;
+
+        3)
+            echo "请粘贴 .ovpn 配置文本或 Base64 (输入完毕后按 Ctrl+D 结束):"
+            local raw_input
+            raw_input=$(cat)
+            if [[ -z "$raw_input" ]]; then
+                red "[!] 输入为空"
+                reading "按回车继续..." _
+                return 1
+            fi
+            reading "请输入国家代码 (如 JP/KR/US，默认 CUSTOM): " manual_cc
+            manual_cc=$(echo "${manual_cc:-CUSTOM}" | tr '[:lower:]' '[:upper:]' | xargs)
+            mkdir -p "$vg_tmp_dir/$manual_cc"
+
+            local ovpn_txt="$raw_input"
+            if ! echo "$ovpn_txt" | grep -q "remote "; then
+                ovpn_txt=$(echo "$raw_input" | base64 -d 2>/dev/null | tr -d '\r')
+            else
+                ovpn_txt=$(echo "$raw_input" | tr -d '\r')
+            fi
+
+            local proto
+            proto=$(echo "$ovpn_txt" | awk '/^proto[ \t]+/{print $2; exit}' | tr '[:upper:]' '[:lower:]')
+            local remote_ip remote_port
+            remote_ip=$(echo "$ovpn_txt" | awk '/^remote[ \t]+/{print $2; exit}')
+            remote_port=$(echo "$ovpn_txt" | awk '/^remote[ \t]+/{print $3; exit}')
+            local ca_block
+            ca_block=$(echo "$ovpn_txt" | sed -n '/<ca>/,/<\/ca>/p' | sed '1d;$d')
+
+            if [[ -n "$remote_ip" && -n "$remote_port" && -n "$ca_block" ]]; then
+                {
+                    echo "server=$remote_ip"
+                    echo "port=$remote_port"
+                    echo "proto=${proto:-tcp}"
+                    echo "cipher=AES-128-CBC"
+                    echo "auth=SHA1"
+                    echo "---CA---"
+                    echo "$ca_block"
+                } > "$vg_tmp_dir/$manual_cc/node_1.txt"
+                available_ccs+=("$manual_cc")
+                selected_country_input="1"
+            else
+                red "[!] 未能解析出有效的 remote 或 <ca> 证书"
+                reading "按回车继续..." _
+                return 1
+            fi
+            ;;
+    esac
+
+    # 解析用户指定的国家列表
+    local -a final_ccs=()
+    if [[ "$selected_country_input" == "A" || "$selected_country_input" == "ALL" ]]; then
+        final_ccs=("${available_ccs[@]}")
+    elif [[ "$selected_country_input" =~ ^[0-9]+-[0-9]+$ ]]; then
+        local start_idx="${selected_country_input%-*}"
+        local end_idx="${selected_country_input#*-}"
+        for ((idx=start_idx; idx<=end_idx; idx++)); do
+            local array_idx=$((idx - 1))
+            if [[ $array_idx -ge 0 && $array_idx -lt ${#available_ccs[@]} ]]; then
+                final_ccs+=("${available_ccs[$array_idx]}")
+            fi
+        done
+    else
+        IFS=',' read -ra items <<< "$selected_country_input"
+        for item in "${items[@]}"; do
+            item=$(echo "$item" | xargs)
+            if [[ "$item" =~ ^[0-9]+$ ]]; then
+                local array_idx=$((item - 1))
+                if [[ $array_idx -ge 0 && $array_idx -lt ${#available_ccs[@]} ]]; then
+                    final_ccs+=("${available_ccs[$array_idx]}")
+                fi
+            elif [[ "$item" =~ ^[A-Z]{2,6}$ ]]; then
+                for c in "${available_ccs[@]}"; do
+                    if [[ "$c" == "$item" ]]; then
+                        final_ccs+=("$c")
+                        break
+                    fi
+                done
+            fi
+        done
+    fi
+
+    if [[ ${#final_ccs[@]} -eq 0 ]]; then
+        red "[!] 没有选中任何有效的国家"
+        reading "按回车继续..." _
+        return 1
+    fi
+
+    echo
+    echo "请为所选 OpenVPN 国家节点组选择本地入站协议 (用于客户端连接此国家出站):"
+    echo "  1. Hysteria2 入站"
+    echo "  2. TUIC v5 入站"
+    echo "  3. 同时开启 Hy2 与 TUIC"
+    reading "请选择 [1-3, 默认3]: " oproto
+    oproto="${oproto:-3}"
+
+    # 预加载已有端口列表 (用于端口复用与 devil 申请)
+    local -a used_hy2_ports=() used_tuic_ports=()
+    for g in $(get_all_proxy_groups); do
+        local h_p=$(cat "${PROXY_GROUPS_DIR}/${g}/hy2_port.txt" 2>/dev/null)
+        local t_p=$(cat "${PROXY_GROUPS_DIR}/${g}/tuic_port.txt" 2>/dev/null)
+        [[ -n "$h_p" ]] && used_hy2_ports+=("$h_p")
+        [[ -n "$t_p" ]] && used_tuic_ports+=("$t_p")
+    done
+
+    local created_count=0
+    local -a current_created_tags=()
+
+    for each_cc in "${final_ccs[@]}"; do
+        local cn_name=$(get_country_name "$each_cc")
+        local group_remark="OpenVPN-${each_cc}-${cn_name}"
+
+        echo
+        green "============================================================="
+        green " [*] 正在部署国家出站组: [$each_cc] $cn_name ..."
+        green "============================================================="
+
+        local -a node_files=()
+        while IFS= read -r nf; do
+            node_files+=("$nf")
+        done < <(ls -1 "$vg_tmp_dir/$each_cc"/*.txt 2>/dev/null)
+
+        if [[ ${#node_files[@]} -eq 0 ]]; then
+            red "[!] 国家 [$each_cc] 无可用节点文件，跳过"
+            continue
+        fi
+
+        # 按选择分配端口 (复用已有端口或 devil 申请新端口)
+        local hy2_port_p="0" tuic_port_p="0"
+        case "$oproto" in
+            1) hy2_port_p=$(alloc_or_port "hy2" "${used_hy2_ports[@]}") ;;
+            2) tuic_port_p=$(alloc_or_port "tuic" "${used_tuic_ports[@]}") ;;
+            *) hy2_port_p=$(alloc_or_port "hy2" "${used_hy2_ports[@]}")
+               tuic_port_p=$(alloc_or_port "tuic" "${used_tuic_ports[@]}") ;;
+        esac
+
+        if [[ "$hy2_port_p" == "0" && "$tuic_port_p" == "0" ]]; then
+            red "[✗] [$group_remark] 端口分配失败，跳过该国"
+            continue
+        fi
+
+        # 配置入站 IP (逐 IP 手动选择或自动跳过)
+        local -a ip_protos=()
+        local -a gbinds=()
+        mapfile -t gbinds < <(collect_global_udp_binds)
+        local bound_any=false
+
+        echo
+        cyan "[$group_remark] 请选择入站 IP 绑定 (支持多 IP 部署):"
+        for ip in "${ALL_IPS[@]}"; do
+            [[ -z "$ip" ]] && continue
+            local is_avail=true
+            if [[ "$oproto" == "1" ]]; then
+                port_ip_taken_global "$hy2_port_p" "hy2" "$ip" && is_avail=false
+            elif [[ "$oproto" == "2" ]]; then
+                port_ip_taken_global "$tuic_port_p" "tuic" "$ip" && is_avail=false
+            else
+                (port_ip_taken_global "$hy2_port_p" "hy2" "$ip" || port_ip_taken_global "$tuic_port_p" "tuic" "$ip") && is_avail=false
+            fi
+
+            if [[ "$is_avail" == "false" ]]; then
+                yellow "  [自动跳过] IP $ip 对应端口已被其它组占用"
+                continue
+            fi
+
+            echo "  IP $ip: 端口可用"
+            echo "    1. 绑定此 IP"
+            echo "    0. 跳过"
+            reading "    选择 [1, 默认1, 0跳过]: " ip_act
+            ip_act="${ip_act:-1}"
+            if [[ "$ip_act" == "1" ]]; then
+                local chosen_proto="both"
+                [[ "$oproto" == "1" ]] && chosen_proto="hy2"
+                [[ "$oproto" == "2" ]] && chosen_proto="tuic"
+                ip_protos+=("${ip}|${chosen_proto}")
+                bound_any=true
+            else
+                yellow "    已跳过 IP $ip"
+            fi
+        done
+
+        if [[ "$bound_any" == "false" || ${#ip_protos[@]} -eq 0 ]]; then
+            red "[✗] [$group_remark] 未绑定任何入站 IP，跳过该组"
+            continue
+        fi
+
+        # 分配组 Tag
+        local group_tag="proxy-$(( $(get_all_proxy_groups | wc -l) + 1 ))"
+        while proxy_group_exists "$group_tag"; do
+            group_tag="proxy-$((RANDOM % 1000 + 1))"
+        done
+        local out_tag="${group_tag}-out"
+
+        # 分配该国专属的本地 Socks5 转接端口 (63001-65535 兼容 hostuno/serv00)
+        local default_socks_p
+        default_socks_p=$(get_free_mihomo_port)
+        local socks_p="$default_socks_p"
+        yellow "[*] 已分配专属用户态内部中转端口: 127.0.0.1:${socks_p}"
+
+        # 生成 Mihomo 运行配置
+        local m_workdir="$WORKDIR/mihomo_${group_tag}"
+        mkdir -p "$m_workdir"
+        local m_cfg="${m_workdir}/config.yaml"
+        local parsed_proxies_file="${vg_tmp_dir}/parsed_${each_cc}.yaml"
+        rm -f "$parsed_proxies_file"
+
+        local -a proxy_names=()
+        local n_idx=0
+
+        for nfile in "${node_files[@]}"; do
+            ((n_idx++))
+            [[ $n_idx -gt 15 ]] && break
+            local s_pname="ovpn-${each_cc}-$(printf "%02d" $n_idx)"
+
+            local s_server=$(grep '^server=' "$nfile" | cut -d'=' -f2-)
+            local s_port=$(grep '^port=' "$nfile" | cut -d'=' -f2-)
+            local s_proto=$(grep '^proto=' "$nfile" | cut -d'=' -f2-)
+            local s_cipher=$(grep '^cipher=' "$nfile" | cut -d'=' -f2-)
+            local s_auth=$(grep '^auth=' "$nfile" | cut -d'=' -f2-)
+
+            local s_ca=$(sed -n '/^---CA---$/,/^---[A-Z]/p' "$nfile" | grep -v '^---' | sed 's/^/      /')
+            local s_cert=$(sed -n '/^---CERT---$/,/^---[A-Z]/p' "$nfile" | grep -v '^---' | sed 's/^/      /')
+            local s_key=$(sed -n '/^---KEY---$/,/^---[A-Z]/p' "$nfile" | grep -v '^---' | sed 's/^/      /')
+
+            {
+                echo "  - name: \"${s_pname}\""
+                echo "    type: openvpn"
+                echo "    server: \"${s_server}\""
+                echo "    port: ${s_port}"
+                echo "    proto: ${s_proto}"
+                echo "    username: \"vpn\""
+                echo "    password: \"vpn\""
+                echo "    cipher: \"${s_cipher}\""
+                echo "    auth: \"${s_auth}\""
+                echo "    remote-dns-resolve: true"
+                echo "    ca: |-"
+                echo "$s_ca"
+                if [[ -n "$s_cert" ]]; then
+                    echo "    cert: |-"
+                    echo "$s_cert"
+                fi
+                if [[ -n "$s_key" ]]; then
+                    echo "    key: |-"
+                    echo "$s_key"
+                fi
+            } >> "$parsed_proxies_file"
+            proxy_names+=("$s_pname")
+        done
+
+        if [[ ${#proxy_names[@]} -eq 0 || ! -s "$parsed_proxies_file" ]]; then
+            red "[!] 国家 [$each_cc] 未能生成有效节点，跳过"
+            rm -f "$parsed_proxies_file"
+            rm -rf "$m_workdir"
+            continue
+        fi
+
+        green "[✓] 国家 [$each_cc] 成功装载 ${#proxy_names[@]} 个 OpenVPN 节点！"
+
+        {
+            echo "mixed-port: ${socks_p}"
+            echo "allow-lan: false"
+            echo "bind-address: \"127.0.0.1\""
+            echo "mode: rule"
+            echo "log-level: info"
+            echo "ipv6: false"
+            echo ""
+            echo "proxies:"
+            cat "$parsed_proxies_file"
+            echo ""
+            echo "proxy-groups:"
+            echo "  - name: \"ovpn-${each_cc}-fallback\""
+            echo "    type: fallback"
+            echo "    url: https://www.gstatic.com/generate_204"
+            echo "    interval: 300"
+            echo "    proxies:"
+            for pn in "${proxy_names[@]}"; do
+                echo "      - \"${pn}\""
+            done
+            echo ""
+            echo "rules:"
+            echo "  - MATCH,ovpn-${each_cc}-fallback"
+        } > "$m_cfg"
+
+        rm -f "$parsed_proxies_file"
+
+        # 启动 Mihomo 实例 (脱离终端后台运行)
+        local mh_pid_file="${m_workdir}/mihomo.pid"
+        local mh_log_file="${m_workdir}/mihomo.log"
+        run_detached "$mh_pid_file" "$mh_log_file" "$WORKDIR/mihomo" -d "$m_workdir"
+        sleep 2
+
+        local m_pid=$(cat "$mh_pid_file" 2>/dev/null)
+        if [[ -z "$m_pid" ]] || ! kill -0 "$m_pid" 2>/dev/null; then
+            red "[!] 国家 [$each_cc] Mihomo 实例启动失败，查看日志: $mh_log_file"
+            tail -n 10 "$mh_log_file" 2>/dev/null
+            rm -rf "$m_workdir"
+            continue
+        fi
+
+        # 保存副节点元数据
+        local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
+        mkdir -p "$gdir"
+        echo "$group_remark" > "$gdir/remark.txt"
+        echo "openvpn-${each_cc}" > "$gdir/raw_url.txt"
+        echo "$each_cc" > "$gdir/country.txt"
+        [[ -n "$hy2_port_p" && "$hy2_port_p" != "0" ]] && echo "$hy2_port_p" > "$gdir/hy2_port.txt"
+        [[ -n "$tuic_port_p" && "$tuic_port_p" != "0" ]] && echo "$tuic_port_p" > "$gdir/tuic_port.txt"
+        printf '%s\n' "${ip_protos[@]}" > "$gdir/ip_protos.txt"
+        echo "$socks_p" > "$gdir/mihomo_port.txt"
+        echo "true" > "$gdir/is_openvpn.txt"
+
+        cat > "$gdir/outbound.json" << OB_EOF
+{
+  "type": "socks",
+  "tag": "${out_tag}",
+  "server": "127.0.0.1",
+  "server_port": ${socks_p},
+  "version": "5"
+}
+OB_EOF
+
+        if sync_proxy_group_to_singbox "$group_tag"; then
+            if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+                echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
+            fi
+            ((created_count++))
+            current_created_tags+=("$group_tag")
+            green "[✓] 国家 [$each_cc] 出站组 [$group_remark] 添加成功！"
+        else
+            red "[!] 国家 [$each_cc] 同步 Sing-box 失败，回滚清理..."
+            [[ -n "$m_pid" ]] && kill -9 "$m_pid" 2>/dev/null || true
+            rm -rf "$m_workdir" "$gdir"
+        fi
+    done
+
+    rm -rf "$vg_tmp_dir" 2>/dev/null || true
+
+    if [[ $created_count -gt 0 ]]; then
+        start_singbox
+        echo
+        green "============================================================="
+        green " [✓] 成功创建并上线 $created_count 个国家/地区的 OpenVPN 用户态节点池！"
+        green "============================================================="
+        for gt in "${current_created_tags[@]}"; do
+            generate_proxy_group_links "$gt"
+        done
+    else
+        yellow "未创建任何 OpenVPN 出站组"
+    fi
+}
+
+# ============ OpenVPN 用户态实例自愈守护 (挂 run_cron_check) ============
+openvpn_health_check() {
+    if [[ ! -d "$PROXY_GROUPS_DIR" ]]; then
+        return 0
+    fi
+    for og in $(get_all_proxy_groups); do
+        local gdir="${PROXY_GROUPS_DIR}/${og}"
+        [[ -f "$gdir/is_openvpn.txt" ]] || continue
+
+        local m_dir="$WORKDIR/mihomo_${og}"
+        local m_pid=$(cat "$m_dir/mihomo.pid" 2>/dev/null)
+        if [[ -z "$m_pid" ]] || ! kill -0 "$m_pid" 2>/dev/null; then
+            local mh_bin="$WORKDIR/mihomo"
+            [[ ! -x "$mh_bin" ]] && mh_bin="$HOME/bin/mihomo"
+            if [[ -x "$mh_bin" && -d "$m_dir" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenVPN自愈] 重启异常退出的 Mihomo 实例 ($og)" >> "$WORKDIR/monitor.log"
+                run_detached "$m_dir/mihomo.pid" "$m_dir/mihomo.log" "$mh_bin" -d "$m_dir"
+            fi
+        fi
+    done
+}
+
+
+
 # ==== 修改代理出站后端 (保持入站配置不变) ====
 edit_proxy_egress_backend() {
     init_proxy_groups_dir
@@ -11968,10 +12625,11 @@ proxy_egress_menu() {
         blue   "  5. 重新同步全部代理配置并重启"
         cyan   "  6. 一键添加 OpenRung 中继节点 (按国家分类, 自动自愈)"
         cyan   "  7. 一键添加免费节点池 (按国家分类, 自动自愈)"
+        cyan   "  8. 添加 OpenVPN 出站节点池 (Mihomo 用户态免TUN, 多节点容灾切换)"
         echo "------------------------------------------------------------"
         red    "  0. 返回上一级菜单"
         echo "============================================================"
-        reading "请选择 [0-7]: " choice
+        reading "请选择 [0-8]: " choice
         echo
 
         case "$choice" in
@@ -11983,6 +12641,9 @@ proxy_egress_menu() {
                 ;;
             7)
                 add_freepool_egress_group
+                ;;
+            8)
+                add_openvpn_egress_group
                 ;;
             2)
                 if [[ ${#groups[@]} -eq 0 ]]; then
@@ -12292,6 +12953,8 @@ run_cron_check() {
     openrung_health_check
     # 免费节点池自愈探测
     freepool_health_check
+    # OpenVPN 用户态实例自愈探测
+    openvpn_health_check
 }
 
 # ==================== 入口调度与 CLI 支持 ====================
